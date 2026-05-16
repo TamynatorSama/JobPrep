@@ -1,0 +1,43 @@
+/* ─── Global resets + base canvas ──────────────────────────────────────── */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: #0C0C0C;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07","dlig";
+  -webkit-font-smoothing: antialiased;
+  color: #FFFFFF;
+}
+
+/* ─── Slim dark scrollbars (matches the InterPrep design) ─────────────── */
+
+::-webkit-scrollbar         { width: 5px; height: 5px; }
+::-webkit-scrollbar-track   { background: transparent; }
+::-webkit-scrollbar-thumb   { background: #333; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #444; }
+
+/* ─── Universal subtle transitions ────────────────────────────────────── */
+
+* {
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+/* Don't let inputs / buttons inherit the system font. */
+input, textarea, select, button {
+  font-family: inherit;
+}
