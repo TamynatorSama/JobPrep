@@ -84,6 +84,19 @@ interface StageNote {
   notes: string;
 }
 
+interface Credentials {
+  geminiApiKey:     string;
+  glassdoorEmail:   string;
+  glassdoorPassword:string;
+  indeedEmail:      string;
+  indeedPassword:   string;
+}
+
+const EMPTY_CREDS: Credentials = {
+  geminiApiKey: "", glassdoorEmail: "", glassdoorPassword: "",
+  indeedEmail: "", indeedPassword: "",
+};
+
 interface Job {
   id: string;
   company: string;
@@ -186,7 +199,7 @@ type IconName =
   | "refresh" | "bookmark" | "sparkle" | "zap" | "search" | "x" | "check"
   | "sun" | "moon" | "upload" | "briefcase" | "edit" | "trash" | "user"
   | "bell" | "layout" | "mapPin" | "calendar" | "link" | "note" | "analyze"
-  | "interview" | "panel" | "archive";
+  | "interview" | "panel" | "archive" | "key" | "eye" | "eyeOff";
 
 const Icon = ({ name, size = 16, color = "currentColor", strokeWidth = 1.75 }: IconProps) => {
   const common = {
@@ -236,6 +249,9 @@ const Icon = ({ name, size = 16, color = "currentColor", strokeWidth = 1.75 }: I
     interview:    <><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></>,
     panel:        <><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></>,
     archive:      <><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></>,
+    key:          <><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></>,
+    eye:          <><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></>,
+    eyeOff:       <><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></>,
   };
   return <svg {...common}>{paths[name]}</svg>;
 };
@@ -1234,19 +1250,27 @@ const Field = ({ label, required, error, children }: FieldProps) => (
   </div>
 );
 
-// ─── Settings modal (slimmed initial port) ────────────────────────────────
+// ─── Settings modal ───────────────────────────────────────────────────────
 
-interface SettingsModalProps { onClose: () => void; }
+interface SettingsModalProps {
+  credentials: Credentials;
+  onCredentialsChange: (c: Credentials) => void;
+  onClose: () => void;
+}
 
-const SettingsModal = ({ onClose }: SettingsModalProps) => {
-  const [section, setSection] = useState("account");
+const SettingsModal = ({ credentials, onCredentialsChange, onClose }: SettingsModalProps) => {
+  const [section, setSection] = useState("apiKeys");
   const sections = [
     { id: "account",       label: "Account",        icon: "user"      as IconName },
     { id: "appearance",    label: "Appearance",     icon: "sun"       as IconName },
     { id: "resume",        label: "Resume",         icon: "upload"    as IconName },
     { id: "notifications", label: "Notifications",  icon: "bell"      as IconName },
     { id: "data",          label: "Data & Privacy", icon: "briefcase" as IconName },
+    { id: "apiKeys",       label: "API Keys",       icon: "key"       as IconName },
   ];
+
+  const update = (patch: Partial<Credentials>) =>
+    onCredentialsChange({ ...credentials, ...patch });
 
   return (
     <div
@@ -1261,7 +1285,7 @@ const SettingsModal = ({ onClose }: SettingsModalProps) => {
         onClick={(e) => e.stopPropagation()}
         style={{
           background: T.surface, borderRadius: 20,
-          width: 660, height: 460,
+          width: 660, height: 520,
           display: "flex", boxShadow: T.shadowLg,
           border: `0.5px solid ${T.border}`, overflow: "hidden",
         }}
@@ -1302,11 +1326,156 @@ const SettingsModal = ({ onClose }: SettingsModalProps) => {
           <h3 style={{ fontSize: 15, fontWeight: 700, color: T.text, marginBottom: 18, letterSpacing: "-0.4px", fontFamily: T.fontDisplay }}>
             {sections.find((s) => s.id === section)?.label}
           </h3>
-          <p style={{ fontSize: 12, color: T.textTertiary, letterSpacing: "-0.12px" }}>
-            Settings content is being migrated to Tauri. Backend wiring (resume library, API keys, account) comes next.
-          </p>
+
+          {section === "apiKeys" ? (
+            <CredentialsTab credentials={credentials} update={update} />
+          ) : (
+            <p style={{ fontSize: 12, color: T.textTertiary, letterSpacing: "-0.12px" }}>
+              Settings for this section coming soon.
+            </p>
+          )}
         </div>
       </div>
+    </div>
+  );
+};
+
+// ─── API Keys tab body ────────────────────────────────────────────────────
+
+interface CredentialsTabProps {
+  credentials: Credentials;
+  update: (patch: Partial<Credentials>) => void;
+}
+
+const CredentialsTab = ({ credentials, update }: CredentialsTabProps) => (
+  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <Card>
+      <CardTitle>Gemini API Key</CardTitle>
+      <CardDesc>
+        Powers AI chat and JD analysis. Get yours from Google AI Studio.
+      </CardDesc>
+      <SecretField
+        value={credentials.geminiApiKey}
+        placeholder="AIza..."
+        onChange={(v) => update({ geminiApiKey: v })}
+      />
+      <CardHint>Stored in Windows Credential Manager — encrypted with your user account.</CardHint>
+    </Card>
+
+    <Card>
+      <CardTitle>Glassdoor Account</CardTitle>
+      <CardDesc>
+        Optional. Unlocks salary data and reviews behind the login wall.
+      </CardDesc>
+      <FieldLabel>Email</FieldLabel>
+      <PlainField
+        value={credentials.glassdoorEmail}
+        placeholder="you@example.com"
+        onChange={(v) => update({ glassdoorEmail: v })}
+      />
+      <div style={{ height: 8 }} />
+      <FieldLabel>Password</FieldLabel>
+      <SecretField
+        value={credentials.glassdoorPassword}
+        placeholder="Password"
+        onChange={(v) => update({ glassdoorPassword: v })}
+      />
+    </Card>
+
+    <Card>
+      <CardTitle>Indeed Account</CardTitle>
+      <CardDesc>
+        Optional. Unlocks detailed company reviews and salary data.
+      </CardDesc>
+      <FieldLabel>Email</FieldLabel>
+      <PlainField
+        value={credentials.indeedEmail}
+        placeholder="you@example.com"
+        onChange={(v) => update({ indeedEmail: v })}
+      />
+      <div style={{ height: 8 }} />
+      <FieldLabel>Password</FieldLabel>
+      <SecretField
+        value={credentials.indeedPassword}
+        placeholder="Password"
+        onChange={(v) => update({ indeedPassword: v })}
+      />
+      <CardHint>Credentials used only to automate your own account. Encrypted at rest.</CardHint>
+    </Card>
+  </div>
+);
+
+const Card = ({ children }: { children: ReactNode }) => (
+  <div style={{
+    background: T.bg, borderRadius: 10,
+    border: `0.5px solid ${T.border}`, padding: 16,
+  }}>{children}</div>
+);
+const CardTitle = ({ children }: { children: ReactNode }) => (
+  <div style={{ fontSize: 13, fontWeight: 600, color: T.text, letterSpacing: "-0.3px", marginBottom: 4 }}>{children}</div>
+);
+const CardDesc = ({ children }: { children: ReactNode }) => (
+  <p style={{ fontSize: 12, color: T.textSecondary, marginBottom: 12, letterSpacing: "-0.12px", lineHeight: 1.5 }}>{children}</p>
+);
+const CardHint = ({ children }: { children: ReactNode }) => (
+  <p style={{ fontSize: 11, color: T.textTertiary, marginTop: 8, letterSpacing: "-0.11px" }}>{children}</p>
+);
+const FieldLabel = ({ children }: { children: ReactNode }) => (
+  <div style={{ fontSize: 12, color: T.textSecondary, marginBottom: 4, letterSpacing: "-0.12px" }}>{children}</div>
+);
+
+const fieldInputStyle = (): CSSProperties => ({
+  width: "100%", padding: "10px 12px", borderRadius: 8,
+  border: `0.5px solid ${T.border}`, background: T.surface,
+  color: T.text, fontSize: 13, fontFamily: T.fontBody,
+  outline: "none", letterSpacing: "-0.13px",
+});
+
+interface CredentialFieldProps {
+  value: string;
+  placeholder?: string;
+  onChange: (v: string) => void;
+}
+
+const PlainField = ({ value, placeholder, onChange }: CredentialFieldProps) => (
+  <input
+    type="text"
+    value={value}
+    placeholder={placeholder}
+    onChange={(e) => onChange(e.target.value)}
+    onFocus={(e) => { e.target.style.borderColor = T.accent; e.target.style.boxShadow = T.accentRing; }}
+    onBlur={(e)  => { e.target.style.borderColor = T.border; e.target.style.boxShadow = "none"; }}
+    style={fieldInputStyle()}
+  />
+);
+
+const SecretField = ({ value, placeholder, onChange }: CredentialFieldProps) => {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div style={{ display: "flex", gap: 6 }}>
+      <input
+        type={visible ? "text" : "password"}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        onFocus={(e) => { e.target.style.borderColor = T.accent; e.target.style.boxShadow = T.accentRing; }}
+        onBlur={(e)  => { e.target.style.borderColor = T.border; e.target.style.boxShadow = "none"; }}
+        style={{ ...fieldInputStyle(), flex: 1 }}
+      />
+      <button
+        type="button"
+        onClick={() => setVisible((v) => !v)}
+        title={visible ? "Hide" : "Show"}
+        style={{
+          width: 36, height: 36, borderRadius: 8,
+          background: T.surface2, color: T.textSecondary,
+          border: `0.5px solid ${T.border}`, cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          flexShrink: 0, padding: 0,
+        }}
+      >
+        <Icon name={visible ? "eyeOff" : "eye"} size={14} />
+      </button>
     </div>
   );
 };
@@ -1325,6 +1494,19 @@ const App = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [activeScreen, setActiveScreen] = useState<Screen>("chat");
+
+  // ── Credentials (Windows Credential Manager via Tauri) ─────────────────
+  // Loaded once on mount, kept in local state while the Settings modal is
+  // open, written back to the OS keychain when the modal closes.
+  const [credentials, setCredentials] = useState<Credentials>(EMPTY_CREDS);
+  const [credentialsLoaded, setCredentialsLoaded] = useState(false);
+
+  useEffect(() => {
+    invoke<Credentials>("load_credentials")
+      .then((c) => setCredentials(c))
+      .catch((e) => console.error("load_credentials failed:", e))
+      .finally(() => setCredentialsLoaded(true));
+  }, []);
 
   // ── Load persisted jobs on mount ────────────────────────────────────────
   useEffect(() => {
@@ -1508,7 +1690,21 @@ const App = () => {
       </div>
 
       {showNewJobModal && <NewJobModal onClose={() => setShowNewJobModal(false)} onSubmit={onCreateJob} />}
-      {showSettings    && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <SettingsModal
+          credentials={credentials}
+          onCredentialsChange={setCredentials}
+          onClose={() => {
+            setShowSettings(false);
+            // Flush credentials to the OS keychain. Don't block close on it.
+            if (credentialsLoaded) {
+              invoke("save_credentials", { credentials }).catch((e) =>
+                console.error("save_credentials failed:", e),
+              );
+            }
+          }}
+        />
+      )}
     </div>
   );
 };
