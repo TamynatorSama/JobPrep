@@ -1,8 +1,15 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" style="background:#0C0C0C">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Inline canvas color so the first parsed frame is already dark.
+         Without this the WebView paints its default white background between
+         "HTML loaded" and "external CSS applied", flashing white on launch. -->
+    <style>
+      html, body { background: #0C0C0C; color: #FFFFFF; margin: 0; padding: 0; }
+      #root { background: #0C0C0C; min-height: 100vh; }
+    </style>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -11,7 +18,7 @@
     />
     <title>InterPrep</title>
   </head>
-  <body>
+  <body style="background:#0C0C0C">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -14,6 +14,7 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 // ─── Theme tokens ──────────────────────────────────────────────────────────
 
@@ -96,6 +97,8 @@ interface Job {
   avatar: string;
   avatarColor: string;
   chats: ChatThread[];
+  /** Hidden from the main sidebar list once true. */
+  archived?: boolean;
 }
 
 type Screen = "chat" | "timeline";
@@ -284,6 +287,17 @@ const MarkdownText = ({ content }: MarkdownTextProps) => {
   );
 };
 
+// ─── Small style helper for popup menu rows ───────────────────────────────
+
+const menuItemStyle = (color: string = T.textSecondary): CSSProperties => ({
+  display: "flex", alignItems: "center", gap: 8,
+  width: "100%", padding: "6px 10px", borderRadius: 6,
+  border: "none", background: "transparent",
+  color, fontSize: 12, fontWeight: 500,
+  cursor: "pointer", textAlign: "left",
+  fontFamily: T.fontBody, letterSpacing: "-0.12px",
+});
+
 // ─── Sidebar ───────────────────────────────────────────────────────────────
 
 interface SidebarProps {
@@ -294,6 +308,9 @@ interface SidebarProps {
   onSelectChat: (id: string | null) => void;
   onNewJob: () => void;
   onSettings: () => void;
+  onArchiveJob: (id: string) => void;
+  onUnarchiveJob: (id: string) => void;
+  onDeleteJob: (id: string) => void;
   collapsed: boolean;
   activeScreen: Screen;
   onSetScreen: (s: Screen) => void;
@@ -301,7 +318,25 @@ interface SidebarProps {
 
 const Sidebar = (p: SidebarProps) => {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ job1: true, job2: false });
-  const [hovered, setHovered] = useState<string | null>(null);
+  const [hovered, setHovered]   = useState<string | null>(null);
+  /** Job id whose kebab popup is currently open, or `null`. */
+  const [menuFor, setMenuFor]   = useState<string | null>(null);
+  /** Whether the "Archived (N)" disclosure is expanded. */
+  const [showArchived, setShowArchived] = useState(false);
+
+  // Close any open popup when the user clicks outside the sidebar.
+  useEffect(() => {
+    if (!menuFor) return;
+    const close = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (!t.closest("[data-job-menu]")) setMenuFor(null);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [menuFor]);
+
+  const activeJobs   = p.jobs.filter((j) => !j.archived);
+  const archivedJobs = p.jobs.filter((j) =>  j.archived);
 
   const toggle = (id: string) => setExpanded((f) => ({ ...f, [id]: !f[id] }));
 
@@ -391,7 +426,7 @@ const Sidebar = (p: SidebarProps) => {
             }}>Job Research</p>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 8px" }}>
-            {p.jobs.map((job) => (
+            {activeJobs.map((job) => (
               <div key={job.id} style={{ marginBottom: 1 }}>
                 <div
                   onClick={() => { toggle(job.id); p.onSelectJob(job.id); }}
@@ -400,10 +435,12 @@ const Sidebar = (p: SidebarProps) => {
                   style={{
                     display: "flex", alignItems: "center", gap: 7,
                     padding: "7px 10px", borderRadius: 8, cursor: "pointer",
+                    position: "relative",
                     background:
                       p.selectedJobId === job.id && !expanded[job.id]
                         ? T.surface
-                        : hovered === `f-${job.id}` ? T.surfaceHover : "transparent",
+                        : hovered === `f-${job.id}` || menuFor === job.id
+                          ? T.surfaceHover : "transparent",
                   }}
                 >
                   <span style={{ color: T.textTertiary, display: "flex" }}>
@@ -421,13 +458,65 @@ const Sidebar = (p: SidebarProps) => {
                     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                     letterSpacing: "-0.12px",
                   }}>{job.company}</span>
-                  <span style={{
-                    fontSize: 10, fontWeight: 500,
-                    padding: "2px 7px", borderRadius: 100,
-                    background: STATUS_CONFIG[job.status].bg,
-                    color: STATUS_CONFIG[job.status].color,
-                    flexShrink: 0, letterSpacing: "-0.1px",
-                  }}>{job.status}</span>
+
+                  {/* Kebab + status pill swap based on hover state. */}
+                  {hovered === `f-${job.id}` || menuFor === job.id ? (
+                    <button
+                      data-job-menu
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setMenuFor(menuFor === job.id ? null : job.id);
+                      }}
+                      style={{
+                        width: 22, height: 22, borderRadius: 6, border: "none",
+                        background: menuFor === job.id ? T.surface2 : "transparent",
+                        color: T.textSecondary, cursor: "pointer",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        flexShrink: 0, padding: 0,
+                      }}
+                    >
+                      <Icon name="moreHoriz" size={13} />
+                    </button>
+                  ) : (
+                    <span style={{
+                      fontSize: 10, fontWeight: 500,
+                      padding: "2px 7px", borderRadius: 100,
+                      background: STATUS_CONFIG[job.status].bg,
+                      color: STATUS_CONFIG[job.status].color,
+                      flexShrink: 0, letterSpacing: "-0.1px",
+                    }}>{job.status}</span>
+                  )}
+
+                  {/* Popup menu — Archive / Delete. */}
+                  {menuFor === job.id && (
+                    <div
+                      data-job-menu
+                      onClick={(e) => e.stopPropagation()}
+                      style={{
+                        position: "absolute", top: "100%", right: 4, marginTop: 2,
+                        background: T.surface, border: `0.5px solid ${T.border}`,
+                        borderRadius: 10, padding: 4, boxShadow: T.shadowLg,
+                        zIndex: 60, minWidth: 150,
+                      }}
+                    >
+                      <button
+                        onClick={() => { p.onArchiveJob(job.id); setMenuFor(null); }}
+                        style={menuItemStyle()}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = T.surface2; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                      >
+                        <Icon name="archive" size={12} /> Archive
+                      </button>
+                      <button
+                        onClick={() => { p.onDeleteJob(job.id); setMenuFor(null); }}
+                        style={menuItemStyle("#EF4444")}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = T.surface2; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                      >
+                        <Icon name="trash" size={12} /> Delete
+                      </button>
+                    </div>
+                  )}
                 </div>
                 {expanded[job.id] && (
                   <div style={{ paddingLeft: 24 }}>
@@ -476,6 +565,69 @@ const Sidebar = (p: SidebarProps) => {
                 )}
               </div>
             ))}
+
+            {/* ── Archived (N) disclosure ───────────────────────────────── */}
+            {archivedJobs.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <div
+                  onClick={() => setShowArchived((v) => !v)}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = T.surfaceHover; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 7,
+                    padding: "7px 10px", borderRadius: 8, cursor: "pointer",
+                  }}
+                >
+                  <span style={{ color: T.textTertiary, display: "flex" }}>
+                    <Icon name={showArchived ? "chevronDown" : "chevronRight"} size={12} />
+                  </span>
+                  <span style={{
+                    fontSize: 11, color: T.textTertiary, flex: 1,
+                    letterSpacing: "-0.11px",
+                  }}>Archived ({archivedJobs.length})</span>
+                </div>
+
+                {showArchived && archivedJobs.map((job) => (
+                  <div
+                    key={job.id}
+                    onMouseEnter={() => setHovered(`a-${job.id}`)}
+                    onMouseLeave={() => setHovered(null)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 7,
+                      padding: "6px 10px 6px 22px", borderRadius: 8,
+                      background: hovered === `a-${job.id}` ? T.surfaceHover : "transparent",
+                    }}
+                  >
+                    <div style={{
+                      width: 16, height: 16, borderRadius: 4,
+                      background: `${job.avatarColor}18`,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      fontSize: 9, fontWeight: 700, color: job.avatarColor,
+                      flexShrink: 0, opacity: 0.7,
+                    }}>{job.avatar}</div>
+                    <span style={{
+                      fontSize: 12, color: T.textTertiary, flex: 1,
+                      whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                    }}>{job.company}</span>
+                    <button
+                      onClick={() => p.onUnarchiveJob(job.id)}
+                      title="Restore"
+                      onMouseEnter={(e) => { e.currentTarget.style.background = T.surface2; e.currentTarget.style.color = T.text; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = T.textSecondary; }}
+                      style={{
+                        width: 22, height: 22, borderRadius: 6, border: "none",
+                        background: "transparent", color: T.textSecondary,
+                        cursor: "pointer", display: "flex",
+                        alignItems: "center", justifyContent: "center",
+                        flexShrink: 0, padding: 0,
+                      }}
+                    >
+                      <Icon name="refresh" size={11} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1162,14 +1314,46 @@ const SettingsModal = ({ onClose }: SettingsModalProps) => {
 // ─── Main app ─────────────────────────────────────────────────────────────
 
 const App = () => {
-  const [jobs, setJobs] = useState<Job[]>(INITIAL_JOBS);
-  const [selectedJobId, setSelectedJobId] = useState<string | null>("job1");
-  const [selectedChatId, setSelectedChatId] = useState<string | null>("c1");
+  const [jobs, setJobs] = useState<Job[]>([]);
+  /** Becomes `true` once `list_jobs` has resolved, so we don't save the
+   *  initial empty array over a real file before the load completes. */
+  const [jobsLoaded, setJobsLoaded] = useState(false);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showNewJobModal, setShowNewJobModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [activeScreen, setActiveScreen] = useState<Screen>("chat");
+
+  // ── Load persisted jobs on mount ────────────────────────────────────────
+  useEffect(() => {
+    invoke<Job[]>("list_jobs")
+      .then((loaded) => {
+        // First-run fallback: if the on-disk file is empty, seed with the
+        // sample jobs so the user has something to look at and explore.
+        const list = loaded.length > 0 ? loaded : INITIAL_JOBS;
+        setJobs(list);
+        const first = list.find((j) => !j.archived);
+        setSelectedJobId(first?.id ?? null);
+        setSelectedChatId(first?.chats[0]?.id ?? null);
+      })
+      .catch((e) => {
+        console.error("list_jobs failed, falling back to seed:", e);
+        setJobs(INITIAL_JOBS);
+        setSelectedJobId(INITIAL_JOBS[0].id);
+        setSelectedChatId(INITIAL_JOBS[0].chats[0]?.id ?? null);
+      })
+      .finally(() => setJobsLoaded(true));
+  }, []);
+
+  // ── Persist on every change (cheap; jobs.json is small) ────────────────
+  useEffect(() => {
+    if (!jobsLoaded) return;
+    invoke("save_jobs", { jobs }).catch((e) =>
+      console.error("save_jobs failed:", e),
+    );
+  }, [jobs, jobsLoaded]);
 
   const selectedJob  = jobs.find((j) => j.id === selectedJobId) ?? null;
   const selectedChat = selectedJob?.chats.find((c) => c.id === selectedChatId) ?? null;
@@ -1178,6 +1362,38 @@ const App = () => {
     setSelectedJobId(jobId);
     const j = jobs.find((x) => x.id === jobId);
     setSelectedChatId(j?.chats[0]?.id ?? null);
+  };
+
+  // ── Archive / restore / delete actions ────────────────────────────────
+  // All three mutate `jobs` — the save-on-change effect above persists.
+
+  const reselectAfterRemoval = (currentList: Job[]) => {
+    if (selectedJobId && currentList.some((j) => j.id === selectedJobId && !j.archived)) {
+      return; // Selected job still active — leave selection alone.
+    }
+    const next = currentList.find((j) => !j.archived) ?? null;
+    setSelectedJobId(next?.id ?? null);
+    setSelectedChatId(next?.chats[0]?.id ?? null);
+  };
+
+  const onArchiveJob = (id: string) => {
+    setJobs((prev) => {
+      const next = prev.map((j) => j.id === id ? { ...j, archived: true } : j);
+      reselectAfterRemoval(next);
+      return next;
+    });
+  };
+
+  const onUnarchiveJob = (id: string) => {
+    setJobs((prev) => prev.map((j) => j.id === id ? { ...j, archived: false } : j));
+  };
+
+  const onDeleteJob = (id: string) => {
+    setJobs((prev) => {
+      const next = prev.filter((j) => j.id !== id);
+      reselectAfterRemoval(next);
+      return next;
+    });
   };
 
   const onSendMessage = (text: string) => {
@@ -1253,6 +1469,9 @@ const App = () => {
         onSelectChat={setSelectedChatId}
         onNewJob={() => setShowNewJobModal(true)}
         onSettings={() => setShowSettings(true)}
+        onArchiveJob={onArchiveJob}
+        onUnarchiveJob={onUnarchiveJob}
+        onDeleteJob={onDeleteJob}
         collapsed={sidebarCollapsed}
         activeScreen={activeScreen}
         onSetScreen={setActiveScreen}
