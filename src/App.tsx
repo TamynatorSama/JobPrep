@@ -15,6 +15,14 @@ import {
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+// ─── Backend lifecycle ─────────────────────────────────────────────────────
+
+type BackendStatus =
+  | { status: "starting" }
+  | { status: "ready"; url?: string }
+  | { status: "failed"; error: string };
 
 // ─── Theme tokens ──────────────────────────────────────────────────────────
 
@@ -69,6 +77,11 @@ const STAGES = ["Applied", "Screen", "Technical 1", "Technical 2", "Final", "Off
 interface ChatMsg {
   role: "user" | "ai";
   content: string;
+  /** Agent progress/tool-use lines shown in a collapsible disclosure above
+   *  the bubble, like Claude's tool-use card. */
+  logs?: string[];
+  /** True while tokens are still streaming into `content`. */
+  streaming?: boolean;
 }
 
 interface ChatThread {
@@ -803,6 +816,86 @@ const WorkspaceHeader = ({ job, onToggleSidebar }: WorkspaceHeaderProps) => {
   );
 };
 
+// ─── Thinking disclosure (above AI bubbles when agent emitted stage logs) ─
+
+interface ThinkingProps {
+  logs: string[];
+  streaming: boolean;
+}
+
+const Thinking = ({ logs, streaming }: ThinkingProps) => {
+  // Default-open while streaming; users can toggle and the state sticks.
+  const [open, setOpen] = useState(streaming);
+  const count = logs.length;
+  const plural = count === 1 ? "" : "s";
+  const title = streaming
+    ? `Thinking… · ${count} step${plural}`
+    : `Thought for ${count} step${plural}`;
+
+  // Strip backend padding (empty lines, "---" dividers, lone dots) and
+  // render inline **bold**. Keeps long agent logs compact.
+  const cleanLine = (raw: string): string => raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !/^[-._*]+$/.test(l))
+    .join(" ");
+
+  return (
+    <div style={{
+      background: T.bg, borderRadius: 10,
+      border: `0.5px solid ${T.border}`,
+      padding: "8px 12px", marginBottom: 6,
+    }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          display: "flex", alignItems: "center", gap: 6,
+          background: "transparent", border: "none", cursor: "pointer",
+          padding: 0, width: "100%", textAlign: "left",
+          color: T.textSecondary, fontFamily: T.fontBody,
+          fontSize: 12, fontWeight: 500, letterSpacing: "-0.12px",
+        }}
+      >
+        <Icon name={open ? "chevronDown" : "chevronRight"} size={11} color={T.textTertiary} />
+        <span>{title}</span>
+        {!open && count > 0 && (
+          <span style={{
+            color: T.textTertiary, fontWeight: 400,
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+            flex: 1, minWidth: 0,
+          }}>
+            {" — "}
+            {cleanLine(logs[count - 1] ?? "").slice(0, 72)}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+          {logs.map((raw, i) => {
+            const text = cleanLine(raw);
+            if (!text) return null;
+            return (
+              <div key={i} style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+                <span style={{ color: T.textTertiary, fontSize: 11.5, lineHeight: 1.6 }}>·</span>
+                <span style={{
+                  color: T.textSecondary, fontSize: 11.5, lineHeight: 1.6,
+                  letterSpacing: "-0.115px",
+                }}>
+                  {text.split(/(\*\*[^*]+\*\*)/g).map((part, j) =>
+                    part.startsWith("**")
+                      ? <strong key={j} style={{ color: T.text }}>{part.slice(2, -2)}</strong>
+                      : <span key={j}>{part}</span>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ─── Chat area ────────────────────────────────────────────────────────────
 
 interface ChatAreaProps {
@@ -902,13 +995,19 @@ const ChatArea = ({ chat, onSendMessage, isLoading }: ChatAreaProps) => {
               }}>
                 <Icon name="sparkle" size={12} color={T.textSecondary} />
               </div>
-              <div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                {msg.logs && msg.logs.length > 0 && (
+                  <Thinking logs={msg.logs} streaming={!!msg.streaming} />
+                )}
                 <div style={{
                   padding: "12px 16px",
                   borderRadius: "6px 20px 20px 20px",
                   background: T.surface, boxShadow: T.shadowMd,
                 }}>
-                  <MarkdownText content={msg.content} />
+                  {msg.streaming && !msg.content
+                    ? <span style={{ color: T.textTertiary, fontSize: 14 }}>…</span>
+                    : <MarkdownText content={msg.streaming ? msg.content + "▊" : msg.content} />
+                  }
                 </div>
                 {hoveredMsg === i && (
                   <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
@@ -1495,6 +1594,87 @@ const App = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [activeScreen, setActiveScreen] = useState<Screen>("chat");
 
+  // ── Backend lifecycle ──────────────────────────────────────────────────
+  // The Python sidecar starts in the background. Subscribe to its lifecycle
+  // events AND poll the current status on mount so we don't miss the ready
+  // event if the page subscribes too late.
+  const [backend, setBackend] = useState<BackendStatus>({ status: "starting" });
+
+  useEffect(() => {
+    let unsubReady:  UnlistenFn | undefined;
+    let unsubError:  UnlistenFn | undefined;
+
+    invoke<BackendStatus>("backend_status")
+      .then((s) => setBackend(s))
+      .catch((e) => console.error("backend_status failed:", e));
+
+    listen<string>("sidecar:ready", (e) => setBackend({ status: "ready", url: e.payload }))
+      .then((un) => { unsubReady = un; });
+    listen<string>("sidecar:error", (e) => setBackend({ status: "failed", error: e.payload }))
+      .then((un) => { unsubError = un; });
+
+    return () => { unsubReady?.(); unsubError?.(); };
+  }, []);
+
+  // ── Chat stream listeners ──────────────────────────────────────────────
+  // The Rust side broadcasts `chat:token` / `chat:log` / `chat:done` /
+  // `chat:error` events for whichever stream is currently active. The
+  // frontend appends to the most recent AI message in the current thread —
+  // since we disable send while a stream is running, there's only ever one.
+  const streamingTargetRef = useRef<{ jobId: string; chatId: string } | null>(null);
+
+  useEffect(() => {
+    const unsubs: UnlistenFn[] = [];
+
+    const appendToLast = (mutate: (m: ChatMsg) => ChatMsg) => {
+      const target = streamingTargetRef.current;
+      if (!target) return;
+      setJobs((prev) => prev.map((j) =>
+        j.id !== target.jobId
+          ? j
+          : {
+              ...j,
+              chats: j.chats.map((c) =>
+                c.id !== target.chatId
+                  ? c
+                  : {
+                      ...c,
+                      messages: c.messages.map((m, i) =>
+                        i === c.messages.length - 1 ? mutate(m) : m,
+                      ),
+                    },
+              ),
+            },
+      ));
+    };
+
+    listen<string>("chat:token", (e) => {
+      appendToLast((m) => ({ ...m, content: m.content + e.payload }));
+    }).then((u) => unsubs.push(u));
+
+    listen<string>("chat:log", (e) => {
+      appendToLast((m) => ({ ...m, logs: [...(m.logs ?? []), e.payload] }));
+    }).then((u) => unsubs.push(u));
+
+    listen<string>("chat:done", () => {
+      appendToLast((m) => ({ ...m, streaming: false }));
+      streamingTargetRef.current = null;
+      setIsLoading(false);
+    }).then((u) => unsubs.push(u));
+
+    listen<string>("chat:error", (e) => {
+      appendToLast((m) => ({
+        ...m,
+        streaming: false,
+        content: m.content || `**Error:** ${e.payload}`,
+      }));
+      streamingTargetRef.current = null;
+      setIsLoading(false);
+    }).then((u) => unsubs.push(u));
+
+    return () => { unsubs.forEach((u) => u()); };
+  }, []);
+
   // ── Credentials (Windows Credential Manager via Tauri) ─────────────────
   // Loaded once on mount, kept in local state while the Settings modal is
   // open, written back to the OS keychain when the modal closes.
@@ -1588,23 +1768,73 @@ const App = () => {
       setJobs((prev) => prev.map((j) => j.id === selectedJobId ? { ...j, chats: [...j.chats, newChat] } : j));
       setSelectedChatId(chatId);
     }
+    const targetChatId = chatId;
 
+    // Append the user's message AND an empty AI bubble that the SSE stream
+    // will fill in tokens-first. Keeping them in one setJobs call avoids a
+    // wasted re-render between the two appends.
+    const aiPlaceholder: ChatMsg = { role: "ai", content: "", streaming: true, logs: [] };
     setJobs((prev) => prev.map((j) =>
       j.id !== selectedJobId
         ? j
-        : { ...j, chats: j.chats.map((c) => c.id !== chatId ? c : { ...c, messages: [...c.messages, { role: "user", content: text }] }) }
+        : {
+            ...j,
+            chats: j.chats.map((c) =>
+              c.id !== targetChatId
+                ? c
+                : {
+                    ...c,
+                    messages: [
+                      ...c.messages,
+                      { role: "user", content: text },
+                      aiPlaceholder,
+                    ],
+                  },
+            ),
+          },
     ));
 
+    // Build a tight context blob the backend can prepend to its system prompt.
+    const job = jobs.find((j) => j.id === selectedJobId);
+    const jobContext = job
+      ? [
+          `Company: ${job.company}`,
+          `Role: ${job.role}`,
+          job.location ? `Location: ${job.location}` : "",
+        ].filter(Boolean).join("\n")
+      : "";
+
+    streamingTargetRef.current = { jobId: selectedJobId, chatId: targetChatId };
     setIsLoading(true);
-    // TODO: replace with Tauri IPC streaming once backend is wired.
-    window.setTimeout(() => {
+
+    invoke("start_chat_stream", {
+      message: text,
+      jobContext,
+      apiKey: credentials.geminiApiKey,
+    }).catch((e) => {
+      const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
         j.id !== selectedJobId
           ? j
-          : { ...j, chats: j.chats.map((c) => c.id !== chatId ? c : { ...c, messages: [...c.messages, { role: "ai", content: "*(Backend not yet wired — this is a mock response. The Python sidecar will be plumbed through Tauri IPC in the next migration phase.)*" }] }) }
+          : {
+              ...j,
+              chats: j.chats.map((c) =>
+                c.id !== targetChatId
+                  ? c
+                  : {
+                      ...c,
+                      messages: c.messages.map((m, i) =>
+                        i === c.messages.length - 1
+                          ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+                          : m,
+                      ),
+                    },
+              ),
+            },
       ));
+      streamingTargetRef.current = null;
       setIsLoading(false);
-    }, 600);
+    });
   };
 
   const onCreateJob = (form: NewJobFormState) => {
