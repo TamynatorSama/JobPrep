@@ -97,6 +97,12 @@ interface StageNote {
   notes: string;
 }
 
+interface Resume {
+  id:   number;
+  name: string;
+  text: string;
+}
+
 interface Credentials {
   geminiApiKey:     string;
   glassdoorEmail:   string;
@@ -816,6 +822,487 @@ const WorkspaceHeader = ({ job, onToggleSidebar }: WorkspaceHeaderProps) => {
   );
 };
 
+// ─── Gantt timeline ───────────────────────────────────────────────────────
+
+const MONTH_NAMES = [
+  "January","February","March","April","May","June",
+  "July","August","September","October","November","December",
+];
+const STAGE_COLORS = ["#F59E0B","#0099FF","#a855f7","#a855f7","#ec4899","#22c55e"];
+const STAGES_GANTT = ["Applied","Screen","Technical 1","Technical 2","Final","Offer"];
+const DAY_MS = 86_400_000;
+
+interface GanttProps {
+  jobs: Job[];
+  onSelectJob: (id: string) => void;
+  onNewJob: () => void;
+  onToggleSidebar: () => void;
+  onUpdateJob: (id: string, updater: (j: Job) => Job) => void;
+}
+
+const Gantt = (p: GanttProps) => {
+  // Today is read once on mount. If we re-read it every render the "today"
+  // column would jitter when nothing meaningful changed.
+  const [todayRef] = useState<Date>(() => new Date());
+  const ROW_HEIGHT = 64;
+  const LEFT_COL   = 200;
+  const DAY_W      = 36;
+  const TOTAL_DAYS = 60;
+
+  /** Days before today the view starts on. Negative values pan into the past. */
+  const [startOffset, setStartOffset] = useState(-14);
+
+  // Editor popover state: which stage on which job is being edited.
+  const [editing, setEditing] = useState<{
+    jobId: string; stageIdx: number; anchor: { x: number; y: number };
+  } | null>(null);
+
+  const viewStart = new Date(todayRef.getTime() + startOffset * DAY_MS);
+  const viewEnd   = new Date(viewStart.getTime() + TOTAL_DAYS * DAY_MS);
+
+  // Build day columns.
+  const days: Date[] = [];
+  for (let i = 0; i < TOTAL_DAYS; i++) {
+    days.push(new Date(viewStart.getTime() + i * DAY_MS));
+  }
+
+  // Group days by month for the header row.
+  const monthGroups: { label: string; start: number; count: number }[] = [];
+  days.forEach((d, i) => {
+    const label = `${MONTH_NAMES[d.getMonth()].slice(0,3)} ${d.getFullYear()}`;
+    const last = monthGroups[monthGroups.length - 1];
+    if (!last || last.label !== label) {
+      monthGroups.push({ label, start: i, count: 1 });
+    } else {
+      last.count++;
+    }
+  });
+
+  const dateToX = (d: Date) =>
+    LEFT_COL + ((d.getTime() - viewStart.getTime()) / DAY_MS) * DAY_W;
+  const todayX = dateToX(todayRef);
+
+  const parseStageDate = (s: string): Date | null => {
+    if (!s) return null;
+    const months: Record<string, number> = {
+      Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,
+      Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11,
+    };
+    const parts = s.replace(",", "").trim().split(" ");
+    if (parts.length >= 2 && months[parts[0]] !== undefined) {
+      const year = parts[2] ? parseInt(parts[2]) : todayRef.getFullYear();
+      return new Date(year, months[parts[0]], parseInt(parts[1]));
+    }
+    return null;
+  };
+
+  const handleSaveStage = (jobId: string, stageIdx: number, data: StageNote) => {
+    p.onUpdateJob(jobId, (job) => ({
+      ...job,
+      currentStage: Math.max(job.currentStage, stageIdx),
+      stageNotes: { ...job.stageNotes, [stageIdx]: data },
+    }));
+    setEditing(null);
+  };
+
+  const activeJobs = p.jobs.filter((j) => !j.archived);
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: T.bg }}>
+      {/* ── Toolbar ────────────────────────────────────────────────── */}
+      <div style={{
+        height: 52, flexShrink: 0,
+        borderBottom: `1px solid ${T.border}`,
+        background: T.bg, display: "flex", alignItems: "center",
+        padding: "0 16px", gap: 8, overflow: "hidden",
+      }}>
+        <button
+          onClick={p.onToggleSidebar}
+          onMouseEnter={(e) => { e.currentTarget.style.background = T.surface2; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = T.surface; }}
+          style={{
+            width: 30, height: 30, borderRadius: 100,
+            border: `0.5px solid ${T.border}`, background: T.surface,
+            cursor: "pointer", display: "flex",
+            alignItems: "center", justifyContent: "center", color: T.textSecondary,
+          }}
+        >
+          <Icon name="panel" size={13} />
+        </button>
+        <span style={{
+          fontSize: 14, fontWeight: 600, color: T.text,
+          letterSpacing: "-0.4px", fontFamily: T.fontDisplay, marginRight: 4,
+        }}>Timeline</span>
+
+        <div style={{
+          display: "flex", alignItems: "center", gap: 2,
+          background: T.surface, borderRadius: 100, padding: 3,
+          border: `0.5px solid ${T.border}`,
+        }}>
+          <button onClick={() => setStartOffset((o) => o - 7)} style={navBtnStyle()}>
+            <Icon name="chevronLeft" size={13} />
+          </button>
+          <span style={{
+            fontSize: 12, color: T.textSecondary, minWidth: 110,
+            textAlign: "center", letterSpacing: "-0.12px",
+          }}>
+            {viewStart.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+            {" – "}
+            {viewEnd.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+          </span>
+          <button onClick={() => setStartOffset((o) => o + 7)} style={navBtnStyle()}>
+            <Icon name="chevronRight" size={13} />
+          </button>
+        </div>
+        <button
+          onClick={() => setStartOffset(-14)}
+          style={{
+            padding: "5px 12px", borderRadius: 100,
+            border: `0.5px solid ${T.border}`,
+            background: "transparent", color: T.textSecondary,
+            fontSize: 12, cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.12px",
+          }}
+        >Today</button>
+        <div style={{ flex: 1 }} />
+        <button
+          onClick={p.onNewJob}
+          style={{
+            display: "flex", alignItems: "center", gap: 6,
+            padding: "6px 14px", borderRadius: 100, border: "none",
+            background: "#fff", color: "#0C0C0C",
+            fontSize: 12, fontWeight: 500, cursor: "pointer",
+            fontFamily: T.fontBody, letterSpacing: "-0.12px",
+          }}
+        >
+          <Icon name="plus" size={13} color="#0C0C0C" strokeWidth={2.5} />
+          Add Job
+        </button>
+      </div>
+
+      {/* ── Body (scrollable) ──────────────────────────────────────── */}
+      <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
+        <div style={{ minWidth: LEFT_COL + TOTAL_DAYS * DAY_W, position: "relative" }}>
+          {/* Header rows (month + day numbers), sticky to the top. */}
+          <div style={{ position: "sticky", top: 0, zIndex: 10, background: T.bg, borderBottom: `1px solid ${T.border}` }}>
+            <div style={{ display: "flex", marginLeft: LEFT_COL, height: 22 }}>
+              {monthGroups.map((mg, i) => (
+                <div key={i} style={{
+                  width: mg.count * DAY_W, flexShrink: 0,
+                  padding: "3px 8px", fontSize: 11, fontWeight: 600,
+                  color: T.textTertiary, letterSpacing: "0.02em",
+                  textTransform: "uppercase",
+                  borderRight: `1px solid ${T.border}`,
+                  overflow: "hidden", whiteSpace: "nowrap",
+                }}>{mg.label}</div>
+              ))}
+            </div>
+            <div style={{ display: "flex", marginLeft: LEFT_COL, height: 28, borderBottom: `1px solid ${T.border}` }}>
+              {days.map((d, i) => {
+                const isToday = d.toDateString() === todayRef.toDateString();
+                const isWk = d.getDay() === 0 || d.getDay() === 6;
+                return (
+                  <div key={i} style={{
+                    width: DAY_W, flexShrink: 0,
+                    display: "flex", flexDirection: "column",
+                    alignItems: "center", justifyContent: "center",
+                    fontSize: 10,
+                    color: isToday ? "#fff" : isWk ? T.textTertiary : T.textSecondary,
+                    background: isToday ? T.accent : "transparent",
+                    fontWeight: isToday ? 700 : 400,
+                    borderRight: `1px solid ${T.border}`,
+                    letterSpacing: "-0.1px",
+                  }}>
+                    <span style={{ fontSize: 9, opacity: 0.6 }}>{"SMTWTFS"[d.getDay()]}</span>
+                    <span>{d.getDate()}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Job rows. */}
+          {activeJobs.map((job) => {
+            const stageEntries = Object.entries(job.stageNotes || {})
+              .map(([k, v]) => ({ idx: parseInt(k), note: v as StageNote }))
+              .sort((a, b) => a.idx - b.idx);
+
+            return (
+              <div key={job.id} style={{
+                display: "flex", height: ROW_HEIGHT,
+                borderBottom: `1px solid ${T.border}`,
+                alignItems: "center", position: "relative",
+              }}>
+                {/* Sticky left label */}
+                <div
+                  onClick={() => p.onSelectJob(job.id)}
+                  style={{
+                    width: LEFT_COL, flexShrink: 0,
+                    padding: "0 16px", display: "flex",
+                    alignItems: "center", gap: 10,
+                    position: "sticky", left: 0, background: T.bg,
+                    zIndex: 5, borderRight: `1px solid ${T.border}`,
+                    height: "100%", cursor: "pointer",
+                  }}
+                >
+                  <div style={{
+                    width: 28, height: 28, borderRadius: 8,
+                    background: `${job.avatarColor}18`,
+                    border: `0.5px solid ${job.avatarColor}40`,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: 12, fontWeight: 700, color: job.avatarColor,
+                    flexShrink: 0, fontFamily: T.fontDisplay,
+                  }}>{job.avatar}</div>
+                  <div style={{ minWidth: 0 }}>
+                    <p style={{ fontSize: 12, fontWeight: 600, color: T.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", letterSpacing: "-0.3px" }}>{job.company}</p>
+                    <p style={{ fontSize: 11, color: T.textSecondary, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", letterSpacing: "-0.11px" }}>{job.role.split(",")[0]}</p>
+                  </div>
+                </div>
+
+                {/* Day-stripe background */}
+                <div style={{ position: "absolute", left: LEFT_COL, right: 0, top: 0, bottom: 0, display: "flex", pointerEvents: "none" }}>
+                  {days.map((d, i) => (
+                    <div key={i} style={{
+                      width: DAY_W, flexShrink: 0, height: "100%",
+                      background: (d.getDay() === 0 || d.getDay() === 6)
+                        ? "rgba(255,255,255,0.015)"
+                        : "transparent",
+                      borderRight: `1px solid ${T.border}`,
+                    }} />
+                  ))}
+                </div>
+
+                {/* Today line */}
+                <div style={{
+                  position: "absolute", left: todayX, top: 0, bottom: 0,
+                  width: 2, background: T.accent, zIndex: 4, opacity: 0.7,
+                  pointerEvents: "none",
+                }} />
+
+                {/* Stage bars + dots */}
+                {stageEntries.map(({ idx, note }) => {
+                  const d = parseStageDate(note.date);
+                  if (!d) return null;
+                  const x = dateToX(d);
+                  if (x < LEFT_COL - 20 || x > LEFT_COL + TOTAL_DAYS * DAY_W + 20) return null;
+
+                  const color = STAGE_COLORS[idx] ?? T.accent;
+                  const isDone    = idx <  job.currentStage;
+                  const isCurrent = idx === job.currentStage;
+                  const next = stageEntries.find((e) => e.idx === idx + 1);
+                  const nextDate = next ? parseStageDate(next.note.date) : (isCurrent ? todayRef : null);
+                  const barW = nextDate ? Math.max(8, ((nextDate.getTime() - d.getTime()) / DAY_MS) * DAY_W) : 0;
+
+                  return (
+                    <div key={idx} style={{ position: "absolute", top: "50%", transform: "translateY(-50%)", zIndex: 6 }}>
+                      {barW > 0 && (
+                        <div style={{
+                          position: "absolute", left: x, top: "50%",
+                          transform: "translateY(-50%)",
+                          height: 20, width: barW,
+                          background: `${color}25`,
+                          borderRadius: 4, border: `1px solid ${color}40`,
+                          display: "flex", alignItems: "center", paddingLeft: 22, overflow: "hidden",
+                        }}>
+                          <span style={{ fontSize: 10, color, opacity: 0.8, whiteSpace: "nowrap", letterSpacing: "-0.1px" }}>
+                            {STAGES_GANTT[idx]}
+                          </span>
+                        </div>
+                      )}
+                      <button
+                        onClick={(e) => {
+                          const r = e.currentTarget.getBoundingClientRect();
+                          setEditing({ jobId: job.id, stageIdx: idx, anchor: { x: r.left, y: r.bottom + 8 } });
+                          e.stopPropagation();
+                        }}
+                        style={{
+                          position: "absolute", left: x - 7, top: "50%",
+                          transform: "translateY(-50%)",
+                          width: 14, height: 14, borderRadius: "50%",
+                          background: isDone || isCurrent ? color : T.surface2,
+                          border: `2px solid ${color}`, cursor: "pointer", zIndex: 7,
+                          boxShadow: isCurrent ? `0 0 0 3px ${color}30` : "none",
+                          padding: 0,
+                        }}
+                      />
+                    </div>
+                  );
+                })}
+
+                {/* "+ next stage" affordance */}
+                {(() => {
+                  const lastIdx = stageEntries.length ? stageEntries[stageEntries.length - 1].idx : -1;
+                  const nextIdx = Math.min(lastIdx + 1, STAGES_GANTT.length - 1);
+                  if (nextIdx > lastIdx || lastIdx === -1) {
+                    const x = todayX + 10;
+                    return (
+                      <button
+                        onClick={(e) => {
+                          const r = e.currentTarget.getBoundingClientRect();
+                          setEditing({ jobId: job.id, stageIdx: nextIdx, anchor: { x: r.left, y: r.bottom + 8 } });
+                          e.stopPropagation();
+                        }}
+                        style={{
+                          position: "absolute", left: x, top: "50%",
+                          transform: "translateY(-50%)",
+                          width: 20, height: 20, borderRadius: "50%",
+                          background: T.surface2,
+                          border: `1px dashed ${T.textTertiary}`,
+                          cursor: "pointer", zIndex: 7,
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          color: T.textTertiary, padding: 0,
+                        }}
+                      >
+                        <Icon name="plus" size={10} />
+                      </button>
+                    );
+                  }
+                  return null;
+                })()}
+              </div>
+            );
+          })}
+
+          {/* Add job row */}
+          <div style={{ display: "flex", height: 44, alignItems: "center", borderBottom: `1px solid ${T.border}` }}>
+            <div style={{
+              width: LEFT_COL, flexShrink: 0, padding: "0 16px",
+              position: "sticky", left: 0, background: T.bg, zIndex: 5,
+              height: "100%", display: "flex", alignItems: "center",
+              borderRight: `1px solid ${T.border}`,
+            }}>
+              <button
+                onClick={p.onNewJob}
+                onMouseEnter={(e) => { e.currentTarget.style.color = T.text; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = T.textTertiary; }}
+                style={{
+                  display: "flex", alignItems: "center", gap: 6,
+                  color: T.textTertiary, background: "none", border: "none",
+                  cursor: "pointer", fontSize: 12, fontFamily: T.fontBody, letterSpacing: "-0.12px",
+                }}
+              >
+                <Icon name="plus" size={12} /> Add job
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Stage editor popover */}
+      {editing && (
+        <StageEditor
+          job={p.jobs.find((j) => j.id === editing.jobId)!}
+          stageIdx={editing.stageIdx}
+          anchor={editing.anchor}
+          onSave={(idx, data) => handleSaveStage(editing.jobId, idx, data)}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </div>
+  );
+};
+
+const navBtnStyle = (): CSSProperties => ({
+  width: 26, height: 26, borderRadius: 100,
+  border: "none", background: "none", cursor: "pointer",
+  display: "flex", alignItems: "center", justifyContent: "center",
+  color: T.textSecondary, padding: 0,
+});
+
+// ─── Stage editor popover ─────────────────────────────────────────────────
+
+interface StageEditorProps {
+  job:      Job;
+  stageIdx: number;
+  anchor:   { x: number; y: number };
+  onSave:   (idx: number, data: StageNote) => void;
+  onClose:  () => void;
+}
+
+const StageEditor = ({ job, stageIdx, anchor, onSave, onClose }: StageEditorProps) => {
+  const existing = job.stageNotes[stageIdx];
+  const [date,    setDate]    = useState(existing?.date    ?? "");
+  const [outcome, setOutcome] = useState(existing?.outcome ?? "");
+  const [notes,   setNotes]   = useState(existing?.notes   ?? "");
+  const stage = STAGES_GANTT[stageIdx];
+
+  const inp: CSSProperties = {
+    width: "100%", padding: "7px 10px", borderRadius: 8,
+    border: `0.5px solid ${T.border}`, background: T.bg,
+    color: T.text, fontSize: 12, fontFamily: T.fontBody,
+    outline: "none", letterSpacing: "-0.12px",
+  };
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 200 }}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          position: "fixed",
+          top:  anchor.y,
+          left: Math.min(anchor.x, window.innerWidth - 300),
+          background: T.surface, border: `0.5px solid ${T.border}`,
+          borderRadius: 14, padding: 16, width: 280,
+          boxShadow: T.shadowLg, zIndex: 201,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <p style={{ fontSize: 13, fontWeight: 600, color: T.text, letterSpacing: "-0.3px", fontFamily: T.fontDisplay }}>{stage}</p>
+          <button onClick={onClose} style={{
+            background: T.surface2, border: "none", borderRadius: 100,
+            width: 22, height: 22, display: "flex",
+            alignItems: "center", justifyContent: "center",
+            cursor: "pointer", color: T.textSecondary,
+          }}>
+            <Icon name="x" size={11} />
+          </button>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div>
+            <label style={{ fontSize: 11, color: T.textSecondary, display: "block", marginBottom: 4, letterSpacing: "-0.11px" }}>Date</label>
+            <input style={inp} value={date} onChange={(e) => setDate(e.target.value)} placeholder="e.g. Apr 18" />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: T.textSecondary, display: "block", marginBottom: 4, letterSpacing: "-0.11px" }}>Outcome</label>
+            <select style={{ ...inp, cursor: "pointer" }} value={outcome} onChange={(e) => setOutcome(e.target.value)}>
+              <option value="">Select outcome</option>
+              <option value="Submitted">Submitted</option>
+              <option value="Passed">Passed</option>
+              <option value="In progress">In progress</option>
+              <option value="Scheduled">Scheduled</option>
+              <option value="Rejected">Rejected</option>
+              <option value="Offer received">Offer received</option>
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: T.textSecondary, display: "block", marginBottom: 4, letterSpacing: "-0.11px" }}>Notes</label>
+            <textarea
+              style={{ ...inp, minHeight: 60, resize: "vertical" }}
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Add notes..."
+            />
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+          <button onClick={onClose} style={{
+            flex: 1, padding: "7px 0", borderRadius: 100, border: "none",
+            background: T.surface2, color: T.textSecondary,
+            fontSize: 12, cursor: "pointer", fontFamily: T.fontBody,
+          }}>Cancel</button>
+          <button
+            onClick={() => onSave(stageIdx, { date, outcome, notes })}
+            style={{
+              flex: 2, padding: "7px 0", borderRadius: 100, border: "none",
+              background: "#fff", color: "#0C0C0C",
+              fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: T.fontBody,
+            }}
+          >Save</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ─── Thinking disclosure (above AI bubbles when agent emitted stage logs) ─
 
 interface ThinkingProps {
@@ -1354,11 +1841,17 @@ const Field = ({ label, required, error, children }: FieldProps) => (
 interface SettingsModalProps {
   credentials: Credentials;
   onCredentialsChange: (c: Credentials) => void;
+  resumes: Resume[];
+  onResumesChange: (r: Resume[]) => void;
   onClose: () => void;
 }
 
-const SettingsModal = ({ credentials, onCredentialsChange, onClose }: SettingsModalProps) => {
-  const [section, setSection] = useState("apiKeys");
+const SettingsModal = ({
+  credentials, onCredentialsChange,
+  resumes, onResumesChange,
+  onClose,
+}: SettingsModalProps) => {
+  const [section, setSection] = useState("resume");
   const sections = [
     { id: "account",       label: "Account",        icon: "user"      as IconName },
     { id: "appearance",    label: "Appearance",     icon: "sun"       as IconName },
@@ -1428,6 +1921,8 @@ const SettingsModal = ({ credentials, onCredentialsChange, onClose }: SettingsMo
 
           {section === "apiKeys" ? (
             <CredentialsTab credentials={credentials} update={update} />
+          ) : section === "resume" ? (
+            <ResumeTab resumes={resumes} onChange={onResumesChange} />
           ) : (
             <p style={{ fontSize: 12, color: T.textTertiary, letterSpacing: "-0.12px" }}>
               Settings for this section coming soon.
@@ -1519,6 +2014,145 @@ const CardDesc = ({ children }: { children: ReactNode }) => (
 const CardHint = ({ children }: { children: ReactNode }) => (
   <p style={{ fontSize: 11, color: T.textTertiary, marginTop: 8, letterSpacing: "-0.11px" }}>{children}</p>
 );
+
+// ─── Resume tab ──────────────────────────────────────────────────────────
+
+interface ResumeTabProps {
+  resumes: Resume[];
+  onChange: (r: Resume[]) => void;
+}
+
+const ResumeTab = ({ resumes, onChange }: ResumeTabProps) => {
+  const [adding, setAdding] = useState(false);
+  const [name,   setName]   = useState("");
+  const [text,   setText]   = useState("");
+  const [err,    setErr]    = useState<string | null>(null);
+
+  const submit = () => {
+    if (!name.trim()) { setErr("Name is required."); return; }
+    if (!text.trim()) { setErr("Paste your resume text."); return; }
+    onChange([...resumes, { id: Date.now(), name: name.trim(), text: text.trim() }]);
+    setAdding(false);
+    setName("");
+    setText("");
+    setErr(null);
+  };
+
+  const remove = (id: number) => onChange(resumes.filter((r) => r.id !== id));
+
+  return (
+    <Card>
+      <CardTitle>Master resumes</CardTitle>
+      <CardDesc>
+        Add one or more variants — InterPrep picks the closest match for each
+        job and tailors it to the JD before starting company research.
+      </CardDesc>
+
+      <div style={{ height: 12 }} />
+      <div style={{ height: 1, background: T.border, marginBottom: 10 }} />
+
+      {resumes.length === 0 ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Icon name="briefcase" size={13} color="#F59E0B" />
+          <span style={{ fontSize: 12, color: T.textTertiary, letterSpacing: "-0.12px" }}>
+            No resumes yet — add one below.
+          </span>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {resumes.map((r) => (
+            <div key={r.id} style={{
+              display: "flex", alignItems: "center", gap: 10,
+              padding: "8px 10px", borderRadius: 8,
+              background: T.surface, border: `0.5px solid ${T.border}`,
+            }}>
+              <Icon name="note" size={13} color={T.accent} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: T.text, letterSpacing: "-0.3px" }}>{r.name}</div>
+                <div style={{ fontSize: 11, color: T.textTertiary, letterSpacing: "-0.11px" }}>
+                  {r.text.length.toLocaleString()} characters
+                </div>
+              </div>
+              <button
+                onClick={() => remove(r.id)}
+                onMouseEnter={(e) => { e.currentTarget.style.background = T.surface2; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                style={{
+                  display: "flex", alignItems: "center", gap: 5,
+                  padding: "5px 10px", borderRadius: 14, border: "none",
+                  background: "transparent", color: "#EF4444",
+                  fontSize: 11, cursor: "pointer", fontFamily: T.fontBody,
+                }}
+              >
+                <Icon name="trash" size={11} /> Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ height: 12 }} />
+
+      {adding ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <FieldLabel>Name</FieldLabel>
+          <PlainField value={name} placeholder="e.g. Software Engineer — Backend"
+            onChange={(v) => { setName(v); setErr(null); }} />
+
+          <div style={{ height: 6 }} />
+          <FieldLabel>Resume text</FieldLabel>
+          <textarea
+            value={text}
+            placeholder="Paste your full resume text here…"
+            onChange={(e) => { setText(e.target.value); setErr(null); }}
+            style={{
+              ...fieldInputStyle(),
+              minHeight: 140, resize: "vertical", padding: "10px 12px",
+              lineHeight: 1.5,
+            }}
+          />
+
+          {err && <p style={{ fontSize: 11, color: "#EF4444", marginTop: 4 }}>{err}</p>}
+
+          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+            <button
+              onClick={() => { setAdding(false); setErr(null); setName(""); setText(""); }}
+              style={{
+                flex: 1, padding: "8px 0", borderRadius: 100, border: "none",
+                background: T.surface2, color: T.textSecondary,
+                fontSize: 12, fontWeight: 500, cursor: "pointer",
+                fontFamily: T.fontBody, letterSpacing: "-0.12px",
+              }}
+            >Cancel</button>
+            <button
+              onClick={submit}
+              style={{
+                flex: 2, padding: "8px 0", borderRadius: 100, border: "none",
+                background: "#fff", color: "#0C0C0C",
+                fontSize: 12, fontWeight: 500, cursor: "pointer",
+                fontFamily: T.fontBody, letterSpacing: "-0.12px",
+              }}
+            >Save resume</button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setAdding(true)}
+          style={{
+            display: "flex", alignItems: "center", gap: 6,
+            padding: "8px 14px", borderRadius: 100, border: "none",
+            background: T.surface2, color: T.text,
+            fontSize: 12, fontWeight: 500, cursor: "pointer",
+            fontFamily: T.fontBody, letterSpacing: "-0.12px",
+          }}
+        >
+          <Icon name="plus" size={11} />
+          Add a resume
+        </button>
+      )}
+    </Card>
+  );
+};
 const FieldLabel = ({ children }: { children: ReactNode }) => (
   <div style={{ fontSize: 12, color: T.textSecondary, marginBottom: 4, letterSpacing: "-0.12px" }}>{children}</div>
 );
@@ -1688,6 +2322,25 @@ const App = () => {
       .finally(() => setCredentialsLoaded(true));
   }, []);
 
+  // ── Resume library ─────────────────────────────────────────────────────
+  // Load on mount, save on every mutation (cheap; the file is small).
+  const [resumes, setResumes] = useState<Resume[]>([]);
+  const [resumesLoaded, setResumesLoaded] = useState(false);
+
+  useEffect(() => {
+    invoke<Resume[]>("list_resumes")
+      .then((r) => setResumes(r))
+      .catch((e) => console.error("list_resumes failed:", e))
+      .finally(() => setResumesLoaded(true));
+  }, []);
+
+  useEffect(() => {
+    if (!resumesLoaded) return;
+    invoke("save_resumes", { resumes }).catch((e) =>
+      console.error("save_resumes failed:", e),
+    );
+  }, [resumes, resumesLoaded]);
+
   // ── Load persisted jobs on mount ────────────────────────────────────────
   useEffect(() => {
     invoke<Job[]>("list_jobs")
@@ -1756,6 +2409,10 @@ const App = () => {
       reselectAfterRemoval(next);
       return next;
     });
+  };
+
+  const onUpdateJob = (id: string, updater: (j: Job) => Job) => {
+    setJobs((prev) => prev.map((j) => j.id === id ? updater(j) : j));
   };
 
   const onSendMessage = (text: string) => {
@@ -1891,12 +2548,13 @@ const App = () => {
 
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
         {activeScreen === "timeline" ? (
-          <div style={{
-            flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
-            color: T.textTertiary, fontSize: 14,
-          }}>
-            Timeline view — Gantt port is the next milestone.
-          </div>
+          <Gantt
+            jobs={jobs}
+            onSelectJob={(id) => { onSelectJob(id); setActiveScreen("chat"); }}
+            onNewJob={() => setShowNewJobModal(true)}
+            onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
+            onUpdateJob={onUpdateJob}
+          />
         ) : (
           <>
             <WorkspaceHeader
@@ -1924,6 +2582,8 @@ const App = () => {
         <SettingsModal
           credentials={credentials}
           onCredentialsChange={setCredentials}
+          resumes={resumes}
+          onResumesChange={setResumes}
           onClose={() => {
             setShowSettings(false);
             // Flush credentials to the OS keychain. Don't block close on it.

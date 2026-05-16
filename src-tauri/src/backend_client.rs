@@ -43,6 +43,55 @@ pub fn stream_chat(
     spawn_stream(app, url, body);
 }
 
+/// JD-focused role-fit analysis stream.
+pub fn stream_research(
+    app: AppHandle,
+    base_url: String,
+    company: String,
+    role: String,
+    jd: String,
+    api_key: String,
+) {
+    let url = format!("{base_url}/research/stream");
+    let body = serde_json::json!({
+        "company":         company,
+        "role":            role,
+        "job_description": jd,
+        "api_key":         api_key,
+    });
+    spawn_stream(app, url, body);
+}
+
+/// Full company research — runs the scraping agents that need the user's
+/// Glassdoor / Indeed logins to bypass paywalls.
+pub fn stream_company_research(
+    app: AppHandle,
+    base_url: String,
+    company: String,
+    role: String,
+    location: String,
+    job_description: String,
+    api_key: String,
+    glassdoor_email: String,
+    glassdoor_password: String,
+    indeed_email: String,
+    indeed_password: String,
+) {
+    let url = format!("{base_url}/company-research/stream");
+    let body = serde_json::json!({
+        "company":            company,
+        "role":               role,
+        "location":           location,
+        "job_description":    job_description,
+        "api_key":            api_key,
+        "glassdoor_email":    glassdoor_email,
+        "glassdoor_password": glassdoor_password,
+        "indeed_email":       indeed_email,
+        "indeed_password":    indeed_password,
+    });
+    spawn_stream(app, url, body);
+}
+
 fn spawn_stream(app: AppHandle, url: String, body: Value) {
     std::thread::spawn(move || {
         let client = reqwest::blocking::Client::new();
