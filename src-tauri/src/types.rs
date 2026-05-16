@@ -64,5 +64,7 @@ pub struct Job {
     pub avatar_color: String,
     pub chats: Vec<ChatThread>,
     #[serde(default)]
+    pub job_description: Option<String>,
+    #[serde(default)]
     pub archived: bool,
 }

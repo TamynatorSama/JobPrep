@@ -16,6 +16,43 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import * as pdfjs from "pdfjs-dist";
+// pdf.js needs a worker. Vite bundles the worker script as a separate URL.
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import mammoth from "mammoth";
+
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+// ─── Resume file parsing ──────────────────────────────────────────────────
+
+/** Extracts plain text from PDF/DOCX/MD/TXT. Throws on unknown extension. */
+async function extractResumeText(file: File): Promise<string> {
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "txt" || ext === "md") {
+    return await file.text();
+  }
+  if (ext === "docx") {
+    const buf = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer: buf });
+    return result.value;
+  }
+  if (ext === "pdf") {
+    const buf = await file.arrayBuffer();
+    const doc = await pdfjs.getDocument({ data: buf }).promise;
+    const pages: string[] = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      pages.push(
+        content.items
+          .map((it) => ("str" in it ? it.str : ""))
+          .join(" "),
+      );
+    }
+    return pages.join("\n\n");
+  }
+  throw new Error(`Unsupported file type: .${ext}`);
+}
 
 // ─── Backend lifecycle ─────────────────────────────────────────────────────
 
@@ -129,6 +166,8 @@ interface Job {
   avatar: string;
   avatarColor: string;
   chats: ChatThread[];
+  /** Full job description text. Used as context for chat + research. */
+  jobDescription?: string;
   /** Hidden from the main sidebar list once true. */
   archived?: boolean;
 }
@@ -1687,6 +1726,7 @@ interface NewJobFormState {
   url: string;
   location: string;
   status: JobStatusKey;
+  jobDescription: string;
   notes: string;
 }
 
@@ -1697,7 +1737,8 @@ interface NewJobModalProps {
 
 const NewJobModal = ({ onClose, onSubmit }: NewJobModalProps) => {
   const [form, setForm] = useState<NewJobFormState>({
-    company: "", role: "", url: "", location: "", status: "Applied", notes: "",
+    company: "", role: "", url: "", location: "", status: "Applied",
+    jobDescription: "", notes: "",
   });
   const [errors, setErrors] = useState<Partial<Record<keyof NewJobFormState, string>>>({});
 
@@ -1790,6 +1831,14 @@ const NewJobModal = ({ onClose, onSubmit }: NewJobModalProps) => {
               </select>
             </Field>
           </div>
+          <Field label="Job Description" id="jobDescription">
+            <textarea
+              style={{ ...fieldStyle(), minHeight: 120, resize: "vertical" }}
+              value={form.jobDescription}
+              onChange={(e) => setForm((f) => ({ ...f, jobDescription: e.target.value }))}
+              placeholder="Paste the JD here so InterPrep can research the company, process, and likely questions."
+            />
+          </Field>
           <Field label="Notes" id="notes">
             <textarea
               style={{ ...fieldStyle(), minHeight: 72, resize: "vertical" }}
@@ -2023,19 +2072,33 @@ interface ResumeTabProps {
 }
 
 const ResumeTab = ({ resumes, onChange }: ResumeTabProps) => {
-  const [adding, setAdding] = useState(false);
-  const [name,   setName]   = useState("");
-  const [text,   setText]   = useState("");
-  const [err,    setErr]    = useState<string | null>(null);
+  const [err,     setErr]     = useState<string | null>(null);
+  const [busy,    setBusy]    = useState(false);
+  const fileInput = useRef<HTMLInputElement | null>(null);
 
-  const submit = () => {
-    if (!name.trim()) { setErr("Name is required."); return; }
-    if (!text.trim()) { setErr("Paste your resume text."); return; }
-    onChange([...resumes, { id: Date.now(), name: name.trim(), text: text.trim() }]);
-    setAdding(false);
-    setName("");
-    setText("");
+  const handleFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setBusy(true);
     setErr(null);
+    const added: Resume[] = [];
+    for (const file of Array.from(files)) {
+      try {
+        const text = await extractResumeText(file);
+        if (!text.trim()) throw new Error("File is empty or unreadable.");
+        // Strip the extension so the displayed name stays clean.
+        const baseName = file.name.replace(/\.[^.]+$/, "");
+        added.push({
+          id:   Date.now() + Math.floor(Math.random() * 1000),
+          name: baseName,
+          text: text.trim(),
+        });
+      } catch (e) {
+        setErr(`${file.name}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (added.length) onChange([...resumes, ...added]);
+    setBusy(false);
+    if (fileInput.current) fileInput.current.value = "";
   };
 
   const remove = (id: number) => onChange(resumes.filter((r) => r.id !== id));
@@ -2093,63 +2156,39 @@ const ResumeTab = ({ resumes, onChange }: ResumeTabProps) => {
 
       <div style={{ height: 12 }} />
 
-      {adding ? (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <FieldLabel>Name</FieldLabel>
-          <PlainField value={name} placeholder="e.g. Software Engineer — Backend"
-            onChange={(v) => { setName(v); setErr(null); }} />
+      <input
+        ref={fileInput}
+        type="file"
+        accept=".pdf,.docx,.md,.txt"
+        multiple
+        style={{ display: "none" }}
+        onChange={(e) => handleFiles(e.target.files)}
+      />
+      <div
+        onClick={() => !busy && fileInput.current?.click()}
+        onDragOver={(e) => { e.preventDefault(); e.currentTarget.style.borderColor = T.accent; }}
+        onDragLeave={(e) => { e.currentTarget.style.borderColor = T.border; }}
+        onDrop={(e) => {
+          e.preventDefault();
+          e.currentTarget.style.borderColor = T.border;
+          handleFiles(e.dataTransfer.files);
+        }}
+        style={{
+          border: `1px dashed ${T.border}`, borderRadius: 12,
+          padding: 22, textAlign: "center", cursor: busy ? "default" : "pointer",
+          background: T.surface, opacity: busy ? 0.6 : 1,
+        }}
+      >
+        <Icon name="upload" size={22} color={T.textTertiary} />
+        <p style={{ marginTop: 8, fontSize: 13, color: T.text, fontWeight: 500, letterSpacing: "-0.13px" }}>
+          {busy ? "Reading…" : "Drop a resume here, or click to choose"}
+        </p>
+        <p style={{ marginTop: 4, fontSize: 11, color: T.textTertiary, letterSpacing: "-0.11px" }}>
+          PDF, DOCX, MD, or TXT
+        </p>
+      </div>
 
-          <div style={{ height: 6 }} />
-          <FieldLabel>Resume text</FieldLabel>
-          <textarea
-            value={text}
-            placeholder="Paste your full resume text here…"
-            onChange={(e) => { setText(e.target.value); setErr(null); }}
-            style={{
-              ...fieldInputStyle(),
-              minHeight: 140, resize: "vertical", padding: "10px 12px",
-              lineHeight: 1.5,
-            }}
-          />
-
-          {err && <p style={{ fontSize: 11, color: "#EF4444", marginTop: 4 }}>{err}</p>}
-
-          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-            <button
-              onClick={() => { setAdding(false); setErr(null); setName(""); setText(""); }}
-              style={{
-                flex: 1, padding: "8px 0", borderRadius: 100, border: "none",
-                background: T.surface2, color: T.textSecondary,
-                fontSize: 12, fontWeight: 500, cursor: "pointer",
-                fontFamily: T.fontBody, letterSpacing: "-0.12px",
-              }}
-            >Cancel</button>
-            <button
-              onClick={submit}
-              style={{
-                flex: 2, padding: "8px 0", borderRadius: 100, border: "none",
-                background: "#fff", color: "#0C0C0C",
-                fontSize: 12, fontWeight: 500, cursor: "pointer",
-                fontFamily: T.fontBody, letterSpacing: "-0.12px",
-              }}
-            >Save resume</button>
-          </div>
-        </div>
-      ) : (
-        <button
-          onClick={() => setAdding(true)}
-          style={{
-            display: "flex", alignItems: "center", gap: 6,
-            padding: "8px 14px", borderRadius: 100, border: "none",
-            background: T.surface2, color: T.text,
-            fontSize: 12, fontWeight: 500, cursor: "pointer",
-            fontFamily: T.fontBody, letterSpacing: "-0.12px",
-          }}
-        >
-          <Icon name="plus" size={11} />
-          Add a resume
-        </button>
-      )}
+      {err && <p style={{ fontSize: 11, color: "#EF4444", marginTop: 8 }}>{err}</p>}
     </Card>
   );
 };
@@ -2458,6 +2497,9 @@ const App = () => {
           `Company: ${job.company}`,
           `Role: ${job.role}`,
           job.location ? `Location: ${job.location}` : "",
+          job.jobDescription
+            ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}`
+            : "",
         ].filter(Boolean).join("\n")
       : "";
 
@@ -2518,6 +2560,7 @@ const App = () => {
       chats: [
         { id: `c-new-${id}`, title: "General Prep", preview: "Start your prep here...", messages: [] },
       ],
+      jobDescription: form.jobDescription.trim() || undefined,
     };
     setJobs((prev) => [...prev, newJob]);
     setSelectedJobId(id);
