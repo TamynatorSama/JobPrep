@@ -1,0 +1,184 @@
+URL: https://www.levels.fyi/companies/stripe/salaries/software-engineer?country=254
+Title: Stripe Software Engineer Salary | $208K-$860K+ | Levels.fyi
+
+Visible text:
+📣Levels.fyi has acquired TechPaysLevels.fyi acquires TechPaysRead MoreFor EmployersDownload AppUSD/ yrChangeEnglish (US)ChangeLoginSign UpAll DataBy LocationBy CompanyBy TitleSalary CalculatorChart VisualizationsVerified SalariesInternshipsH-1B SalariesNegotiation SupportCompare BenefitsWho's Hiring2025 Pay ReportTop Paying CompaniesIntegrateBlogPressGoogleSoftware EngineerProduct ManagerNew York City AreaData ScientistExplore By Different TitlesSalaries📂 All Data🌎 By Location🏢 By Company🖋 By Title🏭️ By Industry📍 Salary Heatmap📈 Chart Visualizations🔥 Real-time Percentiles🎓 Internships🛂 H-1B Salaries❣️ Compare Benefits🎬 2025 Pay Report🏆 Top Paying Companies💸 Calculate Meeting Cost#️⃣ Salary CalculatorContributeAdd SalaryAdd Company BenefitsAdd Level MappingJobs🔍 Search Jobs📥 InboxServicesCandidate Services💵 Negotiation Coaching📄 Resume Review🎁 Gift a Resume ReviewFor EmployersData ExplorerTalent PoolInteractive Offer LettersReal-time Percentiles 🔥Compensation BenchmarkingLevels.fyi API, MCP, CLIFor Academic ResearchCompensation DatasetCommunityDownload AppHiring?Engaged senior talent with comp upfrontSenior talent, comp upfrontExplore TalentGet HiredInterviews on your calendar. You set the bar.Interviews on your termsUpload ResumeResumeNegotiate$10K+ guaranteed or money backFree Consult← Company Directory StripeWork Here? Claim Your CompanyOverviewSalariesBenefitsJobsNewChatSalariesSoftware EngineerAll Software Engineer SalariesStripe Software Engineer Salaries United StatesSoftware Engineer compensation in United States at Stripe ranges from $208K per year for L1 to $860K per year for L6. The median yearly compensation in United States package totals $316K. View the base salary, stock, and bonus breakdowns for Stripe's total compensation packages. Last updated: 5/14/2026Average Compensation By LevelAdd CompCompare LevelsLevel NameTotal Base Stock (/yr)Bonus L1(Entry Level)$208K$145K$43K$19.9KL2$284K$184K$79.9K$19.6KL3$437K$233K$181K$23.3KL4Staff Engineer$633K$278K$300K$55.4KView 3 More LevelsAdd CompCompare LevelsOpen to the right role?Set your comp bar. Only companies that clear it reach out.Upload ResumeLatest Salary Submissions​Table FilterSubscribeAddAdd CompAdd CompensationUnited StatesCompanyLocation | DateLevel NameTagYears of ExperienceTotal / At CompanyTotal Compensation (USD) Base | Stock (yr) | Bonus StripeSeattle, WA | 18 hours agoL1Full Stack0 yrs 0 yrs$210,000160K | 50K | N/AStripeSouth San Francisco, CA | a day agoL5Developer Productivity23 yrs 0 yrs$835,000340K | 400K | 95KStripeSeattle, WA | 2 days agoL2Distributed Systems (Back-End)2 yrs 2 yrs$310,000176K | 116K | 18KUnlock by Adding Your Salary!Add your salary anonymously in less than 60 seconds and continue exploring all the data.Add SalaryAdded mine already within last 1 year***********, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/**
+
+Interactive elements:
+[
+  {
+    "i": 112,
+    "tag": "button",
+    "type": "button",
+    "text": "What's the vesting schedule at Stripe?",
+    "href": ""
+  },
+  {
+    "i": 113,
+    "tag": "a",
+    "type": "",
+    "text": "Learn More \u2192",
+    "href": "https://www.levels.fyi/verified"
+  },
+  {
+    "i": 115,
+    "tag": "button",
+    "type": "submit",
+    "text": "Subscribe",
+    "href": ""
+  },
+  {
+    "i": 118,
+    "tag": "a",
+    "type": "",
+    "text": "Submit New Title",
+    "href": "https://www.levels.fyi/salaries/add"
+  },
+  {
+    "i": 119,
+    "tag": "a",
+    "type": "",
+    "text": "Machine Learning Engineer",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer/title/machine"
+  },
+  {
+    "i": 120,
+    "tag": "a",
+    "type": "",
+    "text": "Backend Software Engineer",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer/title/backend"
+  },
+  {
+    "i": 121,
+    "tag": "a",
+    "type": "",
+    "text": "Full-Stack Software Engineer",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer/title/full-st"
+  },
+  {
+    "i": 122,
+    "tag": "a",
+    "type": "",
+    "text": "Crypto Engineer",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer/title/crypto-"
+  },
+  {
+    "i": 123,
+    "tag": "div",
+    "type": "",
+    "text": "What is the highest Software Engineer salary at Stripe in Un",
+    "href": ""
+  },
+  {
+    "i": 124,
+    "tag": "div",
+    "type": "",
+    "text": "How much do Stripe Software Engineer employees get paid in U",
+    "href": ""
+  },
+  {
+    "i": 125,
+    "tag": "div",
+    "type": "",
+    "text": "How can I negotiate a higher Software Engineer offer at Stri",
+    "href": ""
+  },
+  {
+    "i": 150,
+    "tag": "a",
+    "type": "",
+    "text": "/companies/stripe/salaries/software-engineer.md",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer.md"
+  },
+  {
+    "i": 151,
+    "tag": "a",
+    "type": "",
+    "text": "robots.txt",
+    "href": "https://www.levels.fyi/robots.txt"
+  },
+  {
+    "i": 152,
+    "tag": "a",
+    "type": "",
+    "text": "llms.txt",
+    "href": "https://www.levels.fyi/llms.txt"
+  },
+  {
+    "i": 153,
+    "tag": "a",
+    "type": "",
+    "text": "https://www.levels.fyi",
+    "href": "https://www.levels.fyi/"
+  },
+  {
+    "i": 159,
+    "tag": "button",
+    "type": "button",
+    "text": "USD\n/ yr",
+    "href": ""
+  },
+  {
+    "i": 162,
+    "tag": "a",
+    "type": "",
+    "text": "Home Page",
+    "href": "https://www.levels.fyi/"
+  },
+  {
+    "i": 163,
+    "tag": "a",
+    "type": "",
+    "text": "Job Board",
+    "href": "https://www.levels.fyi/jobs?locationSlug=united-states"
+  },
+  {
+    "i": 164,
+    "tag": "a",
+    "type": "",
+    "text": "Compensation",
+    "href": "https://www.levels.fyi/t/software-engineer"
+  },
+  {
+    "i": 165,
+    "tag": "a",
+    "type": "",
+    "text": "Salary Heatmap",
+    "href": "https://www.levels.fyi/heatmap/"
+  },
+  {
+    "i": 166,
+    "tag": "a",
+    "type": "",
+    "text": "Salary Calculator",
+    "href": "https://www.levels.fyi/calculator/"
+  },
+  {
+    "i": 167,
+    "tag": "a",
+    "type": "",
+    "text": "Benefits",
+    "href": "https://www.levels.fyi/benefits/"
+  },
+  {
+    "i": 168,
+    "tag": "a",
+    "type": "",
+    "text": "Verified Salaries",
+    "href": "https://www.levels.fyi/verified/"
+  },
+  {
+    "i": 169,
+    "tag": "a",
+    "type": "",
+    "text": "Internship Salaries",
+    "href": "https://www.levels.fyi/internships/"
+  },
+  {
+    "i": 170,
+    "tag": "a",
+    "type": "",
+    "text": "H-1B Salaries",
+    "href": "https://www.levels.fyi/h1b/"
+  }
+]

@@ -1,0 +1,46 @@
+{
+  "action": "done",
+  "data": {
+    "role": "Software Engineer",
+    "tc_median": 316000,
+    "base": 210000,
+    "equity": 151000,
+    "bonus": 29600,
+    "submissions": null,
+    "trend": null,
+    "levels": [
+      {
+        "level": "L1",
+        "name": "Entry Level",
+        "total": 208000,
+        "base": 145000,
+        "equity": 43000,
+        "bonus": 19900
+      },
+      {
+        "level": "L2",
+        "name": null,
+        "total": 284000,
+        "base": 184000,
+        "equity": 79900,
+        "bonus": 19600
+      },
+      {
+        "level": "L3",
+        "name": null,
+        "total": 437000,
+        "base": 233000,
+        "equity": 181000,
+        "bonus": 23300
+      },
+      {
+        "level": "L4",
+        "name": "Staff Engineer",
+        "total": 633000,
+        "base": 278000,
+        "equity": 300000,
+        "bonus": 55400
+      }
+    ]
+  }
+}

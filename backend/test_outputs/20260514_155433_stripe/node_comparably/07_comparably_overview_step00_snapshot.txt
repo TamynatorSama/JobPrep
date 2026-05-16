@@ -1,0 +1,184 @@
+URL: https://www.comparably.com/companies/stripe/
+Title: Stripe Culture | Comparably
+
+Visible text:
+ComparablySearch TermSearch EverythingDashboardCompaniesBrandsSalariesCultureAwards Search...ProfileCompaniesBrandsSalariesNewsAwards Search...For EmployersLoginSign UpPressContact UsEnglishBritishFrançaisDeutschItalianoPortuguêsPусскийEspañolExec, HR Leader, or Brand Manager? Claim This PageCompetitors:ComdataBlockAppleVisaPayPalStripeA set of unified APIs and tools that instantly enable businesses to accept and manage online payments. read moreEMPLOYEE PARTICIPANTS225TOTAL RATINGS1578CEOPatrick CollisonRate This CompanyOverviewLeadershipReviewsSalariesCompetitorsInterviewsQ&A⋮OverviewLeadershipReviewsSalariesCompetitorsInterviewsQ&ARate This CompanyWorking at StripeReviewsAboutCompetitorsEmployeesFeatured ArticlesLeadershipSalariesDiversity & InclusionPerks & BenefitsPTOCareersFAQs⋮Working at StripeReviewsAboutCompetitorsEmployeesFeatured ArticlesLeadershipSalariesDiversity & InclusionPerks & BenefitsPTOCareersFAQsHomeCompaniesStripeUpdated on: April 27, 2026Stripe Company CultureStripe Culture This score is derived from employee ratings & reviews4.2/5 Stripe's Overall Culture is rated B+ Top Rated Culture DimensionsCEO RatingADiversityAProfessional DevelopmentALeadershipA-Perks & BenefitsB+Stripe CEOTop 10%Top 10% of Similar Size Companies on ComparablyPatrick Collison 80 /100See MoreDiversity at StripeTop 10%Top 10% of Similar Size Companies on ComparablyADiverse employees at Stripe have rated CEO Rating, Team, and Outlook as the highest categories they have scoredWomen at StripeTop 35%Top 35% of Similar Size Companies on ComparablyBWomen at Stripe have rated Perks And Benefits, Professional Development, and Outlook as the highest categories they have scoredStripe eNPS Net Promoter Score tracks your employees' overall score to this question: "On a scale from 0-10, how likely are you to recommend working at your company to a friend?"Top 50%Top 50% of Similar Size Companies on ComparablyRecommend to a Friend?-2Stripe employees are -2% more likely to recommend Stripe as a great place to work41%Promoters16%Passives43%DetractorsWorking at StripeWorking at Stripe is rated highly by 225 employees, across various culture dimensions. Stripe employees are most satisfied about CEO Rating, Professional Development, and Leadership categories, putting Stripe’s culture in the Top 20% compared to similar sized companies on Comparably and in the Top 40% compared to other companies in San Francisco. See below in detail how working at Stripe was rated by employees.Overall Company CultureB+CEO RatingAGenderBDiversityAHappinessBFuture OutlookBPerks and BenefitsB+Professional DevelopmentACompensationBExecutive TeamBManagerBRetentionBeNPS-2Overall Company CultureCEO RatingGenderDiversityHappinessFuture OutlookPerks and BenefitsProfessional DevelopmentCompensationExecutive TeamManagerRetentioneNPSOverall Company CultureOverall Company Culture at StripeB+Overall Company Culture at Stripe is rated B+Last updated a month agoTop20%Stripe ranks in the Top 20% of other co
+
+Interactive elements:
+[
+  {
+    "i": 0,
+    "tag": "a",
+    "type": "",
+    "text": "Comparably",
+    "href": "https://www.comparably.com/"
+  },
+  {
+    "i": 12,
+    "tag": "a",
+    "type": "",
+    "text": "Companies",
+    "href": "https://www.comparably.com/companies"
+  },
+  {
+    "i": 13,
+    "tag": "a",
+    "type": "",
+    "text": "Brands",
+    "href": "https://www.comparably.com/brands"
+  },
+  {
+    "i": 14,
+    "tag": "a",
+    "type": "",
+    "text": "Salaries",
+    "href": "https://www.comparably.com/salaries"
+  },
+  {
+    "i": 15,
+    "tag": "a",
+    "type": "",
+    "text": "News",
+    "href": "https://www.comparably.com/news"
+  },
+  {
+    "i": 16,
+    "tag": "a",
+    "type": "",
+    "text": "Awards",
+    "href": "https://www.comparably.com/awards"
+  },
+  {
+    "i": 17,
+    "tag": "a",
+    "type": "",
+    "text": "Search...",
+    "href": "https://www.comparably.com/search"
+  },
+  {
+    "i": 18,
+    "tag": "a",
+    "type": "",
+    "text": "Login",
+    "href": "https://www.comparably.com/users/signin"
+  },
+  {
+    "i": 19,
+    "tag": "a",
+    "type": "",
+    "text": "Sign Up",
+    "href": "https://www.comparably.com/users/signup"
+  },
+  {
+    "i": 29,
+    "tag": "button",
+    "type": "submit",
+    "text": "Exec, HR Leader, or Brand Manager? Claim This Page",
+    "href": ""
+  },
+  {
+    "i": 30,
+    "tag": "a",
+    "type": "",
+    "text": "Comdata",
+    "href": "https://www.comparably.com/companies/comdata"
+  },
+  {
+    "i": 31,
+    "tag": "a",
+    "type": "",
+    "text": "Block",
+    "href": "https://www.comparably.com/companies/block-85109"
+  },
+  {
+    "i": 32,
+    "tag": "a",
+    "type": "",
+    "text": "Apple",
+    "href": "https://www.comparably.com/companies/apple"
+  },
+  {
+    "i": 33,
+    "tag": "a",
+    "type": "",
+    "text": "Visa",
+    "href": "https://www.comparably.com/companies/visa"
+  },
+  {
+    "i": 34,
+    "tag": "a",
+    "type": "",
+    "text": "PayPal",
+    "href": "https://www.comparably.com/companies/paypal"
+  },
+  {
+    "i": 36,
+    "tag": "a",
+    "type": "",
+    "text": "Stripe",
+    "href": "https://www.comparably.com/companies/stripe"
+  },
+  {
+    "i": 37,
+    "tag": "a",
+    "type": "",
+    "text": "read more",
+    "href": "https://www.comparably.com/companies/stripe/mission"
+  },
+  {
+    "i": 38,
+    "tag": "a",
+    "type": "",
+    "text": "CEO\nPatrick Collison",
+    "href": "https://www.comparably.com/companies/stripe/ceo-rating"
+  },
+  {
+    "i": 41,
+    "tag": "a",
+    "type": "",
+    "text": "Overview",
+    "href": "https://www.comparably.com/companies/stripe"
+  },
+  {
+    "i": 42,
+    "tag": "a",
+    "type": "",
+    "text": "Leadership",
+    "href": "https://www.comparably.com/companies/stripe/leadership"
+  },
+  {
+    "i": 43,
+    "tag": "a",
+    "type": "",
+    "text": "Reviews",
+    "href": "https://www.comparably.com/companies/stripe/reviews"
+  },
+  {
+    "i": 44,
+    "tag": "a",
+    "type": "",
+    "text": "Salaries",
+    "href": "https://www.comparably.com/companies/stripe/salaries"
+  },
+  {
+    "i": 45,
+    "tag": "a",
+    "type": "",
+    "text": "Competitors",
+    "href": "https://www.comparably.com/companies/stripe/competitors"
+  },
+  {
+    "i": 46,
+    "tag": "a",
+    "type": "",
+    "text": "Interviews",
+    "href": "https://www.comparably.com/companies/stripe/interviews"
+  },
+  {
+    "i": 47,
+    "tag": "a",
+    "type": "",
+    "text": "Q&A",
+    "href": "https://www.comparably.com/companies/stripe/questions"
+  }
+]

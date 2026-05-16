@@ -1,0 +1,20 @@
+{
+  "action": "done",
+  "data": {
+    "rating": 3.5,
+    "review_count": 30,
+    "pros": [
+      "Fair pay for job",
+      "Ability to learn new things",
+      "Time and location flexibility"
+    ],
+    "cons": [
+      "Ability to meet personal goals",
+      "Inclusive work environment",
+      "Trust in colleagues"
+    ],
+    "work_life_balance": 3.0,
+    "compensation": 4.1,
+    "management": 2.8
+  }
+}

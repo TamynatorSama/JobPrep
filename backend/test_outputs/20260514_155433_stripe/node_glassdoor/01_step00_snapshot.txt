@@ -1,0 +1,172 @@
+URL: https://www.glassdoor.com/Search/results.htm?keyword=Stripe
+Title: “Stripe” results | Glassdoor
+
+Visible text:
+Skip to contentSkip to footerCommunityJobsCompaniesSalariesFor EmployersSearchNotificationsLoading...Sign In“Stripe” resultsCompaniesStripe3.7★5jobs1.5Kreviews4.5KsalariesStripe OLT4.2★0jobs24reviews36salariesStripe Communications2.9★0jobs12reviews44salariesView more companies JobsCaptivateIQ3.9Vice President of Technical ServicesUnited States$225K - $378K (Employer provided)Easy Apply23dOwner4.6Staff Product DesignerRemote$190K - $270K (Employer provided)30d+Owner4.6Head of SEO + AEORemote$190K - $230K (Employer provided)30d+Viva BenefitsTechnical AdvisorRemote$73K - $208K (Employer provided)30d+View more jobs ConversationsFinanceKk Imb5dI'm currently in an interview process with PayPal and wanted to get perspectives from people who are either currently at the company or have recently left. some of the news i have seen so far: 3 CEO changes in the past 4 years Rumors earlier this year about a potential Stripe acquisition Recent articles about planning to cut 20% of the workforce another major organization restructuring and a number of senior executives departing would really appreciate any insights from current employees,read more21 CommentTechKk Imb5dI'm currently in an interview process with PayPal and wanted to get perspectives from people who are either currently at the company or have recently left. some of the news i have seen so far: 3 CEO changes in the past 4 years Rumors earlier this year about a potential Stripe acquisition Recent articles about planning to cut 20% of the workforce another major organization restructuring and several senior executives departing would really appreciate any insights from current employees,read more55 CommentsJobs in FinanceKk Imb5dI'm currently in an interview process with PayPal and wanted to get perspectives from people who are either currently at the company or have recently left. some of the news i have seen so far: 3 CEO changes in the past 4 years Rumors earlier this year about a potential Stripe acquisition
+Recent articles about planning to cut 20% of the workforce
+another major organization restructuring and a number of senior executives departing would really appreciate any insights from current employees,read more2CommentFintechPre-IPO & Capital Markets1moSeeing a lot of senior talent in this bowl looking to jump from 'legacy' fintech to pre-IPO giants. If you’re making the move to a name like Stripe or OpenAI, does it make more sense to wait for your RSU grant to vest over 4 years, or to grab a discounted secondary allocation now to lock in the '2026 entry price' before the S-1 drops??read more3CommentAsset / Investment ManagementPre-IPO & Capital Markets1moAnyone else seeing their LPs/clients asking more about late-stage secondaries as a hedge against the public tech volatility? With the 'Big 3' (SpaceX, OpenAI, Stripe) trading at 25–40% discounts to their last rounds, it feels like the secondary market is finally offering the 'entry price' margin of safety that the public markets haven't se
+
+Interactive elements:
+[
+  {
+    "i": 0,
+    "tag": "a",
+    "type": "",
+    "text": "Skip to content",
+    "href": "https://www.glassdoor.com/Search/results.htm?keyword=Stripe#__next"
+  },
+  {
+    "i": 1,
+    "tag": "a",
+    "type": "",
+    "text": "Skip to footer",
+    "href": "https://www.glassdoor.com/Search/results.htm?keyword=Stripe#GlobalFooter"
+  },
+  {
+    "i": 2,
+    "tag": "a",
+    "type": "",
+    "text": "Glassdoor Home",
+    "href": "https://www.glassdoor.com/index.htm"
+  },
+  {
+    "i": 3,
+    "tag": "a",
+    "type": "",
+    "text": "Community",
+    "href": "https://www.glassdoor.com/Community/index.htm"
+  },
+  {
+    "i": 4,
+    "tag": "a",
+    "type": "",
+    "text": "Jobs",
+    "href": "https://www.glassdoor.com/Job/index.htm"
+  },
+  {
+    "i": 5,
+    "tag": "a",
+    "type": "",
+    "text": "Companies",
+    "href": "https://www.glassdoor.com/Reviews/index.htm"
+  },
+  {
+    "i": 6,
+    "tag": "a",
+    "type": "",
+    "text": "Salaries",
+    "href": "https://www.glassdoor.com/Salaries/index.htm"
+  },
+  {
+    "i": 7,
+    "tag": "a",
+    "type": "",
+    "text": "For Employers",
+    "href": "https://www.glassdoor.com/employers/?source=gdemployermenu"
+  },
+  {
+    "i": 9,
+    "tag": "button",
+    "type": "button",
+    "text": "Search",
+    "href": ""
+  },
+  {
+    "i": 10,
+    "tag": "input",
+    "type": "text",
+    "text": "Search",
+    "href": ""
+  },
+  {
+    "i": 11,
+    "tag": "input",
+    "type": "text",
+    "text": "Location",
+    "href": ""
+  },
+  {
+    "i": 12,
+    "tag": "button",
+    "type": "button",
+    "text": "notifications",
+    "href": ""
+  },
+  {
+    "i": 14,
+    "tag": "button",
+    "type": "button",
+    "text": "Sign In",
+    "href": ""
+  },
+  {
+    "i": 15,
+    "tag": "a",
+    "type": "",
+    "text": "Stripe\n3.7\u2605\n5jobs\n1.5Kreviews\n4.5Ksalaries",
+    "href": "https://www.glassdoor.com/Overview/Working-at-Stripe-EI_IE671932.11,17.htm"
+  },
+  {
+    "i": 16,
+    "tag": "a",
+    "type": "",
+    "text": "Stripe OLT\n4.2\u2605\n0jobs\n24reviews\n36salaries",
+    "href": "https://www.glassdoor.com/Overview/Working-at-Stripe-OLT-EI_IE5554043.11,21.htm"
+  },
+  {
+    "i": 17,
+    "tag": "a",
+    "type": "",
+    "text": "Stripe Communications\n2.9\u2605\n0jobs\n12reviews\n44salaries",
+    "href": "https://www.glassdoor.com/Overview/Working-at-Stripe-Communications-EI_IE1025096"
+  },
+  {
+    "i": 18,
+    "tag": "a",
+    "type": "",
+    "text": "View more companies",
+    "href": "https://www.glassdoor.com/Explore/browse-companies.htm?employerName=Stripe&overa"
+  },
+  {
+    "i": 19,
+    "tag": "button",
+    "type": "button",
+    "text": "Save",
+    "href": ""
+  },
+  {
+    "i": 21,
+    "tag": "button",
+    "type": "button",
+    "text": "Save",
+    "href": ""
+  },
+  {
+    "i": 23,
+    "tag": "button",
+    "type": "button",
+    "text": "Save",
+    "href": ""
+  },
+  {
+    "i": 25,
+    "tag": "button",
+    "type": "button",
+    "text": "Save",
+    "href": ""
+  },
+  {
+    "i": 27,
+    "tag": "button",
+    "type": "button",
+    "text": "Next",
+    "href": ""
+  },
+  {
+    "i": 28,
+    "tag": "a",
+    "type": "",
+    "text": "View more jobs",
+    "href": "https://www.glassdoor.com/Job/jobs.htm?sc.keyword=Stripe"
+  }
+]

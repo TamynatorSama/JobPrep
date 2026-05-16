@@ -1,0 +1,184 @@
+URL: https://www.indeed.com/cmp/Stripe/reviews
+Title: Working at Stripe: Employee Reviews | Indeed.com
+
+Visible text:
+HomeCompany reviewsFind salariesSign inSign in1 new updateEmployers / Post JobStart of main content StripeWork wellbeing score is 6464•3.5 out of 5 stars.3.5•UnclaimedFollowWrite a reviewSnapshotWhy Join Us30Reviews634Salaries3Jobs14Q&AInterviewsWant to work here?View jobsWorking at Stripe: 23 ReviewsUpdated October 6, 2025Overall rating3.5Based on 30 reviews54321Detailed ratingsWork-life balance3.03.0 out of 5 stars for Work-life balancePay and benefits4.14.1 out of 5 stars for Pay and benefitsJob security and advancement2.92.9 out of 5 stars for Job security and advancementManagement2.82.8 out of 5 stars for ManagementCulture3.03.0 out of 5 stars for CultureWhat people are sayingWhat people likeFair pay for jobWhat people likeAbility to learn new thingsWhat people likeTime and location flexibilityAreas for improvementAbility to meet personal goalsAreas for improvementInclusive work environmentAreas for improvementTrust in colleaguesJob titleJob titlesSoftware EngineerShift LeaderSoftware Engineer InternCustomer Service RepresentativeAutomotive TechnicianDepartmentsSoftware DevelopmentManagementFood Preparation & ServiceMarketingInstallation & MaintenanceLocationKeywordsTopicsAll topicsWork-life balancePay and benefitsJob security and advancementManagementCulture23 reviewsSortSelecting an option will update the pageNewestHighestLowestOctober 4, 2025Run awayAnonymousIf you're considering working here, be prepared for a deeply toxic culture masked by surface-level perks. Management is disengaged, unaccountable, and often indifferent to employee well-being or performance standards. Instead of leadership, you'll find lazy managers who delegate without direction, avoid...Show moreReport reviewCopy linkJobs at StripeSee more jobspage 1 of 2slide1 of 4Chief Operating OfficerWashington, DC$200,700 - $301,100 a year13 days agoslide2 of 4Head of SalesNew York, NY$389,600 - $584,400 a year7 days agoslide3 of 4Global Head of Specialist Solutions ArchitectureNew York, NY$254,600 - $382,000 a year3 days agoslide4 of 4See more jobs1 / 21 / 2September 12, 2025Great company AnonymousGreat company, great business to be in. Strong leadership, not often easy to navigate. Great company if you like to work hard on difficult payment challengesReport reviewCopy linkJune 4, 2025Supportive team, high-impact work, and modern stackSenior Full Stack DeveloperRemoteStripe has been a rewarding place to work as a Senior Full Stack Developer. A typical day involves solving challenging problems across both the backend and frontend — especially within the payments domain. I’ve worked with technologies like Node.js, React, TypeScript, PostgreSQL, and AWS.The engineering...Show moreReport reviewCopy linkNovember 27, 2024Zero psychological safety is a featureSoftware EngineerRemoteCoworkers are brilliant to work with but the culture of overworking and being constantly threatened with a PIP is overbearing. No matter what your previous review ratings were, one slipped deadline could l
+
+Interactive elements:
+[
+  {
+    "i": 0,
+    "tag": "a",
+    "type": "",
+    "text": "Indeed Home",
+    "href": "https://www.indeed.com/?from=gnav-acme--acme-webapp"
+  },
+  {
+    "i": 1,
+    "tag": "a",
+    "type": "",
+    "text": "Home",
+    "href": "https://www.indeed.com/"
+  },
+  {
+    "i": 2,
+    "tag": "a",
+    "type": "",
+    "text": "Company reviews",
+    "href": "https://www.indeed.com/companies"
+  },
+  {
+    "i": 3,
+    "tag": "a",
+    "type": "",
+    "text": "Find salaries",
+    "href": "https://www.indeed.com/career/salaries"
+  },
+  {
+    "i": 4,
+    "tag": "a",
+    "type": "",
+    "text": "Sign in",
+    "href": "https://secure.indeed.com/auth?hl=en_US&co=US&continue=https%3A%2F%2Fwww.indeed."
+  },
+  {
+    "i": 7,
+    "tag": "a",
+    "type": "",
+    "text": "Employers / Post Job",
+    "href": "https://www.indeed.com/hire?co=US&hl=en"
+  },
+  {
+    "i": 8,
+    "tag": "button",
+    "type": "button",
+    "text": "Unclaimed",
+    "href": ""
+  },
+  {
+    "i": 9,
+    "tag": "button",
+    "type": "submit",
+    "text": "Follow",
+    "href": ""
+  },
+  {
+    "i": 10,
+    "tag": "a",
+    "type": "",
+    "text": "Write a review",
+    "href": "https://www.indeed.com/survey/short?cid=294371aa99529aea&pkind=comp%3Aheader%3Aw"
+  },
+  {
+    "i": 11,
+    "tag": "button",
+    "type": "submit",
+    "text": "Reveal previous navigation items",
+    "href": ""
+  },
+  {
+    "i": 12,
+    "tag": "a",
+    "type": "",
+    "text": "Snapshot",
+    "href": "https://www.indeed.com/cmp/Stripe"
+  },
+  {
+    "i": 13,
+    "tag": "a",
+    "type": "",
+    "text": "Why Join Us",
+    "href": "https://www.indeed.com/cmp/Stripe/about"
+  },
+  {
+    "i": 14,
+    "tag": "a",
+    "type": "",
+    "text": "30\nReviews",
+    "href": "https://www.indeed.com/cmp/Stripe/reviews"
+  },
+  {
+    "i": 15,
+    "tag": "a",
+    "type": "",
+    "text": "634\nSalaries",
+    "href": "https://www.indeed.com/cmp/Stripe/salaries"
+  },
+  {
+    "i": 16,
+    "tag": "a",
+    "type": "",
+    "text": "3\nJobs",
+    "href": "https://www.indeed.com/cmp/Stripe/jobs"
+  },
+  {
+    "i": 17,
+    "tag": "a",
+    "type": "",
+    "text": "14\nQ&A",
+    "href": "https://www.indeed.com/cmp/Stripe/faq"
+  },
+  {
+    "i": 18,
+    "tag": "a",
+    "type": "",
+    "text": "Interviews",
+    "href": "https://www.indeed.com/cmp/Stripe/interviews"
+  },
+  {
+    "i": 19,
+    "tag": "button",
+    "type": "submit",
+    "text": "Reveal next navigation items",
+    "href": ""
+  },
+  {
+    "i": 20,
+    "tag": "a",
+    "type": "",
+    "text": "View jobs",
+    "href": "https://www.indeed.com/cmp/Stripe/jobs"
+  },
+  {
+    "i": 21,
+    "tag": "button",
+    "type": "submit",
+    "text": "Close",
+    "href": ""
+  },
+  {
+    "i": 22,
+    "tag": "input",
+    "type": "text",
+    "text": "Job title, department",
+    "href": ""
+  },
+  {
+    "i": 23,
+    "tag": "input",
+    "type": "text",
+    "text": "United States",
+    "href": ""
+  },
+  {
+    "i": 24,
+    "tag": "button",
+    "type": "submit",
+    "text": "Clear",
+    "href": ""
+  },
+  {
+    "i": 25,
+    "tag": "button",
+    "type": "submit",
+    "text": "Search",
+    "href": ""
+  },
+  {
+    "i": 26,
+    "tag": "button",
+    "type": "submit",
+    "text": "Keywords",
+    "href": ""
+  }
+]

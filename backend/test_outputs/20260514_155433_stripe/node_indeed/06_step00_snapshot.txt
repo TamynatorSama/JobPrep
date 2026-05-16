@@ -1,0 +1,79 @@
+URL: https://www.indeed.com/cmp/stripe/salaries?__cf_chl_rt_tk=vimP0OtnAiVjoF2tuL8rgqy5mOMQ279gczg5.di8uvY-1778788665-1.0.1.1-havR0ld5SBg_OymcyfWrxsyUU8CLcXI5lkmp8fVUkuo
+Title: Security Check - Indeed.com
+
+Visible text:
+Find jobs Company Reviews Find salaries Sign in Upload your resume Sign in Employers / Post Job Find jobs Company Reviews Find salaries Additional Verification Required Your Ray ID for this request is 9fbc7948cc58b010 Return home → Troubleshooting Cloudflare Errors Need more help? Contact us
+
+Interactive elements:
+[
+  {
+    "i": 0,
+    "tag": "a",
+    "type": "",
+    "text": "Indeed Home",
+    "href": "https://www.indeed.com/"
+  },
+  {
+    "i": 1,
+    "tag": "a",
+    "type": "",
+    "text": "Find jobs",
+    "href": "https://www.indeed.com/"
+  },
+  {
+    "i": 2,
+    "tag": "a",
+    "type": "",
+    "text": "Company Reviews",
+    "href": "https://www.indeed.com/companies"
+  },
+  {
+    "i": 3,
+    "tag": "a",
+    "type": "",
+    "text": "Find salaries",
+    "href": "https://www.indeed.com/career/salaries"
+  },
+  {
+    "i": 6,
+    "tag": "a",
+    "type": "",
+    "text": "Upload your resume",
+    "href": "https://www.indeed.com/promo/resume"
+  },
+  {
+    "i": 7,
+    "tag": "a",
+    "type": "",
+    "text": "Sign in",
+    "href": "https://secure.indeed.com/account/login?hl=en&continue=https%3A%2F%2Fwww.indeed."
+  },
+  {
+    "i": 8,
+    "tag": "a",
+    "type": "",
+    "text": "Employers / Post Job",
+    "href": "https://www.indeed.com/hire?hl=en&ikw=gnav-header-hire&isid=employerlink"
+  },
+  {
+    "i": 12,
+    "tag": "a",
+    "type": "",
+    "text": "Return home\n\u00a0 \u2192",
+    "href": "https://www.indeed.com/"
+  },
+  {
+    "i": 13,
+    "tag": "a",
+    "type": "",
+    "text": "Troubleshooting Cloudflare Errors",
+    "href": "https://support.indeed.com/hc/en/articles/33465379855501"
+  },
+  {
+    "i": 14,
+    "tag": "a",
+    "type": "",
+    "text": "Contact us",
+    "href": "https://www.indeed.com/support/contact"
+  }
+]

@@ -1,0 +1,26 @@
+{
+  "overview": {
+    "grade": "B+",
+    "ceo_rating": "80%",
+    "culture_score": "B+",
+    "work_life_balance": null,
+    "compensation_score": "B",
+    "perks_score": "B+",
+    "dev_score": "A",
+    "enps": "-2",
+    "rating_count": 1578,
+    "highlights": [
+      "CEO Rating A",
+      "Professional Development A",
+      "Diversity A"
+    ]
+  },
+  "salaries": {
+    "blocked": "title: access to this page",
+    "url": "https://www.comparably.com/companies/stripe/salaries/"
+  },
+  "interviews": {
+    "blocked": "title: access to this page",
+    "url": "https://www.comparably.com/companies/stripe/interviews/"
+  }
+}

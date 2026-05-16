@@ -1,0 +1,1 @@
+Extract compensation details for 'Software Engineer' at 'Stripe' from this Levels.fyi page. Collect: median TC, base, equity, bonus, level breakdown, number of submissions, and any trend (increasing/decreasing). Return a JSON object with keys: role, tc_median, base, equity, bonus, submissions, trend, levels.

@@ -1,0 +1,4 @@
+{
+  "action": "click",
+  "text": "Stripe\n3.7★\n5jobs\n1.5Kreviews\n4.5Ksalaries"
+}

@@ -1,0 +1,37 @@
+{
+  "levels": [
+    {
+      "level": "L1 (Entry Level)",
+      "tc_median": 208000,
+      "base": 145000,
+      "equity": 43000,
+      "bonus": 19900,
+      "data_points": null
+    },
+    {
+      "level": "L2",
+      "tc_median": 284000,
+      "base": 184000,
+      "equity": 79900,
+      "bonus": 19600,
+      "data_points": null
+    },
+    {
+      "level": "L3",
+      "tc_median": 437000,
+      "base": 233000,
+      "equity": 181000,
+      "bonus": 23300,
+      "data_points": null
+    },
+    {
+      "level": "L4 (Staff Engineer)",
+      "tc_median": 633000,
+      "base": 278000,
+      "equity": 300000,
+      "bonus": 55400,
+      "data_points": null
+    }
+  ],
+  "location_note": "United States"
+}

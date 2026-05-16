@@ -1,0 +1,184 @@
+URL: https://www.levels.fyi/companies/stripe/salaries/software-engineer
+Title: Stripe Software Engineer Salary | $208K-$860K+ | Levels.fyi
+
+Visible text:
+📣Levels.fyi has acquired TechPaysLevels.fyi acquires TechPaysRead MoreFor EmployersDownload AppUSD/ yrChangeEnglish (US)ChangeLoginSign UpAll DataBy LocationBy CompanyBy TitleSalary CalculatorChart VisualizationsVerified SalariesInternshipsH-1B SalariesNegotiation SupportCompare BenefitsWho's Hiring2025 Pay ReportTop Paying CompaniesIntegrateBlogPressGoogleSoftware EngineerProduct ManagerNew York City AreaData ScientistExplore By Different TitlesSalaries📂 All Data🌎 By Location🏢 By Company🖋 By Title🏭️ By Industry📍 Salary Heatmap📈 Chart Visualizations🔥 Real-time Percentiles🎓 Internships🛂 H-1B Salaries❣️ Compare Benefits🎬 2025 Pay Report🏆 Top Paying Companies💸 Calculate Meeting Cost#️⃣ Salary CalculatorContributeAdd SalaryAdd Company BenefitsAdd Level MappingJobs🔍 Search Jobs📥 InboxServicesCandidate Services💵 Negotiation Coaching📄 Resume Review🎁 Gift a Resume ReviewFor EmployersData ExplorerTalent PoolInteractive Offer LettersReal-time Percentiles 🔥Compensation BenchmarkingLevels.fyi API, MCP, CLIFor Academic ResearchCompensation DatasetCommunityDownload AppHiring?AI-matched senior talent. Comp upfront.AI-matched. Comp upfront.Explore TalentGet HiredDrop your resume. Let the right offers find you.Let the right offers find youUpload ResumeResumeNegotiate$10K+ guaranteed or money backFree Consult← Company Directory StripeWork Here? Claim Your CompanyOverviewSalariesBenefitsJobsNewChatSalariesSoftware EngineerAll Software Engineer SalariesStripe Software Engineer Salaries United StatesSoftware Engineer compensation in United States at Stripe ranges from $208K per year for L1 to $860K per year for L6. The median yearly compensation in United States package totals $316K. View the base salary, stock, and bonus breakdowns for Stripe's total compensation packages. Last updated: 5/14/2026Average Compensation By LevelAdd CompCompare LevelsLevel NameTotal Base Stock (/yr)Bonus L1(Entry Level)$208K$145K$43K$19.9KL2$284K$184K$79.9K$19.6KL3$437K$233K$181K$23.3KL4Staff Engineer$633K$278K$300K$55.4KView 3 More LevelsAdd CompCompare LevelsHiring Managers: Hiring senior engineers?AI sourcing with comp upfront.Browse Talent PoolLatest Salary Submissions​Table FilterSubscribeAddAdd CompAdd CompensationUnited StatesCompanyLocation | DateLevel NameTagYears of ExperienceTotal / At CompanyTotal Compensation (USD) Base | Stock (yr) | Bonus Unlock by Adding Your Salary!Add your salary anonymously in less than 60 seconds and continue exploring all the data.Add SalaryAdded mine already within last 1 year***********, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,**************, ** | ****/**/******* **$***,***Get notified of new salariesExport DataVie
+
+Interactive elements:
+[
+  {
+    "i": 0,
+    "tag": "a",
+    "type": "",
+    "text": "Levels.fyi has acquired TechPays",
+    "href": "https://blog.pragmaticengineer.com/techpays-has-been-acquired-levels-fyi/"
+  },
+  {
+    "i": 1,
+    "tag": "a",
+    "type": "",
+    "text": "Read More",
+    "href": "https://www.levels.fyi/blog/levelsfyi-acquires-techpays.html"
+  },
+  {
+    "i": 3,
+    "tag": "a",
+    "type": "",
+    "text": "For Employers",
+    "href": "https://www.levels.fyi/offerings/?from=nav"
+  },
+  {
+    "i": 5,
+    "tag": "button",
+    "type": "button",
+    "text": "USD\n/ yr",
+    "href": ""
+  },
+  {
+    "i": 30,
+    "tag": "a",
+    "type": "",
+    "text": "Salaries",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer?country=254#"
+  },
+  {
+    "i": 49,
+    "tag": "a",
+    "type": "",
+    "text": "Jobs",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer?country=254#"
+  },
+  {
+    "i": 52,
+    "tag": "a",
+    "type": "",
+    "text": "Services",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer?country=254#"
+  },
+  {
+    "i": 63,
+    "tag": "a",
+    "type": "",
+    "text": "Download App",
+    "href": "https://www.levels.fyi/download?from=navbar"
+  },
+  {
+    "i": 64,
+    "tag": "a",
+    "type": "",
+    "text": "Hiring?\nAI-matched senior talent. Comp upfront.\nExplore Tale",
+    "href": "https://www.levels.fyi/offerings/talent?action=find-talent&from=promo_banner&cop"
+  },
+  {
+    "i": 65,
+    "tag": "div",
+    "type": "",
+    "text": "Get Hired\nDrop your resume. Let the right offers find you.\nU",
+    "href": ""
+  },
+  {
+    "i": 67,
+    "tag": "a",
+    "type": "",
+    "text": "\u2190 Company Directory",
+    "href": "https://www.levels.fyi/companies"
+  },
+  {
+    "i": 68,
+    "tag": "a",
+    "type": "",
+    "text": "Claim Your Company",
+    "href": "https://www.levels.fyi/employers/profile?from=companyPage"
+  },
+  {
+    "i": 69,
+    "tag": "button",
+    "type": "button",
+    "text": "Overview",
+    "href": ""
+  },
+  {
+    "i": 70,
+    "tag": "a",
+    "type": "",
+    "text": "Overview",
+    "href": "https://www.levels.fyi/companies/stripe"
+  },
+  {
+    "i": 71,
+    "tag": "button",
+    "type": "button",
+    "text": "Salaries",
+    "href": ""
+  },
+  {
+    "i": 72,
+    "tag": "a",
+    "type": "",
+    "text": "Salaries",
+    "href": "https://www.levels.fyi/companies/stripe/salaries"
+  },
+  {
+    "i": 73,
+    "tag": "button",
+    "type": "button",
+    "text": "Benefits",
+    "href": ""
+  },
+  {
+    "i": 74,
+    "tag": "a",
+    "type": "",
+    "text": "Benefits",
+    "href": "https://www.levels.fyi/companies/stripe/benefits"
+  },
+  {
+    "i": 75,
+    "tag": "button",
+    "type": "button",
+    "text": "Jobs\nNew",
+    "href": ""
+  },
+  {
+    "i": 76,
+    "tag": "a",
+    "type": "",
+    "text": "Jobs\nNew",
+    "href": "https://www.levels.fyi/companies/stripe/jobs?from=company_header_navbar"
+  },
+  {
+    "i": 77,
+    "tag": "button",
+    "type": "button",
+    "text": "Chat",
+    "href": ""
+  },
+  {
+    "i": 78,
+    "tag": "a",
+    "type": "",
+    "text": "Chat",
+    "href": "https://www.levels.fyi/community?from=company_header_navbar"
+  },
+  {
+    "i": 80,
+    "tag": "a",
+    "type": "",
+    "text": "Salaries",
+    "href": "https://www.levels.fyi/companies/stripe/salaries"
+  },
+  {
+    "i": 81,
+    "tag": "a",
+    "type": "",
+    "text": "Software Engineer",
+    "href": "https://www.levels.fyi/companies/stripe/salaries/software-engineer"
+  },
+  {
+    "i": 82,
+    "tag": "button",
+    "type": "button",
+    "text": "United States",
+    "href": ""
+  }
+]

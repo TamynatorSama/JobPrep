@@ -1,0 +1,45 @@
+# Rust
+target/
+target_cli/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python (backend sidecar)
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+
+# Build / install caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large binary artifacts
+captures/
+*.wav
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Tauri
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# Misc
+.tmp_design/
+captures/

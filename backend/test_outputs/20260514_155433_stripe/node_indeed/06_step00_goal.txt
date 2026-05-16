@@ -1,0 +1,1 @@
+Extract salary information from this Indeed salaries page for 'Stripe'. Focus on roles similar to 'Software Engineer' if visible. List up to 5 roles with their salary ranges. Return a JSON object with key 'salaries': [{role, min, max, median, count}].

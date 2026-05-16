@@ -1,0 +1,1 @@
+Extract from this Indeed company reviews page for 'Stripe': overall star rating, number of reviews, top pros mentioned in reviews, top cons mentioned, work-life balance score, compensation score, management score. Return a JSON object with keys: rating, review_count, pros, cons, work_life_balance, compensation, management.
