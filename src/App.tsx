@@ -733,12 +733,46 @@ const Sidebar = (p: SidebarProps) => {
 
 // ─── Workspace header ─────────────────────────────────────────────────────
 
+// ─── Backend status badge ─────────────────────────────────────────────────
+
+const BackendBadge = ({ status }: { status: BackendStatus }) => {
+  const palette =
+    status.status === "ready"
+      ? { dot: "#22c55e", text: T.textSecondary, label: "Backend ready" }
+      : status.status === "failed"
+      ? { dot: "#EF4444", text: "#EF4444",       label: "Backend failed" }
+      : { dot: "#F59E0B", text: T.textSecondary, label: "Starting…" };
+
+  const title = status.status === "failed" ? status.error : palette.label;
+
+  return (
+    <div
+      title={title}
+      style={{
+        display: "flex", alignItems: "center", gap: 5,
+        padding: "3px 9px", borderRadius: 100,
+        background: T.surface, border: `0.5px solid ${T.border}`,
+        fontSize: 11, color: palette.text, flexShrink: 0,
+        letterSpacing: "-0.11px", whiteSpace: "nowrap",
+      }}
+    >
+      <span style={{
+        width: 6, height: 6, borderRadius: "50%", background: palette.dot,
+        animation: status.status === "starting" ? "pulse 1.4s ease-in-out infinite" : undefined,
+      }} />
+      {palette.label}
+      <style>{`@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }`}</style>
+    </div>
+  );
+};
+
 interface WorkspaceHeaderProps {
   job: Job | null;
   onToggleSidebar: () => void;
+  backend: BackendStatus;
 }
 
-const WorkspaceHeader = ({ job, onToggleSidebar }: WorkspaceHeaderProps) => {
+const WorkspaceHeader = ({ job, onToggleSidebar, backend }: WorkspaceHeaderProps) => {
   const st = job ? STATUS_CONFIG[job.status] : null;
   const headerRef = useRef<HTMLDivElement>(null);
   const [headerWidth, setHeaderWidth] = useState(900);
@@ -830,6 +864,9 @@ const WorkspaceHeader = ({ job, onToggleSidebar }: WorkspaceHeaderProps) => {
               letterSpacing: "-0.11px", whiteSpace: "nowrap",
             }}>{job.status}</div>
           )}
+
+          <BackendBadge status={backend} />
+
 
           <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
             {actions.map((a) => (
@@ -2492,6 +2529,10 @@ const App = () => {
 
     // Build a tight context blob the backend can prepend to its system prompt.
     const job = jobs.find((j) => j.id === selectedJobId);
+    // Most-recently-added resume is treated as the active one. Trimmed to
+    // 4k chars so the system prompt stays under reasonable token budgets.
+    const resume = resumes.length > 0 ? resumes[resumes.length - 1] : null;
+
     const jobContext = job
       ? [
           `Company: ${job.company}`,
@@ -2499,6 +2540,9 @@ const App = () => {
           job.location ? `Location: ${job.location}` : "",
           job.jobDescription
             ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}`
+            : "",
+          resume
+            ? `\nCandidate Resume (${resume.name}):\n${resume.text.slice(0, 4000)}`
             : "",
         ].filter(Boolean).join("\n")
       : "";
@@ -2539,6 +2583,8 @@ const App = () => {
   const onCreateJob = (form: NewJobFormState) => {
     const id = `job-${Date.now()}`;
     const palette = ["#6366F1", "#10B981", "#F59E0B", "#EC4899", "#8B5CF6"];
+    const researchThreadId = `c-research-${id}`;
+    const jd = form.jobDescription.trim();
     const newJob: Job = {
       id,
       company: form.company,
@@ -2559,13 +2605,55 @@ const App = () => {
       avatarColor: palette[jobs.length % palette.length],
       chats: [
         { id: `c-new-${id}`, title: "General Prep", preview: "Start your prep here...", messages: [] },
+        // Company Research thread: streams the auto-triggered company-
+        // research output. Pre-seeded with a streaming AI placeholder so
+        // chat:* events have a target to append to.
+        {
+          id: researchThreadId,
+          title: "Company Research",
+          messages: [{ role: "ai", content: "", streaming: true, logs: [] }],
+        },
       ],
-      jobDescription: form.jobDescription.trim() || undefined,
+      jobDescription: jd || undefined,
     };
     setJobs((prev) => [...prev, newJob]);
     setSelectedJobId(id);
-    setSelectedChatId(`c-new-${id}`);
+    setSelectedChatId(researchThreadId);
     setShowNewJobModal(false);
+
+    // Kick off the company research stream. The browser-scraping agents use
+    // the company + location to mine Glassdoor/Indeed/Google, and the JD (if
+    // pasted) to make the final report role-specific.
+    streamingTargetRef.current = { jobId: id, chatId: researchThreadId };
+    setIsLoading(true);
+    invoke("start_company_research_stream", {
+      company:          newJob.company,
+      role:             newJob.role,
+      location:         newJob.location,
+      jobDescription:   jd,
+      apiKey:           credentials.geminiApiKey,
+      glassdoorEmail:   credentials.glassdoorEmail,
+      glassdoorPassword:credentials.glassdoorPassword,
+      indeedEmail:      credentials.indeedEmail,
+      indeedPassword:   credentials.indeedPassword,
+    }).catch((e) => {
+      const errMsg = String(e);
+      setJobs((prev) => prev.map((j) =>
+        j.id !== id ? j : {
+          ...j,
+          chats: j.chats.map((c) => c.id !== researchThreadId ? c : {
+            ...c,
+            messages: c.messages.map((m, i) =>
+              i === c.messages.length - 1
+                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+                : m,
+            ),
+          }),
+        },
+      ));
+      streamingTargetRef.current = null;
+      setIsLoading(false);
+    });
   };
 
   return (
@@ -2603,6 +2691,7 @@ const App = () => {
             <WorkspaceHeader
               job={selectedJob}
               onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
+              backend={backend}
             />
             {selectedJob ? (
               <>

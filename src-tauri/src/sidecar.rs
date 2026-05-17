@@ -9,9 +9,18 @@
 //! Python is resolved by preferring a virtualenv (`backend/.venv`) before any
 //! system Python, so the user's pinned dependency set is what runs.
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+fn log_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("InterPrep")
+}
 
 pub struct PythonSidecar {
     /// Held only so the child process is killed when `Drop` runs.
@@ -44,11 +53,25 @@ impl PythonSidecar {
             "error".into(),
         ]);
 
+        // Pipe stdout + stderr to a log file under %LOCALAPPDATA%\InterPrep so
+        // boot failures are diagnosable. Falls back to /dev/null on failure.
+        let log_path = log_dir().join("sidecar.log");
+        let _ = fs::create_dir_all(log_dir());
+        let stdout = fs::File::create(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        let stderr = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+
         let child = Command::new(&python_exe)
             .args(&args)
             .current_dir(&backend_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn()
             .map_err(|e| format!("failed to spawn Python ({python_exe}): {e}"))?;
 
