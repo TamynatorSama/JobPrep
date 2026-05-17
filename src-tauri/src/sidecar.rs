@@ -114,28 +114,43 @@ impl Drop for PythonSidecar {
 // ─── Discovery helpers ────────────────────────────────────────────────────
 
 fn find_backend_dir() -> Option<PathBuf> {
+    // 1. Explicit override.
     if let Ok(dir) = std::env::var("INTERPREP_BACKEND_DIR") {
         let p = PathBuf::from(dir);
         if p.join("main.py").exists() {
-            return Some(p);
+            return p.canonicalize().ok();
         }
     }
 
+    // 2. Walk up from the executable. Covers both installed layouts and
+    //    `cargo run` from a deep target dir like `C:\ip_tauri\debug\`.
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for rel in &["backend", "../backend", "../../backend"] {
-                let p = exe_dir.join(rel);
-                if p.join("main.py").exists() {
-                    return p.canonicalize().ok();
-                }
+        let mut cursor: Option<&std::path::Path> = exe.parent();
+        for _ in 0..6 {
+            let Some(dir) = cursor else { break; };
+            let candidate = dir.join("backend").join("main.py");
+            if candidate.exists() {
+                return candidate.parent().and_then(|p| p.canonicalize().ok());
             }
+            cursor = dir.parent();
         }
     }
 
-    let p = PathBuf::from("backend");
-    if p.join("main.py").exists() {
-        return p.canonicalize().ok();
+    // 3. Walk up from the current working directory. `tauri dev` runs cargo
+    //    from `src-tauri/`, so `./backend/` doesn't exist — but `../backend/`
+    //    does. Repo roots can be a few levels up depending on the runner.
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cursor: Option<&std::path::Path> = Some(cwd.as_path());
+        for _ in 0..6 {
+            let Some(dir) = cursor else { break; };
+            let candidate = dir.join("backend").join("main.py");
+            if candidate.exists() {
+                return candidate.parent().and_then(|p| p.canonicalize().ok());
+            }
+            cursor = dir.parent();
+        }
     }
+
     None
 }
 
