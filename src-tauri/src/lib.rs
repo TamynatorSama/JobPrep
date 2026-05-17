@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use credentials::Credentials;
 use resume_store::Resume;
 use sidecar::PythonSidecar;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use types::Job;
 
 // ─── State ────────────────────────────────────────────────────────────────
@@ -99,15 +99,18 @@ fn require_url(state: &State<SidecarState>) -> Result<String, String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_chat_stream(
     app: AppHandle,
     state: State<SidecarState>,
     message: String,
     job_context: String,
+    history: Vec<(String, String)>,
+    mode: String,
     api_key: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
-    backend_client::stream_chat(app, url, message, job_context, api_key);
+    backend_client::stream_chat(app, url, message, job_context, history, mode, api_key);
     Ok(())
 }
 
@@ -134,6 +137,7 @@ fn start_company_research_stream(
     role: String,
     location: String,
     job_description: String,
+    tailored_resume: String,
     api_key: String,
     glassdoor_email: String,
     glassdoor_password: String,
@@ -148,6 +152,7 @@ fn start_company_research_stream(
         role,
         location,
         job_description,
+        tailored_resume,
         api_key,
         glassdoor_email,
         glassdoor_password,
@@ -155,6 +160,86 @@ fn start_company_research_stream(
         indeed_password,
     );
     Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn start_application_tailor_stream(
+    app: AppHandle,
+    state: State<SidecarState>,
+    company: String,
+    role: String,
+    location: String,
+    job_description: String,
+    master_resumes: Vec<(String, String)>,
+    api_key: String,
+) -> Result<(), String> {
+    let url = require_url(&state)?;
+    backend_client::stream_application_tailor(
+        app,
+        url,
+        company,
+        role,
+        location,
+        job_description,
+        master_resumes,
+        api_key,
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn start_knockout_screen_stream(
+    app: AppHandle,
+    state: State<SidecarState>,
+    company: String,
+    role: String,
+    location: String,
+    job_description: String,
+    tailored_resume: String,
+    api_key: String,
+) -> Result<(), String> {
+    let url = require_url(&state)?;
+    backend_client::stream_knockout_screen(
+        app,
+        url,
+        company,
+        role,
+        location,
+        job_description,
+        tailored_resume,
+        api_key,
+    );
+    Ok(())
+}
+
+// ─── Generated docx persistence ───────────────────────────────────────────
+
+/// Decode the base64 `.docx` bytes emitted by `chat:resume_docx` and write
+/// them to `%APPDATA%/InterPrep/applications/<job_id>/resume.docx`. Returns
+/// the absolute path so the frontend can persist it on the Job.
+#[tauri::command]
+fn save_resume_docx(job_id: String, b64: String) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+    let dir = dirs::data_dir()
+        .ok_or_else(|| "no AppData directory available".to_string())?
+        .join("InterPrep")
+        .join("applications")
+        .join(&job_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let path = dir.join("resume.docx");
+    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Open an arbitrary path in the OS default app (Word, browser, etc.).
+/// Used by the "Open Tailored Resume" button.
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    opener::open(&path).map_err(|e| format!("open failed: {e}"))
 }
 
 // ─── Audio recording ──────────────────────────────────────────────────────
@@ -314,10 +399,36 @@ pub fn run() {
             start_chat_stream,
             start_research_stream,
             start_company_research_stream,
+            start_application_tailor_stream,
+            start_knockout_screen_stream,
+            save_resume_docx,
+            open_path,
             list_audio_devices,
             start_recording,
             stop_recording,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Drop on managed State only runs reliably during a normal exit
+            // path. ExitRequested fires before the Tauri runtime tears down,
+            // which is the right window to kill the Python sidecar (and its
+            // Chromium grandchildren). Without this, closing the window
+            // leaves python.exe + chrome.exe orphaned until reboot.
+            if let RunEvent::ExitRequested { .. } = event {
+                let sidecar_state = app_handle.state::<SidecarState>();
+                let mut inner = sidecar_state.inner.lock().unwrap();
+                if let Some(mut sc) = inner.sidecar.take() {
+                    sc.shutdown();
+                }
+                inner.base_url = None;
+                // Also kill any lingering recording worker.
+                let rec_state = app_handle.state::<RecorderState>();
+                let maybe_session = rec_state.inner.lock().unwrap().take();
+                if let Some(session) = maybe_session {
+                    session.request_stop();
+                    let _ = session.finish();
+                }
+            }
+        });
 }

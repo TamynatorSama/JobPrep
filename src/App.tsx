@@ -14,6 +14,7 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as pdfjs from "pdfjs-dist";
@@ -153,6 +154,14 @@ const EMPTY_CREDS: Credentials = {
   indeedEmail: "", indeedPassword: "",
 };
 
+interface Scorecard {
+  verbatim_match_score?: number;
+  role_title_alignment?: "Yes" | "No";
+  quantification_check?: "Pass" | "Needs Work";
+  hire_recommendation?: "Hire" | "No Hire";
+  skills_matched?: string[];
+}
+
 interface Job {
   id: string;
   company: string;
@@ -170,6 +179,12 @@ interface Job {
   jobDescription?: string;
   /** Hidden from the main sidebar list once true. */
   archived?: boolean;
+  /** Plain-text tailored resume produced by the Application-Prep step. */
+  tailoredResume?: string;
+  /** Absolute path to the generated `resume.docx` on disk. */
+  resumeDocxPath?: string;
+  /** ATS scorecard returned by the tailoring step. */
+  scorecard?: Scorecard;
 }
 
 type Screen = "chat" | "timeline";
@@ -1461,13 +1476,81 @@ const Thinking = ({ logs, streaming }: ThinkingProps) => {
 
 // ─── Chat area ────────────────────────────────────────────────────────────
 
+// ─── ATS scorecard card (Application-Prep extra) ──────────────────────────
+
+const ScorecardCard = ({ card }: { card: Scorecard }) => {
+  const recommendation = card.hire_recommendation ?? "—";
+  const recColor =
+    recommendation === "Hire"    ? "#10B981" :
+    recommendation === "No Hire" ? "#EF4444" :
+                                   T.textSecondary;
+  const cell = (label: string, value: string, color: string = T.text) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 1, marginRight: 24 }}>
+      <span style={{ fontSize: 10.5, color: T.textTertiary }}>{label}</span>
+      <span style={{ fontSize: 13, fontWeight: 600, color }}>{value}</span>
+    </div>
+  );
+  const MAX_SKILL_CHARS = 28;
+  const skills = (card.skills_matched ?? []).map((s) =>
+    s.length > MAX_SKILL_CHARS ? s.slice(0, MAX_SKILL_CHARS - 1) + "…" : s,
+  );
+  return (
+    <div style={{
+      marginTop: 10, padding: "12px 14px",
+      borderRadius: 12, border: `1px solid ${T.border}`,
+      background: T.surface,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+        <Icon name="analyze" size={14} color={T.accent} />
+        <span style={{ fontSize: 12.5, fontWeight: 600, color: T.text }}>ATS Scorecard</span>
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", rowGap: 8 }}>
+        {cell("Verbatim Match",      card.verbatim_match_score != null ? `${card.verbatim_match_score}%` : "—")}
+        {cell("Role Title Aligned",  card.role_title_alignment ?? "—")}
+        {cell("Quantification",      card.quantification_check ?? "—")}
+        {cell("Recommendation",      recommendation, recColor)}
+      </div>
+      {skills.length > 0 && (
+        <>
+          <div style={{ fontSize: 10.5, color: T.textTertiary, marginTop: 10, marginBottom: 4 }}>
+            Skills matched
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {skills.map((s, i) => (
+              <span key={i} style={{
+                padding: "3px 8px", borderRadius: 100,
+                background: T.surface2, color: T.textSecondary,
+                fontSize: 11, whiteSpace: "nowrap",
+              }}>
+                {s}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
 interface ChatAreaProps {
   chat: ChatThread | null;
+  job: Job | null;
   onSendMessage: (text: string) => void;
   isLoading: boolean;
+  /// ID of the chat thread currently streaming. Used to scope the loading
+  /// indicator so it only appears in the active thread, not every chat.
+  streamingChatId: string | null;
+  /// Launches the saved .docx in the OS default app (Word, etc.).
+  onOpenResumeDocx?: (path: string) => void;
+  /// Kicks off the recruiter-knockout simulation thread for the current job.
+  onSimulateKnockout?: () => void;
 }
 
-const ChatArea = ({ chat, onSendMessage, isLoading }: ChatAreaProps) => {
+const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpenResumeDocx, onSimulateKnockout }: ChatAreaProps) => {
+  // Loader is per-thread, not global. Even if isLoading is true (some other
+  // stream is running), don't draw the bouncing dots unless the user is
+  // looking at the thread the tokens are flowing into.
+  const showLoader = isLoading && chat != null && chat.id === streamingChatId;
   const endRef = useRef<HTMLDivElement>(null);
   const [hoveredMsg, setHoveredMsg] = useState<number | null>(null);
 
@@ -1568,10 +1651,56 @@ const ChatArea = ({ chat, onSendMessage, isLoading }: ChatAreaProps) => {
                   background: T.surface, boxShadow: T.shadowMd,
                 }}>
                   {msg.streaming && !msg.content
-                    ? <span style={{ color: T.textTertiary, fontSize: 14 }}>…</span>
+                    ? <span style={{ color: T.textTertiary, fontSize: 13, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <Icon name="sparkle" size={11} color={T.textTertiary} />
+                        Working — first tokens incoming…
+                      </span>
                     : <MarkdownText content={msg.streaming ? msg.content + "▊" : msg.content} />
                   }
                 </div>
+                {/* Application-Prep extras: scorecard + Open Resume + KO buttons.
+                    Only on the last finished AI message of the Prep thread, only
+                    when the Job has the corresponding data. */}
+                {chat?.title === "Application Prep"
+                  && !msg.streaming
+                  && i === chat.messages.length - 1
+                  && job && (
+                  <>
+                    {job.scorecard && <ScorecardCard card={job.scorecard} />}
+                    {(job.resumeDocxPath || job.tailoredResume) && (
+                      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                        {job.resumeDocxPath && (
+                          <button
+                            onClick={() => onOpenResumeDocx?.(job.resumeDocxPath!)}
+                            style={{
+                              display: "flex", alignItems: "center", gap: 6,
+                              padding: "8px 14px", borderRadius: 100,
+                              border: `1px solid ${T.accentSoft}`,
+                              background: T.surface2, color: T.text,
+                              fontSize: 12.5, cursor: "pointer", fontFamily: T.fontBody,
+                            }}
+                          >
+                            <Icon name="note" size={13} /> Open Tailored Resume
+                          </button>
+                        )}
+                        {job.tailoredResume && (
+                          <button
+                            onClick={() => onSimulateKnockout?.()}
+                            style={{
+                              display: "flex", alignItems: "center", gap: 6,
+                              padding: "8px 14px", borderRadius: 100,
+                              border: `1px solid ${T.accentSoft}`,
+                              background: T.surface2, color: T.text,
+                              fontSize: 12.5, cursor: "pointer", fontFamily: T.fontBody,
+                            }}
+                          >
+                            <Icon name="interview" size={13} /> Simulate Knockout Screen
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
                 {hoveredMsg === i && (
                   <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
                     {([
@@ -1598,7 +1727,7 @@ const ChatArea = ({ chat, onSendMessage, isLoading }: ChatAreaProps) => {
           )}
         </div>
       ))}
-      {isLoading && (
+      {showLoader && (
         <div style={{ padding: "0 24px", marginBottom: 24, display: "flex", gap: 12, alignItems: "flex-start" }}>
           <div style={{
             width: 28, height: 28, borderRadius: 8,
@@ -2318,12 +2447,18 @@ const App = () => {
       .then((s) => setBackend(s))
       .catch((e) => console.error("backend_status failed:", e));
 
+    // StrictMode-safe: see chat:* listeners below for the same pattern.
+    let cancelled = false;
     listen<string>("sidecar:ready", (e) => setBackend({ status: "ready", url: e.payload }))
-      .then((un) => { unsubReady = un; });
+      .then((un) => { if (cancelled) un(); else unsubReady = un; });
     listen<string>("sidecar:error", (e) => setBackend({ status: "failed", error: e.payload }))
-      .then((un) => { unsubError = un; });
+      .then((un) => { if (cancelled) un(); else unsubError = un; });
 
-    return () => { unsubReady?.(); unsubError?.(); };
+    return () => {
+      cancelled = true;
+      unsubReady?.();
+      unsubError?.();
+    };
   }, []);
 
   // ── Chat stream listeners ──────────────────────────────────────────────
@@ -2332,57 +2467,142 @@ const App = () => {
   // frontend appends to the most recent AI message in the current thread —
   // since we disable send while a stream is running, there's only ever one.
   const streamingTargetRef = useRef<{ jobId: string; chatId: string } | null>(null);
+  /// Mirror of `streamingTargetRef.current?.chatId` exposed as React state so
+  /// the loader indicator can be scoped to the active thread.
+  const [streamingChatId, setStreamingChatId] = useState<string | null>(null);
+  /// Buffers the tailored-resume text emitted mid-stream so we can persist it
+  /// to the Job *and* hand it to the Company-Research chain on `chat:done`.
+  const pendingTailoredResumeRef = useRef<string | null>(null);
+
+  // Refs so listener callbacks can read latest credentials + jobs without
+  // re-registering listeners on every state change.
+  const credentialsRef = useRef<Credentials>(EMPTY_CREDS);
+  const jobsRef        = useRef<Job[]>([]);
+  /// Populated once `startCompanyResearchFor` is defined further down. Lets
+  /// the `chat:done` listener (registered in a one-shot useEffect) call into
+  /// the latest closure.
+  const startCompanyResearchForRef = useRef<((job: Job, tailoredResume: string) => void) | null>(null);
 
   useEffect(() => {
-    const unsubs: UnlistenFn[] = [];
+    // StrictMode-safe listener registration. React's dev StrictMode runs
+    // effects twice (mount → cleanup → mount). With `listen().then(u =>
+    // unsubs.push(u))`, the first cleanup fires BEFORE the async listen()
+    // resolves, so its `u` never lands in `unsubs` and the first set of
+    // listeners stays registered forever. Two live `chat:done` listeners
+    // then race: one chains Prep→Research and sets the next streamingTargetRef,
+    // the other immediately nulls it, dropping every subsequent SSE event.
+    //
+    // The fix: a `cancelled` flag + `register()` helper that either pushes
+    // each unlisten into the active list or unsubscribes it inline if
+    // cleanup already ran.
+    let cancelled = false;
+    const cleanups: UnlistenFn[] = [];
+    const register = async <T,>(
+      ev: string,
+      handler: (e: { payload: T }) => void,
+    ) => {
+      const un = await listen<T>(ev, handler);
+      if (cancelled) {
+        un();
+      } else {
+        cleanups.push(un);
+      }
+    };
+
+    const updateJob = (jobId: string, mutate: (j: Job) => Job) => {
+      setJobs((prev) => prev.map((j) => j.id === jobId ? mutate(j) : j));
+    };
 
     const appendToLast = (mutate: (m: ChatMsg) => ChatMsg) => {
       const target = streamingTargetRef.current;
       if (!target) return;
-      setJobs((prev) => prev.map((j) =>
-        j.id !== target.jobId
-          ? j
-          : {
-              ...j,
-              chats: j.chats.map((c) =>
-                c.id !== target.chatId
-                  ? c
-                  : {
-                      ...c,
-                      messages: c.messages.map((m, i) =>
-                        i === c.messages.length - 1 ? mutate(m) : m,
-                      ),
-                    },
-              ),
-            },
-      ));
+      updateJob(target.jobId, (j) => ({
+        ...j,
+        chats: j.chats.map((c) =>
+          c.id !== target.chatId
+            ? c
+            : {
+                ...c,
+                messages: c.messages.map((m, i) =>
+                  i === c.messages.length - 1 ? mutate(m) : m,
+                ),
+              },
+        ),
+      }));
     };
 
-    listen<string>("chat:token", (e) => {
+    register<string>("chat:token", (e) => {
       appendToLast((m) => ({ ...m, content: m.content + e.payload }));
-    }).then((u) => unsubs.push(u));
+    });
 
-    listen<string>("chat:log", (e) => {
+    register<string>("chat:log", (e) => {
       appendToLast((m) => ({ ...m, logs: [...(m.logs ?? []), e.payload] }));
-    }).then((u) => unsubs.push(u));
+    });
 
-    listen<string>("chat:done", () => {
+    register<Scorecard>("chat:scorecard", (e) => {
+      const target = streamingTargetRef.current;
+      if (!target) return;
+      updateJob(target.jobId, (j) => ({ ...j, scorecard: e.payload }));
+    });
+
+    register<string>("chat:resume_docx", async (e) => {
+      const target = streamingTargetRef.current;
+      if (!target) return;
+      try {
+        const path = await invoke<string>("save_resume_docx", {
+          jobId: target.jobId,
+          b64:   e.payload,
+        });
+        updateJob(target.jobId, (j) => ({ ...j, resumeDocxPath: path }));
+      } catch (err) {
+        console.error("save_resume_docx failed:", err);
+      }
+    });
+
+    register<string>("chat:tailored_resume", (e) => {
+      const target = streamingTargetRef.current;
+      if (!target) return;
+      pendingTailoredResumeRef.current = e.payload;
+      updateJob(target.jobId, (j) => ({ ...j, tailoredResume: e.payload }));
+    });
+
+    register<string>("chat:done", () => {
+      const target = streamingTargetRef.current;
       appendToLast((m) => ({ ...m, streaming: false }));
       streamingTargetRef.current = null;
+      setStreamingChatId(null);
       setIsLoading(false);
-    }).then((u) => unsubs.push(u));
 
-    listen<string>("chat:error", (e) => {
+      // Chain: Application Prep → Company Research, using the tailored
+      // resume as candidate context. We resolve the thread from the just-
+      // finished `target` because state hasn't refreshed yet.
+      if (!target) return;
+      const job = jobsRef.current.find((j) => j.id === target.jobId);
+      if (!job) return;
+      const thread = job.chats.find((c) => c.id === target.chatId);
+      if (!thread || thread.title !== "Application Prep") return;
+
+      const tailored = pendingTailoredResumeRef.current ?? job.tailoredResume ?? "";
+      pendingTailoredResumeRef.current = null;
+      startCompanyResearchForRef.current?.(job, tailored);
+    });
+
+    register<string>("chat:error", (e) => {
       appendToLast((m) => ({
         ...m,
         streaming: false,
         content: m.content || `**Error:** ${e.payload}`,
       }));
       streamingTargetRef.current = null;
+      setStreamingChatId(null);
+      pendingTailoredResumeRef.current = null;
       setIsLoading(false);
-    }).then((u) => unsubs.push(u));
+    });
 
-    return () => { unsubs.forEach((u) => u()); };
+    return () => {
+      cancelled = true;
+      cleanups.forEach((u) => u());
+    };
   }, []);
 
   // ── Credentials (Windows Credential Manager via Tauri) ─────────────────
@@ -2397,6 +2617,10 @@ const App = () => {
       .catch((e) => console.error("load_credentials failed:", e))
       .finally(() => setCredentialsLoaded(true));
   }, []);
+
+  // Keep refs in sync so the one-shot SSE listeners read latest state.
+  useEffect(() => { credentialsRef.current = credentials; }, [credentials]);
+  useEffect(() => { jobsRef.current        = jobs; },        [jobs]);
 
   // ── Resume library ─────────────────────────────────────────────────────
   // Load on mount, save on every mutation (cheap; the file is small).
@@ -2548,11 +2772,27 @@ const App = () => {
       : "";
 
     streamingTargetRef.current = { jobId: selectedJobId, chatId: targetChatId };
+    setStreamingChatId(targetChatId);
     setIsLoading(true);
+
+    // Build chronological history from completed (non-streaming, non-empty)
+    // turns BEFORE we appended the new user message above. The backend uses
+    // this to keep multi-turn context — critical for mock interviews.
+    const threadForHistory = job?.chats.find((c) => c.id === targetChatId);
+    const history: [string, string][] = threadForHistory
+      ? threadForHistory.messages
+          .filter((m) => !m.streaming && m.content.trim().length > 0)
+          .map((m) => [m.role === "user" ? "user" : "assistant", m.content] as [string, string])
+      : [];
+
+    // Mock-interview threads switch the system prompt + model on the backend.
+    const mode = threadForHistory?.title === "Mock Interview" ? "interviewer" : "coach";
 
     invoke("start_chat_stream", {
       message: text,
       jobContext,
+      history,
+      mode,
       apiKey: credentials.geminiApiKey,
     }).catch((e) => {
       const errMsg = String(e);
@@ -2576,14 +2816,149 @@ const App = () => {
             },
       ));
       streamingTargetRef.current = null;
+      setStreamingChatId(null);
+      setIsLoading(false);
+    });
+  };
+
+  /// Chain-step: kick off Company Research with the tailored resume as
+  /// candidate context. Called from the `chat:done` listener when the
+  /// Application-Prep thread finishes. Creates the Research thread lazily so
+  /// it only exists after Prep succeeds.
+  const startCompanyResearchFor = (job: Job, tailoredResume: string) => {
+    const creds = credentialsRef.current;
+    const researchThreadId = `c-research-${job.id}`;
+    // Seed the placeholder with a first log line so the user sees activity
+    // immediately. Playwright cold-start + supervisor's first hop can take
+    // ~30s before the backend emits its own stage banner; an empty bubble
+    // during that window reads as "broken" even though it's working.
+    const placeholderThread: ChatThread = {
+      id: researchThreadId,
+      title: "Company Research",
+      messages: [{
+        role: "ai",
+        content: "",
+        streaming: true,
+        logs: ["**Spinning up company research** — warming Playwright + supervisor…"],
+      }],
+    };
+    // flushSync commits the placeholder + streaming target synchronously so
+    // the SSE listener can find the chat by id when the first event arrives.
+    // Without this, Rust can emit `chat:log` before React commits the
+    // placeholder; the listener's `chats.map(c.id === target.chatId)` finds
+    // no match and silently drops the event.
+    flushSync(() => {
+      setJobs((prev) => prev.map((j) =>
+        j.id !== job.id ? j : { ...j, chats: [...j.chats, placeholderThread] },
+      ));
+      streamingTargetRef.current = { jobId: job.id, chatId: researchThreadId };
+      setStreamingChatId(researchThreadId);
+      setIsLoading(true);
+    });
+
+    // Don't auto-switch view — user is reading the cover letter + scorecard
+    // on the Prep thread; jerking them to Research is jarring. Research is
+    // available via the sidebar once it lands.
+
+    invoke("start_company_research_stream", {
+      company:           job.company,
+      role:              job.role,
+      location:          job.location,
+      jobDescription:    job.jobDescription ?? "",
+      tailoredResume,
+      apiKey:            creds.geminiApiKey,
+      glassdoorEmail:    creds.glassdoorEmail,
+      glassdoorPassword: creds.glassdoorPassword,
+      indeedEmail:       creds.indeedEmail,
+      indeedPassword:    creds.indeedPassword,
+    }).catch((e) => {
+      const errMsg = String(e);
+      setJobs((prev) => prev.map((j) =>
+        j.id !== job.id ? j : {
+          ...j,
+          chats: j.chats.map((c) => c.id !== researchThreadId ? c : {
+            ...c,
+            messages: c.messages.map((m, i) =>
+              i === c.messages.length - 1
+                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+                : m,
+            ),
+          }),
+        },
+      ));
+      streamingTargetRef.current = null;
+      setStreamingChatId(null);
+      setIsLoading(false);
+    });
+  };
+
+  // Publish to ref so the chat:done listener (registered once, outside this
+  // closure) can invoke the latest version on completion of Prep.
+  startCompanyResearchForRef.current = startCompanyResearchFor;
+
+  /// Simulate a recruiter knockout phone-screen for the given job. Requires
+  /// `tailoredResume` (from Application Prep). Creates a "Knockout Screen"
+  /// thread and streams the predicted Q&A dossier.
+  const startKnockoutScreen = (job: Job) => {
+    const resume = job.tailoredResume?.trim();
+    if (!resume) {
+      alert("Run Application Prep first — the knockout screen needs the tailored resume.");
+      return;
+    }
+    const koThreadId = `c-knockout-${job.id}-${Date.now()}`;
+    setJobs((prev) => prev.map((j) =>
+      j.id !== job.id ? j : {
+        ...j,
+        chats: [...j.chats, {
+          id: koThreadId,
+          title: "Knockout Screen",
+          messages: [{ role: "ai", content: "", streaming: true, logs: [] }],
+        }],
+      },
+    ));
+    setSelectedChatId(koThreadId);
+
+    streamingTargetRef.current = { jobId: job.id, chatId: koThreadId };
+    setStreamingChatId(koThreadId);
+    setIsLoading(true);
+    invoke("start_knockout_screen_stream", {
+      company:        job.company,
+      role:           job.role,
+      location:       job.location,
+      jobDescription: job.jobDescription ?? "",
+      tailoredResume: resume,
+      apiKey:         credentialsRef.current.geminiApiKey,
+    }).catch((e) => {
+      const errMsg = String(e);
+      setJobs((prev) => prev.map((j) =>
+        j.id !== job.id ? j : {
+          ...j,
+          chats: j.chats.map((c) => c.id !== koThreadId ? c : {
+            ...c,
+            messages: c.messages.map((m, i) =>
+              i === c.messages.length - 1
+                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+                : m,
+            ),
+          }),
+        },
+      ));
+      streamingTargetRef.current = null;
+      setStreamingChatId(null);
       setIsLoading(false);
     });
   };
 
   const onCreateJob = (form: NewJobFormState) => {
+    // Gate: can't tailor without at least one master resume on file.
+    if (resumes.length === 0) {
+      alert("Add at least one master resume in Settings → Resume before creating a job.");
+      return;
+    }
+
     const id = `job-${Date.now()}`;
     const palette = ["#6366F1", "#10B981", "#F59E0B", "#EC4899", "#8B5CF6"];
-    const researchThreadId = `c-research-${id}`;
+    const prepThreadId = `c-prep-${id}`;
     const jd = form.jobDescription.trim();
     const newJob: Job = {
       id,
@@ -2605,12 +2980,12 @@ const App = () => {
       avatarColor: palette[jobs.length % palette.length],
       chats: [
         { id: `c-new-${id}`, title: "General Prep", preview: "Start your prep here...", messages: [] },
-        // Company Research thread: streams the auto-triggered company-
-        // research output. Pre-seeded with a streaming AI placeholder so
-        // chat:* events have a target to append to.
+        // Application Prep: tailored resume + cover letter + scorecard. The
+        // SSE stream fills the placeholder AI message; on `done`, the
+        // listener chains into a Company Research thread automatically.
         {
-          id: researchThreadId,
-          title: "Company Research",
+          id: prepThreadId,
+          title: "Application Prep",
           messages: [{ role: "ai", content: "", streaming: true, logs: [] }],
         },
       ],
@@ -2618,30 +2993,28 @@ const App = () => {
     };
     setJobs((prev) => [...prev, newJob]);
     setSelectedJobId(id);
-    setSelectedChatId(researchThreadId);
+    setSelectedChatId(prepThreadId);
     setShowNewJobModal(false);
 
-    // Kick off the company research stream. The browser-scraping agents use
-    // the company + location to mine Glassdoor/Indeed/Google, and the JD (if
-    // pasted) to make the final report role-specific.
-    streamingTargetRef.current = { jobId: id, chatId: researchThreadId };
+    // Ship every master resume to the backend — the LLM picks the best fit.
+    const masterResumes: [string, string][] = resumes.map((r) => [r.name, r.text]);
+
+    streamingTargetRef.current = { jobId: id, chatId: prepThreadId };
+    setStreamingChatId(prepThreadId);
     setIsLoading(true);
-    invoke("start_company_research_stream", {
-      company:          newJob.company,
-      role:             newJob.role,
-      location:         newJob.location,
-      jobDescription:   jd,
-      apiKey:           credentials.geminiApiKey,
-      glassdoorEmail:   credentials.glassdoorEmail,
-      glassdoorPassword:credentials.glassdoorPassword,
-      indeedEmail:      credentials.indeedEmail,
-      indeedPassword:   credentials.indeedPassword,
+    invoke("start_application_tailor_stream", {
+      company:        newJob.company,
+      role:           newJob.role,
+      location:       newJob.location,
+      jobDescription: jd,
+      masterResumes,
+      apiKey:         credentials.geminiApiKey,
     }).catch((e) => {
       const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
         j.id !== id ? j : {
           ...j,
-          chats: j.chats.map((c) => c.id !== researchThreadId ? c : {
+          chats: j.chats.map((c) => c.id !== prepThreadId ? c : {
             ...c,
             messages: c.messages.map((m, i) =>
               i === c.messages.length - 1
@@ -2652,6 +3025,7 @@ const App = () => {
         },
       ));
       streamingTargetRef.current = null;
+      setStreamingChatId(null);
       setIsLoading(false);
     });
   };
@@ -2697,8 +3071,18 @@ const App = () => {
               <>
                 <ChatArea
                   chat={selectedChat}
+                  job={selectedJob}
                   onSendMessage={onSendMessage}
                   isLoading={isLoading}
+                  streamingChatId={streamingChatId}
+                  onOpenResumeDocx={(path) => {
+                    invoke("open_path", { path }).catch((e) =>
+                      console.error("open_path failed:", e),
+                    );
+                  }}
+                  onSimulateKnockout={() => {
+                    if (selectedJob) startKnockoutScreen(selectedJob);
+                  }}
                 />
                 <InputComposer onSend={onSendMessage} disabled={isLoading} />
               </>

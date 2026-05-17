@@ -49,8 +49,10 @@ impl PythonSidecar {
             "127.0.0.1".into(),
             "--port".into(),
             port.to_string(),
+            // Info-level keeps access logs in sidecar.log so the user can
+            // confirm requests arrive and trace where a stream stalls.
             "--log-level".into(),
-            "error".into(),
+            "info".into(),
         ]);
 
         // Pipe stdout + stderr to a log file under %LOCALAPPDATA%\InterPrep so
@@ -103,11 +105,38 @@ impl PythonSidecar {
     }
 }
 
+impl PythonSidecar {
+    /// Kill the sidecar and every descendant (uvicorn workers, Playwright's
+    /// Chromium tree). Idempotent — safe to call from both an explicit
+    /// shutdown handler and `Drop`.
+    ///
+    /// On Windows, `Child::kill` only terminates the immediate process. The
+    /// Python interpreter spawns Playwright's `chrome.exe` which itself forks
+    /// renderer/GPU subprocesses; those become orphans unless we walk the
+    /// tree. `taskkill /T /F /PID …` does exactly that.
+    pub fn shutdown(&mut self) {
+        if let Some(mut child) = self.process.take() {
+            let pid = child.id();
+            #[cfg(windows)]
+            {
+                let _ = Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            // Belt-and-braces: also call kill() in case taskkill failed (PID
+            // already gone, missing on PATH on some restricted machines).
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = pid;
+        }
+    }
+}
+
 impl Drop for PythonSidecar {
     fn drop(&mut self) {
-        if let Some(mut child) = self.process.take() {
-            let _ = child.kill();
-        }
+        self.shutdown();
     }
 }
 

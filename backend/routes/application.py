@@ -179,17 +179,36 @@ async def tailor_resume(req: ApplicationRequest):
             yield _evt("stage", "\n📝 **Tailoring resume and drafting cover letter (Gemini 2.5 Pro)…**\n\n")
             await asyncio.sleep(0)
 
-            # Single call returning structured JSON. Pro handles this prompt
-            # well; we don't need to stream the model output token-by-token
-            # because the JSON would be unparseable mid-stream.
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.4,
-                ),
-            )
+            # Single call returning structured JSON. We don't stream the model
+            # output token-by-token because the JSON would be unparseable
+            # mid-stream. Try the latest preview first, fall back to stable
+            # so a 404 / model-not-found doesn't block the whole feature.
+            candidate_models = [
+                "gemini-3.1-pro-preview",
+                "gemini-3-pro-preview",
+                "gemini-2.5-pro",
+            ]
+            response = None
+            last_err: Exception | None = None
+            for model_name in candidate_models:
+                try:
+                    response = await client.aio.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.4,
+                        ),
+                    )
+                    yield _evt("stage", f"\n🧠 **Model:** `{model_name}`\n\n")
+                    await asyncio.sleep(0)
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    yield _evt("stage", f"\n⚠️ {model_name} unavailable — trying next…\n\n")
+                    await asyncio.sleep(0)
+            if response is None:
+                raise last_err or RuntimeError("No model available")
 
             raw = _response_text(response)
             try:

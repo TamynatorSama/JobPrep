@@ -1,5 +1,7 @@
 import asyncio
 import json
+import sys
+import traceback
 
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
@@ -26,6 +28,21 @@ _STAGE_BANNERS = {
 @router.post("/stream")
 async def company_research_stream(req: CompanyResearchRequest):
     async def generate():
+        # Echo arrival so the frontend bubble updates immediately. Without
+        # this, Playwright cold-start + supervisor LLM latency can swallow
+        # 10–30s before any event reaches the client, which reads as a hang.
+        print(
+            f"[company-research] /stream hit company={req.company!r} "
+            f"role={req.role!r} key_len={len(req.api_key or '')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        yield {"data": json.dumps({
+            "type": "stage",
+            "content": "\n📡 **Request received** — building workflow…\n",
+        })}
+        await asyncio.sleep(0)
+
         if not req.api_key:
             yield {"data": json.dumps({
                 "type": "error",
@@ -67,28 +84,75 @@ async def company_research_stream(req: CompanyResearchRequest):
                 "errors":           [],
             }
 
+            yield {"data": json.dumps({
+                "type": "stage",
+                "content": "\n🚀 **Workflow built** — dispatching supervisor…\n",
+            })}
+            await asyncio.sleep(0)
+
+            event_count = 0
+            seen_nodes: set[str] = set()
+            seen_names: set[str] = set()  # diagnostic: all on_chain_start names
             async for event in workflow.astream_events(initial, version="v2"):
+                event_count += 1
                 etype = event.get("event", "")
                 name  = event.get("name", "")
 
-                # Stage banners when a node starts
-                if etype == "on_chain_start" and name in _STAGE_BANNERS:
-                    yield {"data": json.dumps({
-                        "type": "stage",
-                        "content": _STAGE_BANNERS[name],
-                    })}
-                    await asyncio.sleep(0)
+                if etype == "on_chain_start" and name and name not in seen_names:
+                    seen_names.add(name)
+                    print(f"[company-research] on_chain_start name={name!r}",
+                          file=sys.stderr, flush=True)
 
-                # Token stream from any LLM call (supervisor reasoning + final compose)
+                # Banner when a node starts. Prefer the curated copy from
+                # `_STAGE_BANNERS`; fall back to a generic banner so the user
+                # still sees progress when LangGraph internals rename a node.
+                if etype == "on_chain_start" and name and name not in seen_nodes:
+                    if name in _STAGE_BANNERS:
+                        seen_nodes.add(name)
+                        yield {"data": json.dumps({
+                            "type": "stage",
+                            "content": _STAGE_BANNERS[name],
+                        })}
+                        await asyncio.sleep(0)
+                    elif name.lower() in _STAGE_BANNERS:
+                        seen_nodes.add(name)
+                        yield {"data": json.dumps({
+                            "type": "stage",
+                            "content": _STAGE_BANNERS[name.lower()],
+                        })}
+                        await asyncio.sleep(0)
+
+                # Final report — composer is the only node with streaming LLM,
+                # so this only fires during the dossier write.
                 elif etype == "on_chat_model_stream":
                     chunk = event["data"].get("chunk")
                     if chunk and hasattr(chunk, "content") and chunk.content:
                         yield {"data": json.dumps({"type": "token", "content": chunk.content})}
                         await asyncio.sleep(0)
 
+                # Surface the composed report when the compose node finishes,
+                # in case streaming events didn't carry tokens (fallback path).
+                elif etype == "on_chain_end" and name == "compose":
+                    output = event.get("data", {}).get("output") or {}
+                    report = output.get("report") if isinstance(output, dict) else None
+                    if report:
+                        yield {"data": json.dumps({"type": "token", "content": report})}
+                        await asyncio.sleep(0)
+
+            print(
+                f"[company-research] stream done, event_count={event_count}, "
+                f"node_banners_emitted={sorted(seen_nodes)}",
+                file=sys.stderr,
+                flush=True,
+            )
             yield {"data": json.dumps({"type": "done"})}
 
         except Exception as exc:
-            yield {"data": json.dumps({"type": "error", "content": str(exc)})}
+            tb = traceback.format_exc()
+            print(f"[company-research] FATAL: {exc}\n{tb}", file=sys.stderr, flush=True)
+            yield {"data": json.dumps({
+                "type": "error",
+                "content": f"{type(exc).__name__}: {exc}",
+            })}
 
     return EventSourceResponse(generate())

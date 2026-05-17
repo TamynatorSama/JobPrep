@@ -36,6 +36,15 @@ pub enum MsgRole {
 pub struct ChatMsg {
     pub role: MsgRole,
     pub content: String,
+    /// Agent progress log lines collected while the stream was running.
+    /// Rendered in the "Thinking" disclosure above the bubble.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<String>,
+    /// True while tokens are still streaming into `content`. Persisted so a
+    /// reload doesn't drop the streaming cursor mid-response (in which case
+    /// the frontend treats it as an interrupted message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,4 +76,14 @@ pub struct Job {
     pub job_description: Option<String>,
     #[serde(default)]
     pub archived: bool,
+    /// Plain-text tailored resume from the Application-Prep step.
+    /// Fed into Company Research as candidate background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailored_resume: Option<String>,
+    /// Absolute path to the generated `resume.docx`. Set after Prep finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_docx_path: Option<String>,
+    /// ATS scorecard returned by the tailoring step (verbatim match %, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorecard: Option<serde_json::Value>,
 }
