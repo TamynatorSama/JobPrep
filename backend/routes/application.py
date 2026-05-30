@@ -27,111 +27,142 @@ from sse_starlette.sse import EventSourceResponse
 from google import genai
 from google.genai import types as genai_types
 from docx import Document
-from docx.shared import Pt
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor
 
 from models import ApplicationRequest, KnockoutRequest
+from routes.docx_editor import sections_to_text
 
 
 router = APIRouter()
 
-# ── Master prompt (verbatim from the user's spec) ────────────────────────────
-MASTER_PROMPT = """\
-Persona and Role:
+# -- Master prompt (verbatim from the user's spec) ---------------------------
+MASTER_PROMPT = """Persona and Role:
 
-* Act as a dual-expert consultant embodying the roles of a Senior Technical \
-Recruiter, an ATS Logic Engineer, and a Strategic Career Hacker.
 
-* Your objective is to engineer an application that mathematically maximizes \
-the probability of an interview by exploiting the mechanics of Applicant \
-Tracking Systems (ATS) like Greenhouse, Lever, and Workable, and the psychology \
-of recruiters.
+* Act as a dual-expert consultant embodying the roles of a Senior Technical Recruiter, an ATS Logic Engineer, and a Strategic Career Hacker.
 
-* You operate based on 'Verbatim Match', 'Hire/ No Hire', and 'Structure \
-Mirroring' methodologies, treating a resume as a dedicated proof-of-match \
-document for a specific Job Description (JD).
+
+* Your objective is to engineer an application that mathematically maximizes the probability of an interview by exploiting the mechanics of Applicant Tracking Systems (ATS) like Greenhouse, Lever, and Workable, and the psychology of recruiters.
+
+
+* You operate based on 'Verbatim Match', 'Hire/ No Hire', and 'Structure Mirroring' methodologies, treating a resume as a dedicated proof-of-match document for a specific Job Description (JD).
+
+
 
 
 Operational Workflow:
 
 
+
+
 PHASE 1: Semantic Extraction & Strategy Setup
 
-1. Request Input: One or more master resumes are provided below; the JD is \
-provided too. Pick the closest match.
 
-2. The Verbatim Audit: Scan the JD for specific technical phrases. Identify \
-exact strings (e.g., 'manipulate large datasets' instead of 'big data handling').
+1. Request Input: One or more master resumes are provided below. They belong to the SAME candidate -- treat them as ONE unified evidence pool, NOT as alternatives to pick one of. Aggregate the STRONGEST evidence per section from across ALL of them. The JD is provided too.
 
-3. Structure Analysis: Identify headers in the JD responsibilities (e.g., \
-'Data Strategy') to use as CV sub-headers later.
 
-4. Values Detection: Flag terms from the JD's 'Values' or 'Culture' section \
-for alignment.
+2. The Verbatim Audit: Scan the JD for specific technical phrases. Identify exact strings (e.g., 'manipulate large datasets' instead of 'big data handling').
+
+
+3. Structure Analysis: Identify headers in the JD responsibilities (e.g., 'Data Strategy') to use as CV sub-headers later.
+
+
+4. Values Detection: Flag terms from the JD's 'Values' or 'Culture' section for alignment.
+
+
 
 
 PHASE 2: System-Beater Resume Optimization
 
+
 Generate a revised, text-only resume using these rules:
 
-* Benchmark: Utilize standard patterns for Data Analyst, Data Scientist, or AI \
-Engineer roles as benchmarks where applicable.
 
-* Rule 1 (Role Title Trick): Match the candidate's Resume Job Title to the JD \
-title exactly, provided responsibilities align. Do not falsely upgrade seniority.
+* Benchmark: Infer the role family from the JD title (engineering, data, product, design, marketing, ops, finance, etc.) and use that family's strongest resume patterns as the benchmark. Do NOT assume a tech role.
 
-* Rule 2 (Structure Mirroring): Categorize bullet points under sub-headers that \
-mirror the JD's section headers.
 
-* Rule 3 (Verbatim Keyword Injection): Integrate identified exact phrases \
-naturally into bullet points.
+* Rule 1 (Role Title Trick): Match the candidate's Resume Job Title to the JD title exactly, provided responsibilities align. Do not falsely upgrade seniority.
 
-* Rule 4 (Values Alignment): Create a section titled 'Values Alignment' linking \
-traits to company keywords.
 
-* Rule 5 (Quantification): Apply the Google XYZ formula (Accomplished [X] as \
-measured by [Y], by doing [Z]). Every claim must include a number (%, $, time). \
-Use estimates if necessary.
+* Rule 2 (Structure Mirroring): Categorize bullet points under sub-headers that mirror the JD's section headers.
 
-* Rule 6 (Proactive Logistics): Add an 'Additional Information' section \
-addressing location and visa status when known.
 
-* Formatting: Single-column, ATS-friendly. No tables, or columns. No citation \
-markers like '[cite start]'.
+* Rule 3 (Verbatim Keyword Injection): Integrate identified exact phrases naturally into bullet points.
+
+
+* Rule 4 (Values Alignment): Create a section titled 'Values Alignment' linking traits to company keywords.
+
+
+* Rule 5 (Quantification): Apply the Google XYZ formula (Accomplished [X] as measured by [Y], by doing [Z]). Aim for a number (%, $, time) on every impact bullet. If the master resumes don't supply a real figure, you MAY add a conservative estimate — but MARK it approximate (e.g. "~30%", "(est.)"). NEVER present an invented figure as a precisely measured result.
+
+
+* Rule 6 (Proactive Logistics): Add an 'Additional Information' section addressing location and visa status.
+
+
+* Formatting: Single-column, ATS-friendly. No tables, or columns. No citation markers like '[cite start]'.
+
+
 
 
 PHASE 3: Hook & Match Cover Letter
 
+
 Draft a letter using this 5-paragraph formula:
+
 
 1. The Hook: Open with enthusiasm for the specific company mission/product.
 
+
 2. Experience Story: Provide a condensed, quantified STAR format example.
+
 
 3. Why This Role: Mention specific excitement about JD responsibilities.
 
+
 4. Close: Confirm location/availability and request a discussion.
 
-* Tone: Human, natural, using contractions. Avoid 'I am writing to express my \
-interest.'
+
+* Tone: Human, natural, using contractions. Avoid 'I am writing to express my interest.'
+
+
 
 
 PHASE 4: Final Output & Analysis
 
+
 1. Output: Provide rewritten Resume and Cover Letter.
 
-2. Scorecard: Technical Match: List skills using JD terminology. Provide an \
-objective 'Hire' or 'No Hire' recommendation based on fit.
 
-3. Also produce: 'Verbatim Match Score' (0-100%), 'Role Title Alignment' \
-(Yes/No), and 'Quantification Check' (Pass/Needs Work).
+2. Scorecard: Technical Match: List skills using JD terminology. Provide an objective 'Hire' or 'No Hire' recommendation based on fit.
+
+
+   'Verbatim Match Score' (0-100%),
+
+
+   'Role Title Alignment' (Yes/No), and
+
+
+   'Quantification Check'.
+
+
+3. Next Step: Ask if the user wants to simulate a 'Knockout Question' screening.
+
+
 
 
 Operational Guardrails:
 
-* No Hallucination: Do not invent work history. If a required skill isn't in \
-the resumes, omit it rather than fabricate it.
+
+* Honest embellishment (NOT fabrication): You MAY (a) surface skills clearly IMPLIED by the candidate's real experience even when not named verbatim, (b) reframe and strengthen existing bullets in the JD's wording, (c) write a compelling tailored summary and Values Alignment, and (d) add conservative, clearly-marked metric estimates per Rule 5.
+
+
+* HARD LIMITS — never invent any of: employers, job titles, companies, degrees, certifications, dates, or projects/experiences that did not happen. If a required skill has NO basis in the candidate's real background, OMIT it — do not claim it. Strong but defensible in an interview is the bar.
+
 
 * Formatting: .docx compatible. Do not include metadata or citation text.
+
 
 * Tone: Professional, authoritative, and tactical coach.
 """
@@ -142,17 +173,64 @@ OUTPUT_SHAPE = """\
 Return ONLY a single JSON object (no markdown fences, no leading prose) with \
 this exact shape:
 {
-  "selected_resume_label": "<label of the master resume you used as the base>",
-  "resume_text": "<the full tailored resume as PLAIN TEXT.\\nUse these conventions for the docx renderer:\\n  Line 1 = candidate name\\n  Line 2 = single-line contact info (email | phone | location | linkedin)\\n  Section headers: '## Section Name'\\n  Bullets: '- bullet text'\\n  Paragraphs: plain lines.\\nNo emoji, no tables, no columns. ATS-safe.>",
-  "cover_letter": "<the full cover letter, ready to copy/paste. Plain prose with paragraph breaks.>",
+  "resumes_used": ["<labels of every master resume that contributed at least one bullet/skill/fact>"],
+  "aggregation_notes": "<1-3 sentences describing what came from where. Example: 'Experience from Resume A (recent SWE roles); Projects from Resume B (ML/AI shipped work); Education from Resume A.'>",
+  "sections": {
+    "name": "<candidate full name>",
+    "contact": "<single line: email | phone | city, country | linkedin | github (omit any field that is not in the master resumes)>",
+    "summary": "<2-3 line prose summary tailored to the JD role title. Mirror JD wording. No first-person 'I'. No filler adjectives. No contact info, no URLs, no 'Seeking...' opener.>",
+    "skills": [
+      { "category": "<category that fits THIS role>", "items": ["...", "..."] }
+    ],
+    "experience": [
+      {
+        "role":     "Senior Software Engineer",
+        "company":  "Acme",
+        "location": "Remote",
+        "start":    "Jan 2023",
+        "end":      "Present",
+        "bullets":  ["Action verb + what + technology + outcome.", "..."]
+      }
+    ],
+    "projects": [
+      {
+        "name":     "ProjectX",
+        "subtitle": "RAG pipeline over Postgres",
+        "date":     "Mar 2024",
+        "bullets":  ["Built ... using ... to ...", "Tech: Python, FastAPI, pgvector"]
+      }
+    ],
+    "education": [
+      {
+        "institution": "MIT",
+        "location":    "Cambridge, MA",
+        "degree":      "BS Computer Science",
+        "dates":       "Aug 2019 – May 2023"
+      }
+    ],
+    "certifications": ["AWS Solutions Architect Associate — Amazon · Jan 2024"],
+    "achievements":   ["Achievement description · Year"],
+    "values_alignment": ["Trait — mapped to company keyword/value", "..."],
+    "additional_information": "<one short line: location, work auth / visa status, availability. Omit if nothing concrete from the master resumes or request payload supports it.>"
+  },
+  "cover_letter": "<full cover letter, 180-260 words, plain prose with paragraph breaks. Do NOT start with 'I am writing to express my interest'.>",
   "scorecard": {
     "verbatim_match_score": 0-100,
     "role_title_alignment": "Yes" | "No",
     "quantification_check": "Pass" | "Needs Work",
-    "hire_recommendation": "Hire" | "No Hire",
-    "skills_matched": ["skill1", "skill2", "..."]   // SHORT keyword skills only: 1-3 words each, max 25 chars. Examples: "Python", "Distributed systems", "RLHF", "AWS Lambda", "SQL". NEVER full phrases like "develop, test, and maintain software" — break those into individual skill keywords. 6-10 skills total.
+    "hire_recommendation":  "Hire" | "No Hire",
+    "skills_matched":       ["skill1", "skill2", "..."]   // SHORT keyword skills only: 1-3 words each, max 25 chars. 6-10 skills total. NEVER full sentences.
   }
-}"""
+}
+
+IMPORTANT:
+  - Omit ANY section key entirely (do not emit empty arrays/strings) if the aggregated evidence pool has nothing for it.
+  - Do NOT emit a top-level `resume_text` field — content is structured-only and the backend renders the .docx itself.
+  - For each experience entry, prefer 3-4 bullets. For each project, 2-3 bullets max.
+  - Mirror EXACT JD keyword spelling inside skills/bullets where the candidate actually possesses the skill.
+  - SKILLS categories are NOT fixed — choose 4-6 categories that fit THIS role family. Engineering: Languages, Frameworks, Databases, Tools, AI/ML. Product: Product & Strategy, Analytics, Research, Tools. Marketing: Channels, Martech, Analytics, Content. Pick what matches; never force engineering buckets onto a non-engineering role.
+  - Any estimated/inferred number MUST be marked approximate ("~", "(est.)"). Never fabricate a precise measured figure.
+"""
 
 
 @router.post("/tailor-resume")
@@ -176,57 +254,69 @@ async def tailor_resume(req: ApplicationRequest):
         try:
             client = genai.Client(api_key=req.api_key)
 
-            yield _evt("stage", "\n📝 **Tailoring resume and drafting cover letter (Gemini 2.5 Pro)…**\n\n")
+            yield _evt("stage", "\n📝 **Drafting tailored resume + cover letter…**\n\n")
             await asyncio.sleep(0)
 
-            # Single call returning structured JSON. We don't stream the model
-            # output token-by-token because the JSON would be unparseable
-            # mid-stream. Try the latest preview first, fall back to stable
-            # so a 404 / model-not-found doesn't block the whole feature.
-            candidate_models = [
-                "gemini-3.1-pro-preview",
-                "gemini-3-pro-preview",
-                "gemini-2.5-pro",
-            ]
-            response = None
-            last_err: Exception | None = None
-            for model_name in candidate_models:
-                try:
-                    response = await client.aio.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=genai_types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.4,
-                        ),
-                    )
-                    yield _evt("stage", f"\n🧠 **Model:** `{model_name}`\n\n")
-                    await asyncio.sleep(0)
-                    break
-                except Exception as exc:
-                    last_err = exc
-                    yield _evt("stage", f"\n⚠️ {model_name} unavailable — trying next…\n\n")
-                    await asyncio.sleep(0)
-            if response is None:
-                raise last_err or RuntimeError("No model available")
-
-            raw = _response_text(response)
+            # ── Pass 1: draft. Structured JSON — we don't token-stream this
+            #    because mid-stream JSON is unparseable.
             try:
-                data = json.loads(_strip_fences(raw))
-            except json.JSONDecodeError as exc:
+                draft_resp, model_name = await _generate_json(client, prompt, temperature=0.4)
+            except Exception as exc:
+                yield _evt("error", f"Model call failed: {exc}")
+                return
+            yield _evt("stage", f"\n🧠 **Model:** `{model_name}`\n\n")
+            await asyncio.sleep(0)
+
+            try:
+                data = _loads_lenient(_response_text(draft_resp))
+            except (json.JSONDecodeError, ValueError) as exc:
                 yield _evt("error", f"Model returned non-JSON output: {exc}")
                 return
 
-            resume_text  = (data.get("resume_text")  or "").strip()
+            # ── Pass 2: self-critique + refine against the JD. Best-effort —
+            #    a failed or garbled refine falls back to the draft so we never
+            #    lose a usable result.
+            yield _evt("stage", "\n🔬 **Refining against the JD (closing keyword gaps + tightening bullets)…**\n\n")
+            await asyncio.sleep(0)
+            try:
+                refine_prompt = _build_refine_prompt(req, json.dumps(data, ensure_ascii=False))
+                refine_resp, _ = await _generate_json(client, refine_prompt, temperature=0.3)
+                refined = _loads_lenient(_response_text(refine_resp))
+                if isinstance(refined, dict) and refined.get("sections"):
+                    data = refined
+                    yield _evt("stage", "\n✅ **Refinement applied.**\n\n")
+                else:
+                    yield _evt("stage", "\n↩️ Refinement skipped (no sections in output) — kept the draft.\n\n")
+            except Exception as exc:
+                print(f"[application] refine pass failed: {exc!r}", flush=True)
+                yield _evt("stage", f"\n↩️ Refinement skipped ({type(exc).__name__}) — kept the draft.\n\n")
+            await asyncio.sleep(0)
+
+            sections     = data.get("sections") or {}
             cover_letter = (data.get("cover_letter") or "").strip()
             scorecard    = data.get("scorecard")    or {}
-            chosen_label = data.get("selected_resume_label") or "(unspecified)"
+            resumes_used = data.get("resumes_used") or []
+            agg_notes    = (data.get("aggregation_notes") or "").strip()
+
+            # Backwards-compat with older model outputs.
+            if not resumes_used and data.get("selected_resume_label"):
+                resumes_used = [data["selected_resume_label"]]
+
+            # Build plain-text view from sections for chat preview / knockout.
+            resume_text = sections_to_text(sections).strip() if sections else ""
+
+            # Legacy fallback: if a model still emits resume_text directly.
+            if not resume_text and data.get("resume_text"):
+                resume_text = str(data["resume_text"]).strip()
 
             if not resume_text or not cover_letter:
-                yield _evt("error", "Model output was missing the resume or cover letter.")
+                yield _evt("error", "Model output was missing the resume sections or cover letter.")
                 return
 
-            yield _evt("stage", f"\n✨ **Using master resume:** _{chosen_label}_\n\n")
+            used_label = ", ".join(resumes_used) if resumes_used else "(unspecified)"
+            yield _evt("stage", f"\n✨ **Aggregated from:** _{used_label}_\n\n")
+            if agg_notes:
+                yield _evt("stage", f"_{agg_notes}_\n\n")
             await asyncio.sleep(0)
 
             # ── Stream the cover letter as tokens (word-by-word) so the chat
@@ -239,6 +329,9 @@ async def tailor_resume(req: ApplicationRequest):
             yield _evt("token", "\n\n")
 
             # ── Build the .docx and send it back as base64 ──────────────────
+            #    Always render from scratch via `_build_docx`. The in-place
+            #    "duplicate base resume" path was dropped because it silently
+            #    skipped sections whose headers weren't in the source.
             yield _evt("stage", "\n📄 **Building tailored resume.docx…**\n\n")
             await asyncio.sleep(0)
             docx_bytes = _build_docx(resume_text)
@@ -248,7 +341,14 @@ async def tailor_resume(req: ApplicationRequest):
             )
 
             # ── Scorecard ───────────────────────────────────────────────────
-            yield {"data": json.dumps({"type": "scorecard", "content": scorecard})}
+            # Bundle resumes_used + aggregation_notes into the scorecard so the
+            # frontend's persistent `job.scorecard` carries them. Stage banners
+            # show the same info but disappear from view once streaming ends.
+            yield {"data": json.dumps({"type": "scorecard", "content": {
+                **scorecard,
+                "resumes_used": resumes_used,
+                "aggregation_notes": agg_notes,
+            }})}
             await asyncio.sleep(0)
 
             # ── Pass the tailored resume text back so the client can hand
@@ -375,7 +475,7 @@ async def knockout_screen(req: KnockoutRequest):
             yield _evt("error", "Company and role are required.")
             return
 
-        yield _evt("stage", "\n\n---\n🎯 **Simulating recruiter knockout screen (Gemini 2.5 Pro)…**\n\n")
+        yield _evt("stage", "\n\n---\n🎯 **Simulating recruiter knockout screen…**\n\n")
         await asyncio.sleep(0)
 
         loc = f"\nLocation: {req.location}" if req.location else ""
@@ -390,13 +490,35 @@ async def knockout_screen(req: KnockoutRequest):
         try:
             client = genai.Client(api_key=req.api_key)
 
+            # Try Gemini 3 first for sharper recruiter judgement; fall back
+            # gracefully when a model name isn't available on the account.
+            candidate_models = [
+                "gemini-3.1-pro-preview",
+                "gemini-3-pro-preview",
+                "gemini-2.5-pro",
+            ]
+            stream = None
+            last_err: Exception | None = None
+            for model_name in candidate_models:
+                try:
+                    stream = await client.aio.models.generate_content_stream(
+                        model=model_name,
+                        contents=contents,
+                        config=genai_types.GenerateContentConfig(temperature=0.5),
+                    )
+                    yield _evt("stage", f"\n🧠 **Model:** `{model_name}`\n\n")
+                    await asyncio.sleep(0)
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    yield _evt("stage", f"\n⚠️ {model_name} unavailable — trying next…\n\n")
+                    await asyncio.sleep(0)
+            if stream is None:
+                raise last_err or RuntimeError("No model available")
+
             # True streaming — these questions form a narrative the user wants
             # to watch render in the chat bubble.
-            async for chunk in await client.aio.models.generate_content_stream(
-                model="gemini-2.5-pro",
-                contents=contents,
-                config=genai_types.GenerateContentConfig(temperature=0.5),
-            ):
+            async for chunk in stream:
                 text = _response_text(chunk)
                 if text:
                     yield _evt("token", text)
@@ -423,6 +545,22 @@ def _strip_fences(text: str) -> str:
     return t.strip()
 
 
+def _loads_lenient(text: str) -> dict:
+    """Parse the first complete JSON object out of a model response.
+
+    Tolerates leading prose, code fences, and — importantly — trailing junk
+    after the object (Gemini sometimes appends stray `}` braces, which makes
+    a plain `json.loads` raise "Extra data"). Uses `raw_decode` so we take the
+    first balanced object and ignore whatever follows.
+    """
+    t = _strip_fences(text)
+    start = t.find("{")
+    if start == -1:
+        raise ValueError("no JSON object found in model output")
+    obj, _ = json.JSONDecoder().raw_decode(t[start:])
+    return obj
+
+
 def _response_text(response) -> str:
     if hasattr(response, "text") and response.text:
         return response.text
@@ -434,11 +572,26 @@ def _response_text(response) -> str:
 
 
 def _build_prompt(req: ApplicationRequest) -> str:
+    def _format_resume(i: int, r) -> str:
+        return (
+            f"=== MASTER RESUME [{i+1}/{len(req.master_resumes)}] "
+            f"LABEL: {r.name} ===\n{r.text}"
+        )
+
     resumes_block = "\n\n".join(
-        f"=== MASTER RESUME: {r.name} ===\n{r.text}"
-        for r in req.master_resumes
+        _format_resume(i, r) for i, r in enumerate(req.master_resumes)
     )
     loc = f"\nLocation: {req.location}" if req.location else ""
+    aggregation_note = (
+        f"\n\nAGGREGATION REMINDER: {len(req.master_resumes)} master resumes "
+        "below belong to the SAME candidate. Merge them into ONE unified "
+        "evidence pool per PHASE 1. Pull the STRONGEST item per section from "
+        "across ALL of them. Use every contributing resume's LABEL in "
+        "`resumes_used`."
+        if len(req.master_resumes) > 1
+        else "\n\nNOTE: Only one master resume supplied. Use it as the sole "
+             "evidence pool."
+    )
     return (
         MASTER_PROMPT
         + "\n\n=== JOB CONTEXT ===\n"
@@ -447,84 +600,252 @@ def _build_prompt(req: ApplicationRequest) -> str:
         + f"=== JOB DESCRIPTION ===\n{req.job_description}\n\n"
         + f"=== AVAILABLE MASTER RESUMES ({len(req.master_resumes)}) ===\n"
         + resumes_block
+        + aggregation_note
         + "\n\n=== TASK ===\n"
         + OUTPUT_SHAPE
     )
 
 
+REFINE_PROMPT = """You are a Senior Technical Recruiter + ATS Logic Engineer doing a \
+SECOND-PASS review of a tailored-resume DRAFT (JSON below) against the target JD. Make it \
+materially stronger WITHOUT fabricating. Critique the draft, then return an IMPROVED version \
+applying every fix:
+
+1. Keyword coverage: scan the JD for must-have phrases; every one the candidate plausibly \
+satisfies must appear VERBATIM in skills or a bullet. Close the gaps.
+2. Bullets: each experience/project bullet follows XYZ (Accomplished X, measured by Y, by \
+doing Z) and carries a number. If no real figure exists, add a conservative estimate MARKED \
+approximate ("~", "(est.)") — never a fake precise metric. Cut generic or duplicate bullets.
+3. Summary: 2-3 lines, mirrors the JD title + its top 3 requirements, no first-person, no filler.
+4. Skills: categories must fit THIS role family (don't force engineering buckets on a \
+non-engineering role); 4-6 categories; JD wording where the candidate has the skill.
+5. Values Alignment: map REAL candidate traits to the company's stated values/keywords.
+6. Cover letter: keep the 5-beat structure + human tone; no "I am writing to express my interest".
+
+HARD LIMITS (same as the draft): never invent employers, titles, companies, degrees, \
+certifications, dates, or projects. Preserve `resumes_used`; update `aggregation_notes` only if \
+your edits shift what came from where.
+
+Return ONLY the improved JSON in the exact shape specified below.
+"""
+
+
+def _build_refine_prompt(req: ApplicationRequest, draft_json: str) -> str:
+    loc = f"\nLocation: {req.location}" if req.location else ""
+    return (
+        REFINE_PROMPT
+        + "\n\n=== JOB CONTEXT ===\n"
+        + f"Company: {req.company}\nRole: {req.role}{loc}\n\n"
+        + f"=== JOB DESCRIPTION ===\n{req.job_description}\n\n"
+        + "=== DRAFT TO IMPROVE (JSON) ===\n"
+        + draft_json
+        + "\n\n=== REQUIRED OUTPUT SHAPE ===\n"
+        + OUTPUT_SHAPE
+    )
+
+
+async def _generate_json(client, contents: str, *, temperature: float):
+    """Call Gemini for JSON output, trying preview models then stable so a
+    404 / model-not-found doesn't block the feature. Returns
+    (response, model_name); raises the last error if every model fails."""
+    candidate_models = [
+        "gemini-3.1-pro-preview",
+        "gemini-3-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    last_err: Exception | None = None
+    for model_name in candidate_models:
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=temperature,
+                ),
+            )
+            return resp, model_name
+        except Exception as exc:
+            last_err = exc
+    raise last_err or RuntimeError("No model available")
+
+
+def _add_bottom_border(paragraph) -> None:
+    """Attach a full-width horizontal rule under a paragraph (section divider).
+
+    `w:sz` is in eighths-of-a-point — 8 = 1pt. `w:space` (in points) pushes
+    the rule a few pt below the text so the heading doesn't sit on the line.
+    """
+    pPr = paragraph._p.get_or_add_pPr()
+    # Drop any existing pBdr so we don't stack borders.
+    for existing in pPr.findall(qn("w:pBdr")):
+        pPr.remove(existing)
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"),   "single")
+    bottom.set(qn("w:sz"),    "8")        # 1pt — visible without screaming
+    bottom.set(qn("w:space"), "4")        # 4pt gap between text and rule
+    bottom.set(qn("w:color"), "606060")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+
+def _add_run_with_inline_bold(paragraph, text: str) -> None:
+    """Add runs to `paragraph` splitting `text` on '**...**' bold spans."""
+    parts = text.split("**")
+    for i, seg in enumerate(parts):
+        if not seg:
+            continue
+        r = paragraph.add_run(seg)
+        r.bold = (i % 2 == 1)
+
+
+FONT_NAME = "Times New Roman"
+
+
+def _set_font(run, *, size_pt: float | None = None, bold: bool | None = None,
+              color: "RGBColor | None" = None) -> None:
+    """Apply Times New Roman + optional size/bold/color to a run.
+
+    python-docx does not always propagate `font.name` from the Normal style
+    into runs with explicit rPr children, so we set it on every run we
+    build to guarantee the whole resume renders in one font.
+    """
+    run.font.name = FONT_NAME
+    # rFonts override — pins eastAsia + cs slots so Word doesn't substitute
+    # back to Calibri for any character class.
+    rPr = run._element.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rFonts.set(qn(attr), FONT_NAME)
+    if size_pt is not None:
+        run.font.size = Pt(size_pt)
+    if bold is not None:
+        run.bold = bold
+    if color is not None:
+        run.font.color.rgb = color
+
+
 def _build_docx(resume_text: str) -> bytes:
     """Render the LLM's plain-text resume into a clean, ATS-friendly .docx.
 
-    Conventions honored:
-        First line       → candidate name (heading)
-        Second line      → contact info (italic-ish, smaller)
-        '## …'           → section heading
-        '- …'            → bullet
-        '**…**' bare line → bold paragraph
-        '' (blank)       → spacer
-        anything else    → paragraph
+    Layout rules:
+        Line 1            → candidate name (centered, 20pt, bold)
+        Line 2            → contact info (centered, 10pt, grey)
+        '## SECTION'      → uppercase heading, 11.5pt bold, bottom-rule
+        '### Subhead'     → 11pt bold (role / project / school)
+        '- bullet'        → List Bullet style with hanging indent
+        '**text**'        → inline bold
+        '' (blank)        → tight spacer
+
+    Times New Roman 11pt + 0.6in margins is the most ATS-portable combo.
     """
     doc = Document()
 
-    # Single-column, default style. Calibri 11 is the most ATS-tolerant
-    # default in 2026 (Word's stock font).
+    # Tighter margins: 0.6in left/right, 0.5in top/bottom.
+    section = doc.sections[0]
+    section.top_margin    = Inches(0.5)
+    section.bottom_margin = Inches(0.5)
+    section.left_margin   = Inches(0.6)
+    section.right_margin  = Inches(0.6)
+
     normal = doc.styles["Normal"]
-    normal.font.name = "Calibri"
+    normal.font.name = FONT_NAME
     normal.font.size = Pt(11)
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after  = Pt(2)
+    normal.paragraph_format.line_spacing = 1.15
 
     lines = [ln.rstrip() for ln in resume_text.split("\n")]
     saw_name = False
+    saw_contact = False
+
+    GREY = RGBColor(0x55, 0x55, 0x55)
+    BLACK_INK = RGBColor(0x10, 0x10, 0x10)
 
     for raw in lines:
         line = raw.strip()
+
         if not line:
-            doc.add_paragraph("")
+            spacer = doc.add_paragraph("")
+            spacer.paragraph_format.space_after = Pt(2)
             continue
 
+        # ── Header: name + contact (first two non-empty lines) ───────────
         if not saw_name:
-            heading = doc.add_paragraph()
-            run = heading.add_run(line)
-            run.bold = True
-            run.font.size = Pt(18)
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after  = Pt(0)
+            p.alignment = 1  # WD_ALIGN_PARAGRAPH.CENTER
+            _set_font(p.add_run(line), size_pt=20, bold=True, color=BLACK_INK)
             saw_name = True
             continue
 
+        if not saw_contact:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(1)
+            p.paragraph_format.space_after  = Pt(4)
+            p.alignment = 1
+            _set_font(p.add_run(line), size_pt=10, color=GREY)
+            saw_contact = True
+            continue
+
+        # ── Section heading (## or #) ────────────────────────────────────
         if line.startswith("## "):
-            sec = doc.add_paragraph()
-            run = sec.add_run(line[3:].strip().upper())
-            run.bold = True
-            run.font.size = Pt(12)
+            p = doc.add_paragraph()
+            # Modest space above so sections feel separated without burning
+            # vertical real estate; smaller gap below so the rule + body
+            # read as one block.
+            p.paragraph_format.space_before = Pt(8)
+            p.paragraph_format.space_after  = Pt(3)
+            _set_font(p.add_run(line[3:].strip().upper()),
+                      size_pt=11.5, bold=True, color=BLACK_INK)
+            _add_bottom_border(p)
             continue
 
         if line.startswith("# "):
-            sec = doc.add_paragraph()
-            run = sec.add_run(line[2:].strip())
-            run.bold = True
-            run.font.size = Pt(14)
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(6)
+            p.paragraph_format.space_after  = Pt(2)
+            _set_font(p.add_run(line[2:].strip()), size_pt=13, bold=True)
             continue
 
+        # ── Sub-heading (### role/project/school) ─────────────────────────
+        if line.startswith("### "):
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(3)
+            p.paragraph_format.space_after  = Pt(1)
+            _add_run_with_inline_bold(p, line[4:].strip())
+            # Force the whole sub-head bold regardless of inline markers.
+            for r in p.runs:
+                _set_font(r, size_pt=11, bold=True)
+            continue
+
+        # ── Bullet ────────────────────────────────────────────────────────
         if line.startswith("- ") or line.startswith("* "):
-            doc.add_paragraph(line[2:].strip(), style="List Bullet")
+            p = doc.add_paragraph(style="List Bullet")
+            p.paragraph_format.space_after = Pt(1)
+            _add_run_with_inline_bold(p, line[2:].strip())
+            for r in p.runs:
+                _set_font(r)
             continue
 
-        # Bare bold line e.g. **Education** as a sub-header
+        # ── Bare bold line e.g. "**Education**" ───────────────────────────
         if line.startswith("**") and line.endswith("**") and len(line) > 4:
             p = doc.add_paragraph()
-            r = p.add_run(line[2:-2])
-            r.bold = True
+            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_after  = Pt(1)
+            _set_font(p.add_run(line[2:-2]), bold=True)
             continue
 
-        # Inline bold in regular paragraphs: split on **…** and toggle.
-        if "**" in line:
-            p = doc.add_paragraph()
-            for i, seg in enumerate(line.split("**")):
-                if not seg:
-                    continue
-                r = p.add_run(seg)
-                r.bold = (i % 2 == 1)
-            continue
-
-        doc.add_paragraph(line)
+        # ── Regular paragraph (with optional inline **bold** spans) ──────
+        p = doc.add_paragraph()
+        _add_run_with_inline_bold(p, line)
+        for r in p.runs:
+            _set_font(r)
 
     buf = io.BytesIO()
     doc.save(buf)

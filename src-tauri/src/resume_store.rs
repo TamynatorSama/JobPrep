@@ -20,6 +20,13 @@ pub struct Resume {
     pub id:   u64,
     pub name: String,
     pub text: String,
+    /// Base64-encoded raw .docx bytes when the resume was uploaded as a
+    /// .docx file. Used by the backend as the styling base for in-place
+    /// section editing so the tailored output preserves the original
+    /// document's fonts, headings, and layout. `None` for PDF/MD/TXT
+    /// uploads or for resumes saved before this field existed.
+    #[serde(default)]
+    pub docx_b64: Option<String>,
 }
 
 fn data_dir() -> PathBuf {

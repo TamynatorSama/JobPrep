@@ -7,9 +7,12 @@ mod recorder;
 mod resume_store;
 mod sidecar;
 mod types;
+mod voice_audio;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use credentials::Credentials;
 use resume_store::Resume;
@@ -34,6 +37,27 @@ struct SidecarInner {
 #[derive(Default)]
 struct RecorderState {
     inner: Mutex<Option<recorder::RecordingSession>>,
+}
+
+/// Queue item for the serialized TTS playback worker.
+enum TtsMsg {
+    Speak(String),
+    Flush, // end of one utterance → emit `voice:speak_done`
+}
+
+/// Voice turn state. A single worker thread plays queued TTS chunks in order
+/// (so streamed sentences don't overlap). `interrupt` aborts the current
+/// chunk; `abort` drains the rest of the queue until the next `Flush`;
+/// `listen_stop` ends mic capture early.
+#[derive(Default)]
+struct VoiceState {
+    speak_tx: Mutex<Option<std::sync::mpsc::Sender<TtsMsg>>>,
+    interrupt: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    abort: Arc<AtomicBool>,
+    /// Barge-in (interrupt the AI by talking) only works with headphones —
+    /// on speakers the mic hears the AI's own voice. Off by default.
+    barge_enabled: Arc<AtomicBool>,
+    listen_stop: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 // ─── Jobs ─────────────────────────────────────────────────────────────────
@@ -108,9 +132,10 @@ fn start_chat_stream(
     history: Vec<(String, String)>,
     mode: String,
     api_key: String,
+    documents: Vec<backend_client::RagDocPayload>,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
-    backend_client::stream_chat(app, url, message, job_context, history, mode, api_key);
+    backend_client::stream_chat(app, url, message, job_context, history, mode, api_key, documents);
     Ok(())
 }
 
@@ -171,7 +196,7 @@ fn start_application_tailor_stream(
     role: String,
     location: String,
     job_description: String,
-    master_resumes: Vec<(String, String)>,
+    master_resumes: Vec<backend_client::MasterResumePayload>,
     api_key: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
@@ -346,6 +371,212 @@ fn capture_to_json(c: &recorder::CaptureSummary) -> serde_json::Value {
     })
 }
 
+// ─── Voice (live mock interview) ──────────────────────────────────────────
+
+/// Capability + device (cuda/cpu) report from the sidecar.
+#[tauri::command]
+fn voice_status(state: State<SidecarState>) -> Result<serde_json::Value, String> {
+    let url = require_url(&state)?;
+    backend_client::voice_status(&url)
+}
+
+/// Serialized TTS playback worker. Pulls chunks off the queue, synthesizes +
+/// plays each in order (so streamed sentences never overlap), runs a barge-in
+/// monitor during playback, and emits `voice:speak_done` on each `Flush`.
+fn voice_worker(
+    app: AppHandle,
+    url: String,
+    rx: std::sync::mpsc::Receiver<TtsMsg>,
+    interrupt_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    abort: Arc<AtomicBool>,
+    barge_enabled: Arc<AtomicBool>,
+) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            TtsMsg::Flush => {
+                // `abort` is set if a barge-in/stop cut this utterance short.
+                let interrupted = abort.swap(false, Ordering::SeqCst);
+                let _ = app.emit("voice:speak_done", serde_json::json!({ "interrupted": interrupted }));
+            }
+            TtsMsg::Speak(text) => {
+                if abort.load(Ordering::SeqCst) {
+                    continue; // draining the rest of an aborted utterance
+                }
+                let wav = match backend_client::voice_tts(&url, &text) {
+                    Ok(w) => w,
+                    Err(e) => { let _ = app.emit("voice:error", e); continue; }
+                };
+                if abort.load(Ordering::SeqCst) {
+                    continue;
+                }
+
+                let interrupt = Arc::new(AtomicBool::new(false));
+                *interrupt_slot.lock().unwrap() = Some(Arc::clone(&interrupt));
+
+                // Barge-in monitor for this chunk — only with headphones (else
+                // the mic hears the AI's own playback and false-triggers).
+                let detected = Arc::new(AtomicBool::new(false));
+                let monitor_stop = Arc::new(AtomicBool::new(false));
+                let monitoring = barge_enabled.load(Ordering::SeqCst);
+                if monitoring {
+                    let interrupt = Arc::clone(&interrupt);
+                    let detected = Arc::clone(&detected);
+                    let monitor_stop = Arc::clone(&monitor_stop);
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        let _ = voice_audio::wait_for_speech(&monitor_stop, &detected);
+                        if detected.load(Ordering::SeqCst) {
+                            interrupt.store(true, Ordering::SeqCst);
+                            let _ = app.emit("voice:barge_in", ());
+                        }
+                    });
+                }
+
+                let app_lvl = app.clone();
+                let mut last = Instant::now() - Duration::from_millis(100);
+                let mut on_level = move |rms: f32, zcr: f32| {
+                    let now = Instant::now();
+                    if now.duration_since(last) >= Duration::from_millis(45) {
+                        last = now;
+                        let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "speaking" }));
+                    }
+                };
+                let played = voice_audio::play_wav(&wav, &interrupt, &mut on_level).unwrap_or(false);
+                let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "speaking" }));
+                monitor_stop.store(true, Ordering::SeqCst);
+                *interrupt_slot.lock().unwrap() = None;
+                if detected.load(Ordering::SeqCst) || !played {
+                    abort.store(true, Ordering::SeqCst); // drop the rest of this utterance
+                }
+            }
+        }
+    }
+}
+
+/// Lazily start the playback worker, returning its queue sender.
+fn ensure_voice_worker(
+    app: &AppHandle,
+    url: String,
+    voice: &State<VoiceState>,
+) -> std::sync::mpsc::Sender<TtsMsg> {
+    let mut guard = voice.speak_tx.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        return tx.clone();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let app2 = app.clone();
+    let slot = Arc::clone(&voice.interrupt);
+    let abort = Arc::clone(&voice.abort);
+    let barge = Arc::clone(&voice.barge_enabled);
+    std::thread::spawn(move || voice_worker(app2, url, rx, slot, abort, barge));
+    *guard = Some(tx.clone());
+    tx
+}
+
+/// Enqueue a chunk (typically one sentence) of the interviewer's reply for
+/// playback. Chunks play in order as they stream in from the model.
+#[tauri::command]
+fn voice_speak_chunk(
+    app: AppHandle,
+    sidecar: State<SidecarState>,
+    voice: State<VoiceState>,
+    text: String,
+) -> Result<(), String> {
+    let url = require_url(&sidecar)?;
+    // A fresh utterance is starting — clear any stale abort from a prior turn.
+    voice.abort.store(false, Ordering::SeqCst);
+    let tx = ensure_voice_worker(&app, url, &voice);
+    let _ = tx.send(TtsMsg::Speak(text));
+    Ok(())
+}
+
+/// Mark the end of the interviewer's reply. The worker emits `voice:speak_done`
+/// once it finishes everything queued before this.
+#[tauri::command]
+fn voice_speak_flush(
+    app: AppHandle,
+    sidecar: State<SidecarState>,
+    voice: State<VoiceState>,
+) -> Result<(), String> {
+    let url = require_url(&sidecar)?;
+    let tx = ensure_voice_worker(&app, url, &voice);
+    let _ = tx.send(TtsMsg::Flush);
+    Ok(())
+}
+
+/// Enable/disable barge-in (interrupt the AI by speaking). Should only be on
+/// with headphones — otherwise the mic hears the AI and cuts it off.
+#[tauri::command]
+fn voice_set_barge(voice: State<VoiceState>, enabled: bool) {
+    voice.barge_enabled.store(enabled, Ordering::SeqCst);
+}
+
+/// Abort current playback + drain the rest of the queued utterance.
+#[tauri::command]
+fn voice_interrupt(voice: State<VoiceState>) {
+    voice.abort.store(true, Ordering::SeqCst);
+    if let Some(flag) = voice.interrupt.lock().unwrap().as_ref() {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Capture one spoken answer (VAD-endpointed), transcribe it (faster-whisper),
+/// and emit `voice:transcript` with the text ("" if nothing was said). Emits
+/// `voice:listening` when the mic opens.
+#[tauri::command]
+fn voice_listen(
+    app: AppHandle,
+    sidecar: State<SidecarState>,
+    voice: State<VoiceState>,
+) -> Result<(), String> {
+    let url = require_url(&sidecar)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    *voice.listen_stop.lock().unwrap() = Some(Arc::clone(&stop));
+
+    std::thread::spawn(move || {
+        let _ = app.emit("voice:listening", ());
+        let app_lvl = app.clone();
+        let mut last = Instant::now() - Duration::from_millis(100);
+        let mut on_level = move |rms: f32, zcr: f32| {
+            let now = Instant::now();
+            if now.duration_since(last) >= Duration::from_millis(45) {
+                last = now;
+                let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "listening" }));
+            }
+        };
+        let result = voice_audio::record_answer(&stop, &mut on_level);
+        let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "listening" }));
+        match result {
+            Ok(Some(wav)) => {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+                match backend_client::voice_stt(&url, &b64) {
+                    Ok(text) => { let _ = app.emit("voice:transcript", text); }
+                    Err(e) => {
+                        let _ = app.emit("voice:error", e);
+                        let _ = app.emit("voice:transcript", String::new());
+                    }
+                }
+            }
+            Ok(None) => { let _ = app.emit("voice:transcript", String::new()); }
+            Err(e) => {
+                let _ = app.emit("voice:error", format!("listen failed: {e:#}"));
+                let _ = app.emit("voice:transcript", String::new());
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Force-end mic capture early (user pressed stop / disabled voice).
+#[tauri::command]
+fn voice_stop_listening(voice: State<VoiceState>) {
+    if let Some(flag) = voice.listen_stop.lock().unwrap().as_ref() {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
 fn opt(s: String) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
 }
@@ -362,6 +593,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(SidecarState::default())
         .manage(RecorderState::default())
+        .manage(VoiceState::default())
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -406,6 +638,13 @@ pub fn run() {
             list_audio_devices,
             start_recording,
             stop_recording,
+            voice_status,
+            voice_speak_chunk,
+            voice_speak_flush,
+            voice_set_barge,
+            voice_interrupt,
+            voice_listen,
+            voice_stop_listening,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

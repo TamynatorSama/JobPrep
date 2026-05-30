@@ -8,6 +8,14 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class RagDoc(BaseModel):
+    """One retrievable document from a job's corpus. `source` is a short label
+    (e.g. "resume", "company_research", "chat: Mock Interview") surfaced to the
+    LLM alongside the retrieved text."""
+    source: str
+    text: str
+
+
 class ChatRequest(BaseModel):
     message: str
     job_context: Optional[str] = ""
@@ -16,6 +24,10 @@ class ChatRequest(BaseModel):
     history: List[ChatMessage] = []
     # "coach" (default, friendly assistant) or "interviewer" (in-character live interview).
     mode: Literal["coach", "interviewer"] = "coach"
+    # The job's corpus (resume, company research, sibling chats) for RAG. The
+    # backend embeds + retrieves the most relevant chunks per message. Empty
+    # disables retrieval.
+    documents: List[RagDoc] = []
 
 
 class ResearchRequest(BaseModel):
@@ -41,6 +53,10 @@ class CompanyResearchRequest(BaseModel):
 class MasterResume(BaseModel):
     name: str
     text: str
+    # Base64-encoded raw .docx bytes, when the resume was uploaded as a .docx.
+    # Used as the styling base for in-place section editing so the tailored
+    # output preserves the original document's fonts, headings, and layout.
+    docx_b64: Optional[str] = None
 
 
 class ApplicationRequest(BaseModel):

@@ -10,6 +10,7 @@ from routes.chat import router as chat_router
 from routes.research import router as research_router
 from routes.company_research import router as company_research_router
 from routes.application import router as application_router
+from routes.voice import router as voice_router
 
 
 @asynccontextmanager
@@ -47,6 +48,7 @@ app.include_router(chat_router, prefix="/chat")
 app.include_router(research_router, prefix="/research")
 app.include_router(company_research_router, prefix="/company-research")
 app.include_router(application_router, prefix="/application")
+app.include_router(voice_router, prefix="/voice")
 
 
 @app.get("/health")

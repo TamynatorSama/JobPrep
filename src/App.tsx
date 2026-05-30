@@ -17,28 +17,56 @@ import {
 import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import * as pdfjs from "pdfjs-dist";
-// pdf.js needs a worker. Vite bundles the worker script as a separate URL.
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+// pdf.js needs a worker. Vite emits the worker script as a separate URL asset
+// (the `?url` suffix), so this import is just a string — it does NOT pull the
+// pdf.js library into the main bundle. The library itself + mammoth are
+// dynamically imported on first use (see extractResumeText) so they don't bloat
+// the initial UI load — most sessions never upload a resume.
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import mammoth from "mammoth";
-
-pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 // ─── Resume file parsing ──────────────────────────────────────────────────
 
-/** Extracts plain text from PDF/DOCX/MD/TXT. Throws on unknown extension. */
-async function extractResumeText(file: File): Promise<string> {
+interface ResumeExtract {
+  /** Plain-text content used as evidence by the LLM. */
+  text: string;
+  /** Base64-encoded raw .docx bytes — only set for .docx uploads. The backend
+   *  uses these as the styling base for the tailored output. */
+  docx_b64?: string;
+}
+
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  // Chunked to dodge call-stack limits on very large files.
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, i + chunk)),
+    );
+  }
+  return btoa(binary);
+}
+
+/** Extracts plain text (and raw .docx bytes when applicable) from PDF/DOCX/MD/TXT.
+ *  Throws on unknown extension. */
+async function extractResumeText(file: File): Promise<ResumeExtract> {
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "txt" || ext === "md") {
-    return await file.text();
+    return { text: await file.text() };
   }
   if (ext === "docx") {
     const buf = await file.arrayBuffer();
+    const mammoth = (await import("mammoth")).default;
     const result = await mammoth.extractRawText({ arrayBuffer: buf });
-    return result.value;
+    return { text: result.value, docx_b64: arrayBufferToBase64(buf) };
   }
   if (ext === "pdf") {
     const buf = await file.arrayBuffer();
+    const pdfjs = await import("pdfjs-dist");
+    pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
     const doc = await pdfjs.getDocument({ data: buf }).promise;
     const pages: string[] = [];
     for (let i = 1; i <= doc.numPages; i++) {
@@ -50,7 +78,7 @@ async function extractResumeText(file: File): Promise<string> {
           .join(" "),
       );
     }
-    return pages.join("\n\n");
+    return { text: pages.join("\n\n") };
   }
   throw new Error(`Unsupported file type: .${ext}`);
 }
@@ -120,6 +148,16 @@ interface ChatMsg {
   logs?: string[];
   /** True while tokens are still streaming into `content`. */
   streaming?: boolean;
+  /** Sent to the backend but not rendered (e.g. the Mock Interview kickoff). */
+  hidden?: boolean;
+}
+
+/** Pre-start configuration for a Mock Interview thread. */
+interface InterviewConfig {
+  focus: string;       // Behavioral | Technical | System Design | Full Loop
+  difficulty: string;  // Junior | Mid | Senior | Staff
+  tone: string;        // Friendly | Neutral | Tough
+  length: string;      // e.g. "Standard (8–12 questions)"
 }
 
 interface ChatThread {
@@ -127,6 +165,10 @@ interface ChatThread {
   title: string;
   preview?: string;
   messages: ChatMsg[];
+  /** "interviewer" drives the live mock-interview persona; default "coach". */
+  mode?: "coach" | "interviewer";
+  /** Set on Mock Interview threads from the pre-start modal. */
+  interviewConfig?: InterviewConfig;
 }
 
 interface StageNote {
@@ -139,6 +181,10 @@ interface Resume {
   id:   number;
   name: string;
   text: string;
+  /** Base64-encoded raw .docx bytes when the upload was a .docx. Sent to the
+   *  backend as the styling base for in-place section editing so the
+   *  tailored output preserves the original document's fonts and layout. */
+  docx_b64?: string | null;
 }
 
 interface Credentials {
@@ -160,6 +206,8 @@ interface Scorecard {
   quantification_check?: "Pass" | "Needs Work";
   hire_recommendation?: "Hire" | "No Hire";
   skills_matched?: string[];
+  resumes_used?: string[];
+  aggregation_notes?: string;
 }
 
 interface Job {
@@ -185,9 +233,35 @@ interface Job {
   resumeDocxPath?: string;
   /** ATS scorecard returned by the tailoring step. */
   scorecard?: Scorecard;
+  /** Outcome of the most recent completed mock interview. */
+  lastInterview?: { outcome: string; date: string; chatId: string };
 }
 
 type Screen = "chat" | "timeline";
+
+// ─── Mock-interview config ─────────────────────────────────────────────────
+
+const INTERVIEW_OPTIONS = {
+  focus:      ["Behavioral", "Technical", "System Design", "Full Loop"],
+  difficulty: ["Junior", "Mid", "Senior", "Staff"],
+  tone:       ["Friendly", "Neutral", "Tough"],
+  length:     ["Short (5–6 questions)", "Standard (8–12 questions)", "Extended (12–15 questions)"],
+} as const;
+
+const DEFAULT_INTERVIEW_CONFIG: InterviewConfig = {
+  focus: "Full Loop", difficulty: "Senior", tone: "Neutral", length: "Standard (8–12 questions)",
+};
+
+const INTERVIEW_DONE_MARKER = "--- INTERVIEW COMPLETE ---";
+
+const formatInterviewSetup = (c: InterviewConfig): string =>
+  [
+    "INTERVIEW SETUP (obey strictly):",
+    `- Focus: ${c.focus}`,
+    `- Candidate level / difficulty: ${c.difficulty}`,
+    `- Interviewer tone: ${c.tone}`,
+    `- Length: ${c.length}`,
+  ].join("\n");
 
 // ─── Seed sample data ──────────────────────────────────────────────────────
 
@@ -333,50 +407,83 @@ const Icon = ({ name, size = 16, color = "currentColor", strokeWidth = 1.75 }: I
 
 interface MarkdownTextProps { content: string; }
 
-const MarkdownText = ({ content }: MarkdownTextProps) => {
-  const lines = content.split("\n");
-  const elements: ReactNode[] = [];
+// Theme-mapped component overrides so react-markdown output matches the dark
+// UI tokens. Defined at module scope so the object identity is stable across
+// re-renders (the bubble re-renders on every streamed token).
+const MD_COMPONENTS: Components = {
+  p:      (props) => <p style={{ margin: "0 0 6px" }} {...props} />,
+  strong: (props) => <strong style={{ color: T.text, fontWeight: 700 }} {...props} />,
+  em:     (props) => <em style={{ fontStyle: "italic" }} {...props} />,
+  a:      (props) => <a style={{ color: T.accent, textDecoration: "underline" }} target="_blank" rel="noreferrer" {...props} />,
+  h1:     (props) => <h1 style={{ fontSize: 18,   fontWeight: 700, color: T.text, margin: "14px 0 6px", lineHeight: 1.3 }} {...props} />,
+  h2:     (props) => <h2 style={{ fontSize: 16,   fontWeight: 700, color: T.text, margin: "12px 0 5px", lineHeight: 1.3 }} {...props} />,
+  h3:     (props) => <h3 style={{ fontSize: 14.5, fontWeight: 700, color: T.text, margin: "10px 0 4px", lineHeight: 1.3 }} {...props} />,
+  h4:     (props) => <h4 style={{ fontSize: 13.5, fontWeight: 700, color: T.text, margin: "8px 0 4px",  lineHeight: 1.3 }} {...props} />,
+  ul:     (props) => <ul style={{ margin: "0 0 6px", paddingLeft: 20 }} {...props} />,
+  ol:     (props) => <ol style={{ margin: "0 0 6px", paddingLeft: 20 }} {...props} />,
+  li:     (props) => <li style={{ marginBottom: 3 }} {...props} />,
+  blockquote: (props) => (
+    <blockquote style={{ borderLeft: `3px solid ${T.accent}`, margin: "6px 0", padding: "2px 0 2px 12px", color: T.text }} {...props} />
+  ),
+  hr:     () => <hr style={{ border: "none", borderTop: `1px solid ${T.border}`, margin: "12px 0" }} />,
+  pre:    (props) => (
+    <pre style={{ background: T.surface2, padding: 10, borderRadius: 8, overflowX: "auto", margin: "6px 0", whiteSpace: "pre" }} {...props} />
+  ),
+  // react-markdown v9+ dropped the `inline` prop — a fenced block carries a
+  // `language-*` className, inline code does not. Inline gets a chip; fenced
+  // code is laid out by the `pre` wrapper above.
+  code: ({ className, ...props }) =>
+    /^language-/.test(className || "")
+      ? <code className={className} style={{ fontFamily: "monospace", fontSize: 12.5 }} {...props} />
+      : <code style={{ background: T.surface2, padding: "1px 5px", borderRadius: 4, fontFamily: "monospace", fontSize: 12.5, color: T.text }} {...props} />,
+  table:  (props) => <table style={{ borderCollapse: "collapse", margin: "6px 0", width: "100%", fontSize: 13 }} {...props} />,
+  th:     (props) => <th style={{ border: `1px solid ${T.border}`, padding: "4px 8px", textAlign: "left", color: T.text, fontWeight: 600 }} {...props} />,
+  td:     (props) => <td style={{ border: `1px solid ${T.border}`, padding: "4px 8px" }} {...props} />,
+};
 
-  const renderInlineBold = (text: string, key: string | number): ReactNode[] =>
-    text.split(/(\*\*[^*]+\*\*)/g).map((part, j) =>
-      part.startsWith("**")
-        ? <strong key={`${key}-b-${j}`}>{part.slice(2, -2)}</strong>
-        : <span key={`${key}-s-${j}`}>{part}</span>,
-    );
+const MarkdownText = ({ content }: MarkdownTextProps) => (
+  <div style={{ fontSize: 14, lineHeight: 1.65, color: T.textSecondary }}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+      {content}
+    </ReactMarkdown>
+  </div>
+);
 
-  lines.forEach((line, i) => {
-    if (line.startsWith("**") && line.endsWith("**") && line.length > 4) {
-      elements.push(
-        <p key={i} style={{ fontWeight: 700, color: T.text, marginBottom: 2 }}>
-          {line.slice(2, -2)}
-        </p>,
-      );
-    } else if (line.startsWith("- ") || line.startsWith("• ")) {
-      elements.push(
-        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 2 }}>
-          <span style={{ color: T.accent, flexShrink: 0, marginTop: 2 }}>›</span>
-          <span>{renderInlineBold(line.slice(2), i)}</span>
-        </div>,
-      );
-    } else if (line.startsWith("---")) {
-      elements.push(<hr key={i} style={{ border: "none", borderTop: `1px solid ${T.border}`, margin: "12px 0" }} />);
-    } else if (line === "") {
-      elements.push(<div key={i} style={{ height: 8 }} />);
-    } else {
-      elements.push(
-        <p key={i} style={{ marginBottom: 2 }}>{renderInlineBold(line, i)}</p>,
-      );
-    }
-  });
+// ─── Small style helper for popup menu rows ───────────────────────────────
 
+// Distinct card for the post-interview feedback block (after the
+// `--- INTERVIEW COMPLETE ---` marker), with a Pass/Borderline/Fail badge.
+const FeedbackCard = ({ feedback }: { feedback: string }) => {
+  const m = feedback.match(/Predicted outcome:?\**\s*(Pass|Borderline|Fail)/i);
+  const outcome = m?.[1] ?? null;
+  const color = outcome
+    ? (/pass/i.test(outcome) ? "#22c55e" : /fail/i.test(outcome) ? "#ef4444" : "#f59e0b")
+    : T.accent;
   return (
-    <div style={{ fontSize: 14, lineHeight: 1.65, color: T.textSecondary }}>
-      {elements}
+    <div style={{ marginTop: 10, border: `1px solid ${T.border}`, borderRadius: 14, overflow: "hidden", background: T.surface2 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderBottom: `1px solid ${T.border}` }}>
+        <Icon name="analyze" size={14} color={color} />
+        <span style={{ fontSize: 13, fontWeight: 700, color: T.text, fontFamily: T.fontDisplay }}>Interview Feedback</span>
+        {outcome && (
+          <span style={{ marginLeft: "auto", padding: "3px 10px", borderRadius: 100, background: `${color}22`, color, fontSize: 11, fontWeight: 600 }}>
+            {outcome}
+          </span>
+        )}
+      </div>
+      <div style={{ padding: "4px 16px 12px" }}>
+        <MarkdownText content={feedback} />
+      </div>
     </div>
   );
 };
 
-// ─── Small style helper for popup menu rows ───────────────────────────────
+// Copy / Regenerate pills shown under an AI bubble on hover.
+const msgActionStyle: CSSProperties = {
+  display: "flex", alignItems: "center", gap: 5,
+  padding: "4px 8px", borderRadius: 100, border: "none",
+  background: T.surface2, color: T.textSecondary,
+  fontSize: 11, cursor: "pointer", fontFamily: T.fontBody,
+};
 
 const menuItemStyle = (color: string = T.textSecondary): CSSProperties => ({
   display: "flex", alignItems: "center", gap: 8,
@@ -395,6 +502,7 @@ interface SidebarProps {
   selectedChatId: string | null;
   onSelectJob: (id: string) => void;
   onSelectChat: (id: string | null) => void;
+  onDeleteChat: (jobId: string, chatId: string) => void;
   onNewJob: () => void;
   onSettings: () => void;
   onArchiveJob: (id: string) => void;
@@ -633,6 +741,21 @@ const Sidebar = (p: SidebarProps) => {
                               letterSpacing: "-0.12px",
                             }}>{chat.title}</p>
                           </div>
+                          {hovered === `c-${chat.id}` && (
+                            <button
+                              title="Delete chat"
+                              onClick={(e) => { e.stopPropagation(); p.onDeleteChat(job.id, chat.id); }}
+                              onMouseEnter={(e) => { e.currentTarget.style.color = "#ef4444"; }}
+                              onMouseLeave={(e) => { e.currentTarget.style.color = T.textTertiary; }}
+                              style={{
+                                width: 20, height: 20, borderRadius: 6, border: "none",
+                                background: "transparent", color: T.textTertiary, cursor: "pointer",
+                                display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+                              }}
+                            >
+                              <Icon name="trash" size={11} />
+                            </button>
+                          )}
                         </div>
                       );
                     })}
@@ -785,9 +908,12 @@ interface WorkspaceHeaderProps {
   job: Job | null;
   onToggleSidebar: () => void;
   backend: BackendStatus;
+  /// Step launchers — each creates (and selects) the relevant chat thread.
+  onStartApplicationPrep?: (job: Job) => void;
+  onStartMockInterview?: (job: Job) => void;
 }
 
-const WorkspaceHeader = ({ job, onToggleSidebar, backend }: WorkspaceHeaderProps) => {
+const WorkspaceHeader = ({ job, onToggleSidebar, backend, onStartApplicationPrep, onStartMockInterview }: WorkspaceHeaderProps) => {
   const st = job ? STATUS_CONFIG[job.status] : null;
   const headerRef = useRef<HTMLDivElement>(null);
   const [headerWidth, setHeaderWidth] = useState(900);
@@ -803,9 +929,11 @@ const WorkspaceHeader = ({ job, onToggleSidebar, backend }: WorkspaceHeaderProps
   const showStatus = headerWidth > 480;
   const showLabels = headerWidth > 720;
 
-  const actions: { icon: IconName; label: string; color: string }[] = [
-    { icon: "interview", label: "Mock Interview", color: "#a855f7" },
-    { icon: "note",      label: "Add Note",       color: "#F59E0B" },
+  // Each step button creates (and switches to) its chat thread on click.
+  const actions: { icon: IconName; label: string; color: string; onClick?: () => void }[] = [
+    { icon: "sparkle",   label: "Application Prep", color: "#10B981", onClick: () => job && onStartApplicationPrep?.(job) },
+    { icon: "interview", label: "Mock Interview",   color: "#a855f7", onClick: () => job && onStartMockInterview?.(job) },
+    { icon: "note",      label: "Add Note",         color: "#F59E0B" },
   ];
 
   return (
@@ -887,6 +1015,7 @@ const WorkspaceHeader = ({ job, onToggleSidebar, backend }: WorkspaceHeaderProps
             {actions.map((a) => (
               <button
                 key={a.label}
+                onClick={a.onClick}
                 onMouseEnter={(e) => { e.currentTarget.style.background = T.surface2; e.currentTarget.style.color = T.text; }}
                 onMouseLeave={(e) => { e.currentTarget.style.background = T.surface; e.currentTarget.style.color = T.textSecondary; }}
                 style={{
@@ -1528,6 +1657,32 @@ const ScorecardCard = ({ card }: { card: Scorecard }) => {
           </div>
         </>
       )}
+      {(card.resumes_used?.length ?? 0) > 0 && (
+        <>
+          <div style={{ fontSize: 10.5, color: T.textTertiary, marginTop: 10, marginBottom: 4 }}>
+            Aggregated from
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {card.resumes_used!.map((s, i) => (
+              <span key={i} style={{
+                padding: "3px 8px", borderRadius: 100,
+                background: T.surface2, color: T.textSecondary,
+                fontSize: 11, whiteSpace: "nowrap",
+              }}>
+                {s}
+              </span>
+            ))}
+          </div>
+          {card.aggregation_notes && (
+            <div style={{
+              fontSize: 11.5, color: T.textSecondary,
+              marginTop: 8, fontStyle: "italic", lineHeight: 1.4,
+            }}>
+              {card.aggregation_notes}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 };
@@ -1544,9 +1699,19 @@ interface ChatAreaProps {
   onOpenResumeDocx?: (path: string) => void;
   /// Kicks off the recruiter-knockout simulation thread for the current job.
   onSimulateKnockout?: () => void;
+  /// Re-runs the most recent exchange: drops the last AI reply + its user
+  /// prompt and re-sends that prompt. Only wired for the newest message.
+  onRegenerate?: () => void;
+  /// Ends a live mock interview and asks for structured feedback.
+  onEndInterview?: () => void;
+  /// Voice mode (spoken Q&A + barge-in) for interview threads.
+  voiceEnabled?: boolean;
+  voiceListening?: boolean;
+  voiceStatus?: { available: boolean; device?: string; detail?: string } | null;
+  onOpenVoice?: () => void;
 }
 
-const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpenResumeDocx, onSimulateKnockout }: ChatAreaProps) => {
+const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpenResumeDocx, onSimulateKnockout, onRegenerate, onEndInterview, voiceEnabled, voiceListening, voiceStatus, onOpenVoice }: ChatAreaProps) => {
   // Loader is per-thread, not global. Even if isLoading is true (some other
   // stream is running), don't draw the bouncing dots unless the user is
   // looking at the thread the tokens are flowing into.
@@ -1610,9 +1775,61 @@ const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpen
     );
   }
 
+  const isInterviewThread = chat.mode === "interviewer" || chat.title === "Mock Interview";
+  const interviewComplete = chat.messages.some((m) => m.content.includes(INTERVIEW_DONE_MARKER));
+  const questionCount = chat.messages.filter(
+    (m) => m.role === "ai" && m.content.trim() && !m.content.includes(INTERVIEW_DONE_MARKER),
+  ).length;
+
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "24px 0" }}>
+      {isInterviewThread && (
+        <div style={{
+          position: "sticky", top: 0, zIndex: 5,
+          display: "flex", alignItems: "center", gap: 10,
+          margin: "0 24px 16px", padding: "8px 14px", borderRadius: 100,
+          background: T.surface, border: `1px solid ${T.border}`, boxShadow: T.shadowMd,
+        }}>
+          <Icon name="interview" size={13} color={T.accent} />
+          <span style={{ fontSize: 12, color: T.textSecondary, fontWeight: 500, letterSpacing: "-0.12px" }}>
+            Mock Interview
+            {chat.interviewConfig ? ` · ${chat.interviewConfig.focus} · ${chat.interviewConfig.tone}` : ""}
+            {interviewComplete ? " · Complete" : questionCount > 0 ? ` · ~Q${questionCount}` : ""}
+            {voiceEnabled && voiceListening ? " · 🎙 listening…" : ""}
+            {voiceEnabled && voiceStatus && !voiceStatus.available ? " · voice unavailable" : ""}
+            {voiceEnabled && voiceStatus?.available && voiceStatus.device ? ` · voice on (${voiceStatus.device.toUpperCase()})` : ""}
+          </span>
+          <button
+            title={voiceEnabled ? "Open voice view" : "Voice interview (spoken Q&A)"}
+            onClick={() => onOpenVoice?.()}
+            style={{
+              marginLeft: "auto", width: 28, height: 28, borderRadius: 100,
+              border: `1px solid ${voiceEnabled ? T.accent : T.border}`,
+              background: voiceEnabled ? T.accentSoft : T.surface2,
+              color: voiceEnabled ? T.accent : T.textSecondary,
+              cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+            }}
+          >
+            <Icon name="mic" size={13} />
+          </button>
+          {!interviewComplete && (
+            <button
+              onClick={() => onEndInterview?.()}
+              disabled={isLoading}
+              style={{
+                padding: "5px 12px", borderRadius: 100,
+                border: `1px solid ${T.border}`, background: T.surface2, color: T.text,
+                fontSize: 11.5, fontWeight: 500, fontFamily: T.fontBody,
+                cursor: isLoading ? "not-allowed" : "pointer", opacity: isLoading ? 0.5 : 1,
+              }}
+            >
+              End &amp; get feedback
+            </button>
+          )}
+        </div>
+      )}
       {chat.messages.map((msg, i) => (
+        msg.hidden ? null : (
         <div
           key={i}
           onMouseEnter={() => setHoveredMsg(i)}
@@ -1655,7 +1872,21 @@ const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpen
                         <Icon name="sparkle" size={11} color={T.textTertiary} />
                         Working — first tokens incoming…
                       </span>
-                    : <MarkdownText content={msg.streaming ? msg.content + "▊" : msg.content} />
+                    : (() => {
+                        const c = msg.streaming ? msg.content + "▊" : msg.content;
+                        const idx = c.indexOf(INTERVIEW_DONE_MARKER);
+                        if (idx === -1) return <MarkdownText content={c} />;
+                        // Interview finished: render any closing line, then the
+                        // structured feedback as a distinct card.
+                        const pre = c.slice(0, idx).trim();
+                        const fb = c.slice(idx + INTERVIEW_DONE_MARKER.length).trim();
+                        return (
+                          <>
+                            {pre && <MarkdownText content={pre} />}
+                            <FeedbackCard feedback={fb} />
+                          </>
+                        );
+                      })()
                   }
                 </div>
                 {/* Application-Prep extras: scorecard + Open Resume + KO buttons.
@@ -1701,31 +1932,30 @@ const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpen
                     )}
                   </>
                 )}
-                {hoveredMsg === i && (
+                {hoveredMsg === i && !msg.streaming && (
                   <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
-                    {([
-                      { icon: "copy"     as IconName, label: "Copy" },
-                      { icon: "refresh"  as IconName, label: "Regenerate" },
-                      { icon: "bookmark" as IconName, label: "Save" },
-                    ]).map((a) => (
-                      <button
-                        key={a.icon}
-                        style={{
-                          display: "flex", alignItems: "center", gap: 5,
-                          padding: "4px 8px", borderRadius: 100, border: "none",
-                          background: T.surface2, color: T.textSecondary,
-                          fontSize: 11, cursor: "pointer", fontFamily: T.fontBody,
-                        }}
-                      >
-                        <Icon name={a.icon} size={11} />{a.label}
+                    <button
+                      onClick={() => { void navigator.clipboard?.writeText(msg.content); }}
+                      style={msgActionStyle}
+                    >
+                      <Icon name="copy" size={11} />Copy
+                    </button>
+                    {/* Regenerate only on the newest message, and only when a
+                        user prompt precedes it (skips Prep/Research/Knockout
+                        threads that have their own re-run controls). */}
+                    {i === chat.messages.length - 1
+                      && chat.messages.some((m) => m.role === "user") && (
+                      <button onClick={() => onRegenerate?.()} style={msgActionStyle}>
+                        <Icon name="refresh" size={11} />Regenerate
                       </button>
-                    ))}
+                    )}
                   </div>
                 )}
               </div>
             </div>
           )}
         </div>
+        )
       ))}
       {showLoader && (
         <div style={{ padding: "0 24px", marginBottom: 24, display: "flex", gap: 12, alignItems: "flex-start" }}>
@@ -1900,6 +2130,209 @@ interface NewJobModalProps {
   onClose: () => void;
   onSubmit: (form: NewJobFormState) => void;
 }
+
+interface MockInterviewModalProps {
+  job: Job;
+  onClose: () => void;
+  onStart: (config: InterviewConfig) => void;
+}
+
+const MockInterviewModal = ({ job, onClose, onStart }: MockInterviewModalProps) => {
+  const [config, setConfig] = useState<InterviewConfig>(DEFAULT_INTERVIEW_CONFIG);
+  const sel: CSSProperties = {
+    width: "100%", padding: "10px 14px", borderRadius: 10,
+    border: `0.5px solid ${T.border}`, background: T.bg, color: T.text,
+    fontSize: 13, fontFamily: T.fontBody, outline: "none", cursor: "pointer",
+    letterSpacing: "-0.13px",
+  };
+  const row = (label: string, key: keyof InterviewConfig, opts: readonly string[]) => (
+    <Field label={label} id={key}>
+      <select style={sel} value={config[key]} onChange={(e) => setConfig((c) => ({ ...c, [key]: e.target.value }))}>
+        {opts.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </Field>
+  );
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
+    }}>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        background: T.surface, borderRadius: 20, padding: 28, width: 440, maxWidth: "90vw",
+        boxShadow: T.shadowLg, border: `0.5px solid ${T.border}`,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 22 }}>
+          <div>
+            <h2 style={{ fontSize: 18, fontWeight: 700, color: T.text, letterSpacing: "-0.5px", fontFamily: T.fontDisplay }}>Mock Interview</h2>
+            <p style={{ fontSize: 12, color: T.textSecondary, marginTop: 3, letterSpacing: "-0.12px" }}>{job.role} · {job.company}</p>
+          </div>
+          <button onClick={onClose} style={{
+            background: T.surface2, border: "none", cursor: "pointer", padding: 6, borderRadius: 100,
+            color: T.textSecondary, display: "flex", alignItems: "center", width: 28, height: 28, justifyContent: "center",
+          }}>
+            <Icon name="x" size={14} />
+          </button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 14px" }}>
+          {row("Focus", "focus", INTERVIEW_OPTIONS.focus)}
+          {row("Difficulty", "difficulty", INTERVIEW_OPTIONS.difficulty)}
+          {row("Interviewer tone", "tone", INTERVIEW_OPTIONS.tone)}
+          {row("Length", "length", INTERVIEW_OPTIONS.length)}
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+          <button type="button" onClick={onClose} style={{
+            flex: 1, padding: "10px 0", borderRadius: 100, border: "none",
+            background: T.surface2, color: T.textSecondary, fontSize: 13, fontWeight: 500,
+            cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.13px",
+          }}>Cancel</button>
+          <button type="button" onClick={() => onStart(config)} style={{
+            flex: 1, padding: "10px 0", borderRadius: 100, border: "none",
+            background: "#fff", color: "#0C0C0C", fontSize: 13, fontWeight: 600,
+            cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.13px",
+          }}>Start interview</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+interface VoiceLevel { level: number; pitch: number; mode: string }
+
+interface VoiceOverlayProps {
+  levelRef: React.MutableRefObject<VoiceLevel>;
+  phase: string;            // "speaking" | "listening" | "thinking" | "idle"
+  subtitle?: string;
+  bargeEnabled: boolean;
+  onToggleBarge: () => void;
+  onMinimize: () => void;   // back to chat, keep voice running
+  onStop: () => void;       // turn voice off entirely
+  onEnd: () => void;        // end the interview + get feedback
+}
+
+/// Full-screen voice visualizer: a canvas orb that morphs with the live audio
+/// (RMS → size + core, ZCR pitch proxy → hue + wobble). Dismissible — the
+/// transcript keeps flowing in the chat underneath.
+const VoiceOverlay = ({ levelRef, phase, subtitle, bargeEnabled, onToggleBarge, onMinimize, onStop, onEnd }: VoiceOverlayProps) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const phaseRef = useRef(phase);
+  phaseRef.current = phase;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
+    const size = 280;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = size * dpr;
+    canvas.height = size * dpr;
+    ctx.scale(dpr, dpr);
+    const cx = size / 2, cy = size / 2;
+    let raf = 0;
+    let sl = 0, sp = 0; // smoothed level / pitch
+
+    const draw = (t: number) => {
+      const { level, pitch } = levelRef.current;
+      sl += (Math.min(level * 3.2, 1) - sl) * 0.18;
+      sp += (Math.min(pitch * 4, 1) - sp) * 0.07;
+      ctx.clearRect(0, 0, size, size);
+
+      const ph = phaseRef.current;
+      const baseHue = ph === "listening" ? 160 : ph === "thinking" ? 210 : 265;
+      const hue = baseHue + sp * 45;
+      const baseR = 58 + sl * 40;
+
+      // outer glow
+      const grd = ctx.createRadialGradient(cx, cy, baseR * 0.2, cx, cy, baseR * 1.9);
+      grd.addColorStop(0, `hsla(${hue},85%,66%,0.95)`);
+      grd.addColorStop(0.55, `hsla(${hue},85%,55%,0.45)`);
+      grd.addColorStop(1, `hsla(${hue},85%,50%,0)`);
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      const pts = 72;
+      for (let i = 0; i <= pts; i++) {
+        const a = (i / pts) * Math.PI * 2;
+        const wobble = Math.sin(a * 3 + t / 620) * 7 * sl + Math.sin(a * 5 - t / 430) * 5 * sp;
+        const r = baseR + wobble;
+        const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      // bright core
+      ctx.beginPath();
+      ctx.fillStyle = `hsla(${hue},92%,82%,0.92)`;
+      ctx.arc(cx, cy, baseR * 0.42 + sl * 12, 0, Math.PI * 2);
+      ctx.fill();
+
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [levelRef]);
+
+  const label = phase === "speaking" ? "Interviewer speaking…"
+    : phase === "listening" ? "Listening…"
+    : phase === "thinking" ? "Thinking…"
+    : "Ready";
+
+  const btn = (bg: string, color: string): CSSProperties => ({
+    padding: "9px 18px", borderRadius: 100, border: "none", background: bg, color,
+    fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.13px",
+  });
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 1100,
+      background: "rgba(8,8,12,0.88)", backdropFilter: "blur(12px)",
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 26,
+    }}>
+      <button onClick={onMinimize} title="Back to chat" style={{
+        position: "absolute", top: 18, right: 18, width: 34, height: 34, borderRadius: 100,
+        border: `1px solid ${T.border}`, background: T.surface2, color: T.textSecondary,
+        cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+      }}>
+        <Icon name="x" size={16} />
+      </button>
+
+      <canvas ref={canvasRef} style={{ width: 280, height: 280 }} />
+
+      <div style={{ textAlign: "center" }}>
+        <p style={{ fontSize: 16, fontWeight: 700, color: T.text, fontFamily: T.fontDisplay, letterSpacing: "-0.3px" }}>{label}</p>
+        {subtitle && <p style={{ fontSize: 12.5, color: T.textSecondary, marginTop: 5, letterSpacing: "-0.12px" }}>{subtitle}</p>}
+      </div>
+
+      <button
+        onClick={onToggleBarge}
+        title="Only enable with headphones — otherwise the mic hears the AI and cuts it off"
+        style={{
+          display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", borderRadius: 100,
+          border: `1px solid ${bargeEnabled ? T.accent : T.border}`,
+          background: bargeEnabled ? T.accentSoft : "transparent",
+          color: bargeEnabled ? T.accent : T.textSecondary,
+          fontSize: 12, cursor: "pointer", fontFamily: T.fontBody,
+        }}
+      >
+        <span style={{
+          width: 28, height: 16, borderRadius: 100, background: bargeEnabled ? T.accent : T.surface2,
+          position: "relative", transition: "background 0.15s", flexShrink: 0,
+        }}>
+          <span style={{
+            position: "absolute", top: 2, left: bargeEnabled ? 14 : 2, width: 12, height: 12,
+            borderRadius: 100, background: "#fff", transition: "left 0.15s",
+          }} />
+        </span>
+        Let me interrupt (headphones)
+      </button>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <button onClick={onMinimize} style={btn(T.surface2, T.text)}>Back to chat</button>
+        <button onClick={onEnd} style={btn(T.surface2, T.text)}>End interview</button>
+        <button onClick={onStop} style={btn("#ef4444", "#fff")}>Stop voice</button>
+      </div>
+    </div>
+  );
+};
 
 const NewJobModal = ({ onClose, onSubmit }: NewJobModalProps) => {
   const [form, setForm] = useState<NewJobFormState>({
@@ -2249,14 +2682,15 @@ const ResumeTab = ({ resumes, onChange }: ResumeTabProps) => {
     const added: Resume[] = [];
     for (const file of Array.from(files)) {
       try {
-        const text = await extractResumeText(file);
-        if (!text.trim()) throw new Error("File is empty or unreadable.");
+        const extract = await extractResumeText(file);
+        if (!extract.text.trim()) throw new Error("File is empty or unreadable.");
         // Strip the extension so the displayed name stays clean.
         const baseName = file.name.replace(/\.[^.]+$/, "");
         added.push({
-          id:   Date.now() + Math.floor(Math.random() * 1000),
-          name: baseName,
-          text: text.trim(),
+          id:       Date.now() + Math.floor(Math.random() * 1000),
+          name:     baseName,
+          text:     extract.text.trim(),
+          docx_b64: extract.docx_b64 ?? null,
         });
       } catch (e) {
         setErr(`${file.name}: ${e instanceof Error ? e.message : String(e)}`);
@@ -2430,6 +2864,16 @@ const App = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showNewJobModal, setShowNewJobModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  /// Job awaiting a Mock Interview config before the thread is created.
+  const [mockConfigForJob, setMockConfigForJob] = useState<Job | null>(null);
+  /// Voice-mode UI state for the interview (spoken Q&A + barge-in).
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<{ available: boolean; device?: string; detail?: string } | null>(null);
+  const [voiceOverlayOpen, setVoiceOverlayOpen] = useState(false);
+  const [voicePhase, setVoicePhase] = useState<string>("idle");
+  /// Barge-in (talk over the AI). Off by default — only safe with headphones.
+  const [bargeEnabled, setBargeEnabled] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [activeScreen, setActiveScreen] = useState<Screen>("chat");
 
@@ -2473,6 +2917,25 @@ const App = () => {
   /// Buffers the tailored-resume text emitted mid-stream so we can persist it
   /// to the Job *and* hand it to the Company-Research chain on `chat:done`.
   const pendingTailoredResumeRef = useRef<string | null>(null);
+  /// Set to a freshly-created Mock Interview thread id; an effect fires the
+  /// kickoff prompt once that thread is committed + selected, so onSendMessage
+  /// reads fresh state (avoids the stale-closure trap of calling it inline).
+  const pendingMockKickoffRef = useRef<string | null>(null);
+  /// Voice mode for the live interview. Refs mirror state so the one-shot
+  /// event listeners read the latest values.
+  const voiceEnabledRef = useRef(false);
+  /// `{ jobId, chatId }` of the interview the voice loop is driving.
+  const voiceTargetRef = useRef<{ jobId: string; chatId: string } | null>(null);
+  /// Always points at the latest `onSendMessage` closure (fresh selection).
+  const sendMessageRef = useRef<((text: string, opts?: { hidden?: boolean }) => void) | null>(null);
+  /// Live audio level/pitch for the voice orb (updated ~20×/s; a ref so the
+  /// high-frequency events don't trigger React re-renders).
+  const voiceLevelRef = useRef<VoiceLevel>({ level: 0, pitch: 0, mode: "idle" });
+  /// Streaming-TTS bookkeeping for the current AI turn.
+  const voiceSpeakBufferRef = useRef("");   // tokens not yet flushed as a sentence
+  const voiceUtteranceTextRef = useRef(""); // full text this turn (marker detection)
+  const voiceSkipRef = useRef(false);       // stop speaking this turn (feedback/barge)
+  const voiceListenActiveRef = useRef(false); // mic already opened for this answer
 
   // Refs so listener callbacks can read latest credentials + jobs without
   // re-registering listeners on every state change.
@@ -2533,6 +2996,42 @@ const App = () => {
 
     register<string>("chat:token", (e) => {
       appendToLast((m) => ({ ...m, content: m.content + e.payload }));
+
+      // Streaming TTS: as the interviewer's reply streams, speak complete
+      // sentences immediately instead of waiting for the whole message.
+      if (!voiceEnabledRef.current) return;
+      const target = streamingTargetRef.current;
+      if (!target) return;
+      const job = jobsRef.current.find((j) => j.id === target.jobId);
+      const thread = job?.chats.find((c) => c.id === target.chatId);
+      if (!thread || !(thread.mode === "interviewer" || thread.title === "Mock Interview")) return;
+      voiceTargetRef.current = { jobId: target.jobId, chatId: target.chatId };
+
+      voiceUtteranceTextRef.current += e.payload;
+      if (voiceSkipRef.current) return;
+      // Don't speak the end-of-interview feedback block.
+      if (voiceUtteranceTextRef.current.includes(INTERVIEW_DONE_MARKER)) {
+        voiceSkipRef.current = true;
+        voiceSpeakBufferRef.current = "";
+        return;
+      }
+      voiceSpeakBufferRef.current += e.payload;
+      // Flush each complete sentence (punctuation + trailing space/newline).
+      const buf = voiceSpeakBufferRef.current;
+      const re = /[^.!?\n]*[.!?\n]+(?:\s|$)/g;
+      let lastIdx = 0;
+      let m: RegExpExecArray | null;
+      const sentences: string[] = [];
+      while ((m = re.exec(buf)) !== null) {
+        const s = m[0].trim();
+        if (s) sentences.push(s);
+        lastIdx = re.lastIndex;
+      }
+      if (sentences.length) {
+        voiceSpeakBufferRef.current = buf.slice(lastIdx);
+        setVoicePhase("speaking");
+        for (const s of sentences) invoke("voice_speak_chunk", { text: s }).catch(() => {});
+      }
     });
 
     register<string>("chat:log", (e) => {
@@ -2566,6 +3065,45 @@ const App = () => {
       updateJob(target.jobId, (j) => ({ ...j, tailoredResume: e.payload }));
     });
 
+    // ── Voice loop ─────────────────────────────────────────────────────────
+    register<VoiceLevel>("voice:level", (e) => {
+      // High-frequency: write to a ref (the orb reads it via rAF), no re-render.
+      voiceLevelRef.current = e.payload;
+    });
+    register<null>("voice:listening", () => {
+      setVoiceListening(true);
+      setVoicePhase("listening");
+    });
+    register<{ interrupted: boolean }>("voice:speak_done", () => {
+      // Interviewer finished → open the mic, unless voice is off, the mic is
+      // already open (barge-in), or the interview just ended (skip).
+      if (!voiceEnabledRef.current || !voiceTargetRef.current || voiceSkipRef.current) return;
+      if (voiceListenActiveRef.current) return;
+      voiceListenActiveRef.current = true;
+      invoke("voice_listen").catch((err) => console.error("voice_listen failed:", err));
+    });
+    register<null>("voice:barge_in", () => {
+      // User cut in: stop speaking the rest of this turn and open the mic now.
+      voiceSkipRef.current = true;
+      if (voiceListenActiveRef.current) return;
+      voiceListenActiveRef.current = true;
+      setVoicePhase("listening");
+      invoke("voice_listen").catch(() => {});
+    });
+    register<string>("voice:transcript", (e) => {
+      voiceListenActiveRef.current = false;
+      setVoiceListening(false);
+      setVoicePhase("thinking");
+      const text = (e.payload || "").trim();
+      if (!text || !voiceTargetRef.current) return;
+      // Send the transcribed answer; the next question will auto-speak on done.
+      sendMessageRef.current?.(text);
+    });
+    register<string>("voice:error", (e) => {
+      setVoiceListening(false);
+      console.error("voice error:", e.payload);
+    });
+
     register<string>("chat:done", () => {
       const target = streamingTargetRef.current;
       appendToLast((m) => ({ ...m, streaming: false }));
@@ -2573,15 +3111,44 @@ const App = () => {
       setStreamingChatId(null);
       setIsLoading(false);
 
-      // Chain: Application Prep → Company Research, using the tailored
-      // resume as candidate context. We resolve the thread from the just-
-      // finished `target` because state hasn't refreshed yet.
+      // Resolve the just-finished thread from `target` (state may lag).
       if (!target) return;
       const job = jobsRef.current.find((j) => j.id === target.jobId);
       if (!job) return;
       const thread = job.chats.find((c) => c.id === target.chatId);
-      if (!thread || thread.title !== "Application Prep") return;
+      if (!thread) return;
 
+      // Mock interview finished with feedback → persist the verdict on the job.
+      const isInterview = thread.mode === "interviewer" || thread.title === "Mock Interview";
+      if (isInterview) {
+        const last = thread.messages[thread.messages.length - 1];
+        const content = last?.content ?? "";
+        if (content.includes(INTERVIEW_DONE_MARKER)) {
+          const m = content.match(/Predicted outcome:?\**\s*(Pass|Borderline|Fail)/i);
+          const outcome = m?.[1] ?? "Completed";
+          const date = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+          setJobs((prev) => prev.map((j) =>
+            j.id !== job.id ? j : { ...j, lastInterview: { outcome, date, chatId: thread.id } },
+          ));
+          return; // interview over — don't speak/listen further
+        }
+        // Voice mode: flush the trailing partial sentence, then end the
+        // utterance (worker emits voice:speak_done → opens the mic). Sentences
+        // were already streamed to TTS in the chat:token handler.
+        if (voiceEnabledRef.current && content.trim() && !voiceSkipRef.current) {
+          voiceTargetRef.current = { jobId: job.id, chatId: thread.id };
+          setVoicePhase("speaking");
+          const tail = voiceSpeakBufferRef.current.trim();
+          voiceSpeakBufferRef.current = "";
+          if (tail) invoke("voice_speak_chunk", { text: tail }).catch(() => {});
+          invoke("voice_speak_flush").catch(() => {});
+        }
+        return;
+      }
+
+      // Chain: Application Prep → Company Research, using the tailored resume
+      // as candidate context.
+      if (thread.title !== "Application Prep") return;
       const tailored = pendingTailoredResumeRef.current ?? job.tailoredResume ?? "";
       pendingTailoredResumeRef.current = null;
       startCompanyResearchForRef.current?.(job, tailored);
@@ -2711,12 +3278,30 @@ const App = () => {
     });
   };
 
+  const onDeleteChat = (jobId: string, chatId: string) => {
+    setJobs((prev) => prev.map((j) =>
+      j.id !== jobId ? j : { ...j, chats: j.chats.filter((c) => c.id !== chatId) },
+    ));
+    // If the open thread was deleted, drop the selection so the empty state shows.
+    if (selectedChatId === chatId) setSelectedChatId(null);
+    // If it was mid-stream, stop tracking it (incoming tokens have nowhere to land).
+    if (streamingTargetRef.current?.chatId === chatId) {
+      streamingTargetRef.current = null;
+      setStreamingChatId(null);
+      setIsLoading(false);
+    }
+  };
+
   const onUpdateJob = (id: string, updater: (j: Job) => Job) => {
     setJobs((prev) => prev.map((j) => j.id === id ? updater(j) : j));
   };
 
-  const onSendMessage = (text: string) => {
+  const onSendMessage = (text: string, opts?: { hidden?: boolean }) => {
     if (!selectedJobId) return;
+    // New turn → reset streaming-TTS buffers for the upcoming AI reply.
+    voiceSpeakBufferRef.current = "";
+    voiceUtteranceTextRef.current = "";
+    voiceSkipRef.current = false;
     let chatId = selectedChatId;
 
     if (!chatId) {
@@ -2730,6 +3315,7 @@ const App = () => {
     // Append the user's message AND an empty AI bubble that the SSE stream
     // will fill in tokens-first. Keeping them in one setJobs call avoids a
     // wasted re-render between the two appends.
+    const userMsg: ChatMsg = { role: "user", content: text, ...(opts?.hidden ? { hidden: true } : {}) };
     const aiPlaceholder: ChatMsg = { role: "ai", content: "", streaming: true, logs: [] };
     setJobs((prev) => prev.map((j) =>
       j.id !== selectedJobId
@@ -2739,54 +3325,69 @@ const App = () => {
             chats: j.chats.map((c) =>
               c.id !== targetChatId
                 ? c
-                : {
-                    ...c,
-                    messages: [
-                      ...c.messages,
-                      { role: "user", content: text },
-                      aiPlaceholder,
-                    ],
-                  },
+                : { ...c, messages: [...c.messages, userMsg, aiPlaceholder] },
             ),
           },
     ));
 
-    // Build a tight context blob the backend can prepend to its system prompt.
+    // Context for the backend system prompt. `job` is the pre-append snapshot
+    // (history below must exclude the message we just added).
     const job = jobs.find((j) => j.id === selectedJobId);
-    // Most-recently-added resume is treated as the active one. Trimmed to
-    // 4k chars so the system prompt stays under reasonable token budgets.
-    const resume = resumes.length > 0 ? resumes[resumes.length - 1] : null;
+    const targetThread = job?.chats.find((c) => c.id === targetChatId);
+    const isInterview =
+      (targetThread?.mode ?? (targetThread?.title === "Mock Interview" ? "interviewer" : "coach"))
+        === "interviewer";
+
+    // Prefer the tailored resume the candidate actually submitted; fall back
+    // to the most recent master resume. Trimmed so the prompt stays bounded.
+    const masterResume = resumes.length > 0 ? resumes[resumes.length - 1] : null;
+    const resumeText = (job?.tailoredResume?.trim() || masterResume?.text?.trim() || "");
+    const resumeName = job?.tailoredResume?.trim() ? "Tailored Resume" : (masterResume?.name ?? "Resume");
 
     const jobContext = job
       ? [
           `Company: ${job.company}`,
           `Role: ${job.role}`,
           job.location ? `Location: ${job.location}` : "",
-          job.jobDescription
-            ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}`
-            : "",
-          resume
-            ? `\nCandidate Resume (${resume.name}):\n${resume.text.slice(0, 4000)}`
+          job.jobDescription ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}` : "",
+          resumeText ? `\nCandidate Resume (${resumeName}):\n${resumeText.slice(0, 4000)}` : "",
+          isInterview && targetThread?.interviewConfig
+            ? `\n${formatInterviewSetup(targetThread.interviewConfig)}`
             : "",
         ].filter(Boolean).join("\n")
       : "";
+
+    // RAG corpus. For interviewer mode, restrict to resume + company-research
+    // dossier — sibling chats (esp. prep where the user rehearsed answers)
+    // would leak into a "live" interview and break realism.
+    const ragDocs: { source: string; text: string }[] = [];
+    if (job) {
+      if (resumeText) ragDocs.push({ source: "resume", text: resumeText });
+      for (const c of job.chats) {
+        if (c.id === targetChatId) continue;
+        const isResearch = c.title === "Company Research";
+        if (isInterview && !isResearch) continue;
+        const body = c.messages
+          .filter((m) => !m.streaming && m.content.trim().length > 0)
+          .map((m) => `${m.role === "user" ? "Candidate" : "Assistant"}: ${m.content}`)
+          .join("\n\n");
+        if (!body) continue;
+        ragDocs.push({ source: isResearch ? "company_research" : `chat: ${c.title}`, text: body });
+      }
+    }
 
     streamingTargetRef.current = { jobId: selectedJobId, chatId: targetChatId };
     setStreamingChatId(targetChatId);
     setIsLoading(true);
 
-    // Build chronological history from completed (non-streaming, non-empty)
-    // turns BEFORE we appended the new user message above. The backend uses
-    // this to keep multi-turn context — critical for mock interviews.
-    const threadForHistory = job?.chats.find((c) => c.id === targetChatId);
-    const history: [string, string][] = threadForHistory
-      ? threadForHistory.messages
+    // Chronological history from completed turns BEFORE the message above.
+    const history: [string, string][] = targetThread
+      ? targetThread.messages
           .filter((m) => !m.streaming && m.content.trim().length > 0)
           .map((m) => [m.role === "user" ? "user" : "assistant", m.content] as [string, string])
       : [];
 
-    // Mock-interview threads switch the system prompt + model on the backend.
-    const mode = threadForHistory?.title === "Mock Interview" ? "interviewer" : "coach";
+    const mode = isInterview ? "interviewer" : "coach";
 
     invoke("start_chat_stream", {
       message: text,
@@ -2794,6 +3395,7 @@ const App = () => {
       history,
       mode,
       apiKey: credentials.geminiApiKey,
+      documents: ragDocs,
     }).catch((e) => {
       const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
@@ -2819,6 +3421,51 @@ const App = () => {
       setStreamingChatId(null);
       setIsLoading(false);
     });
+  };
+
+  // Fire the Mock Interview kickoff once the new thread is committed and
+  // selected. Reads fresh state on this render, so onSendMessage routes to the
+  // right thread and detects interviewer mode from its title.
+  useEffect(() => {
+    const id = pendingMockKickoffRef.current;
+    if (id && selectedChatId === id && jobs.some((j) => j.chats.some((c) => c.id === id))) {
+      pendingMockKickoffRef.current = null;
+      // Hidden: it's just the trigger for the interviewer's first question,
+      // not something the candidate should see in the transcript.
+      onSendMessage(
+        "Begin the interview now. Ask your first question.",
+        { hidden: true },
+      );
+    }
+  }, [selectedChatId, jobs]);
+
+  /// Regenerate the newest reply: drop the trailing AI message + the user
+  /// prompt that produced it, then re-send that prompt through onSendMessage
+  /// (which rebuilds history/RAG and re-streams). flushSync commits the
+  /// truncation first so onSendMessage reads the trimmed thread, not stale
+  /// state that would duplicate the turn.
+  const onRegenerate = () => {
+    if (!selectedJobId || !selectedChatId || isLoading) return;
+    const job = jobs.find((j) => j.id === selectedJobId);
+    const chat = job?.chats.find((c) => c.id === selectedChatId);
+    if (!chat) return;
+    let lastUserIdx = -1;
+    for (let k = chat.messages.length - 1; k >= 0; k--) {
+      if (chat.messages[k].role === "user") { lastUserIdx = k; break; }
+    }
+    if (lastUserIdx === -1) return;
+    const userText = chat.messages[lastUserIdx].content;
+    flushSync(() => {
+      setJobs((prev) => prev.map((j) =>
+        j.id !== selectedJobId ? j : {
+          ...j,
+          chats: j.chats.map((c) =>
+            c.id !== selectedChatId ? c : { ...c, messages: c.messages.slice(0, lastUserIdx) },
+          ),
+        },
+      ));
+    });
+    onSendMessage(userText);
   };
 
   /// Chain-step: kick off Company Research with the tailored resume as
@@ -2895,6 +3542,55 @@ const App = () => {
   // Publish to ref so the chat:done listener (registered once, outside this
   // closure) can invoke the latest version on completion of Prep.
   startCompanyResearchForRef.current = startCompanyResearchFor;
+  // Keep voice refs current for the one-shot voice listeners.
+  voiceEnabledRef.current = voiceEnabled;
+  sendMessageRef.current = onSendMessage;
+
+  /// Enable voice mode (spoken Q&A). Checks the sidecar voice status so we can
+  /// show GPU/CPU and bail with guidance if the stack isn't installed.
+  const enableVoice = () => {
+    setVoiceEnabled(true);
+    voiceEnabledRef.current = true;
+    invoke<{ available: boolean; device?: string; detail?: string }>("voice_status")
+      .then((s) => {
+        setVoiceStatus(s);
+        if (!s.available) {
+          setVoiceEnabled(false);
+          voiceEnabledRef.current = false;
+          setVoiceOverlayOpen(false);
+          alert(`Voice unavailable: ${s.detail ?? "voice stack not installed"}\n\nRun: backend\\setup.ps1 -Voice`);
+        }
+      })
+      .catch((e) => {
+        setVoiceStatus({ available: false, detail: String(e) });
+        setVoiceEnabled(false);
+        voiceEnabledRef.current = false;
+        setVoiceOverlayOpen(false);
+      });
+  };
+
+  /// Turn voice off entirely: stop playback + capture, close the overlay.
+  const disableVoice = () => {
+    setVoiceEnabled(false);
+    voiceEnabledRef.current = false;
+    setVoiceListening(false);
+    setVoiceOverlayOpen(false);
+    setVoicePhase("idle");
+    invoke("voice_interrupt").catch(() => {});
+    invoke("voice_stop_listening").catch(() => {});
+  };
+
+  /// Mic button: open the orb overlay, enabling voice if it isn't already.
+  const onOpenVoice = () => {
+    if (!voiceEnabled) enableVoice();
+    setVoiceOverlayOpen(true);
+  };
+
+  const onToggleBarge = () => {
+    const next = !bargeEnabled;
+    setBargeEnabled(next);
+    invoke("voice_set_barge", { enabled: next }).catch(() => {});
+  };
 
   /// Simulate a recruiter knockout phone-screen for the given job. Requires
   /// `tailoredResume` (from Application Prep). Creates a "Knockout Screen"
@@ -2978,11 +3674,11 @@ const App = () => {
       },
       avatar: form.company[0]?.toUpperCase() ?? "?",
       avatarColor: palette[jobs.length % palette.length],
+      // No auto General Prep chat — users create extra chats themselves via
+      // the step buttons or by typing. Application Prep still auto-runs: its
+      // SSE stream fills the placeholder AI message; on `done`, the listener
+      // chains into a Company Research thread automatically.
       chats: [
-        { id: `c-new-${id}`, title: "General Prep", preview: "Start your prep here...", messages: [] },
-        // Application Prep: tailored resume + cover letter + scorecard. The
-        // SSE stream fills the placeholder AI message; on `done`, the
-        // listener chains into a Company Research thread automatically.
         {
           id: prepThreadId,
           title: "Application Prep",
@@ -2996,8 +3692,14 @@ const App = () => {
     setSelectedChatId(prepThreadId);
     setShowNewJobModal(false);
 
-    // Ship every master resume to the backend — the LLM picks the best fit.
-    const masterResumes: [string, string][] = resumes.map((r) => [r.name, r.text]);
+    // Ship every master resume to the backend — the LLM aggregates evidence
+    // across all of them and picks one .docx-source resume as the styling base
+    // for the tailored output.
+    const masterResumes = resumes.map((r) => ({
+      name:     r.name,
+      text:     r.text,
+      docx_b64: r.docx_b64 ?? null,
+    }));
 
     streamingTargetRef.current = { jobId: id, chatId: prepThreadId };
     setStreamingChatId(prepThreadId);
@@ -3030,6 +3732,105 @@ const App = () => {
     });
   };
 
+  /// Step launcher: (re-)run Application Prep for a job. Creates a fresh
+  /// "Application Prep" thread and streams the tailored resume + cover letter
+  /// + scorecard. The `chat:done` listener chains into Company Research, same
+  /// as the auto-run on job create. flushSync so the SSE listener can resolve
+  /// the thread by id before the first event lands.
+  const startApplicationPrep = (job: Job) => {
+    if (resumes.length === 0) {
+      alert("Add at least one master resume in Settings → Resume before running Application Prep.");
+      return;
+    }
+    const prepThreadId = `c-prep-${job.id}-${Date.now()}`;
+    flushSync(() => {
+      setJobs((prev) => prev.map((j) =>
+        j.id !== job.id ? j : {
+          ...j,
+          chats: [...j.chats, {
+            id: prepThreadId,
+            title: "Application Prep",
+            messages: [{ role: "ai", content: "", streaming: true, logs: [] }],
+          }],
+        },
+      ));
+      setSelectedJobId(job.id);
+      setSelectedChatId(prepThreadId);
+      streamingTargetRef.current = { jobId: job.id, chatId: prepThreadId };
+      setStreamingChatId(prepThreadId);
+      setIsLoading(true);
+    });
+
+    const masterResumes = resumes.map((r) => ({
+      name:     r.name,
+      text:     r.text,
+      docx_b64: r.docx_b64 ?? null,
+    }));
+    invoke("start_application_tailor_stream", {
+      company:        job.company,
+      role:           job.role,
+      location:       job.location,
+      jobDescription: job.jobDescription ?? "",
+      masterResumes,
+      apiKey:         credentialsRef.current.geminiApiKey,
+    }).catch((e) => {
+      const errMsg = String(e);
+      setJobs((prev) => prev.map((j) =>
+        j.id !== job.id ? j : {
+          ...j,
+          chats: j.chats.map((c) => c.id !== prepThreadId ? c : {
+            ...c,
+            messages: c.messages.map((m, i) =>
+              i === c.messages.length - 1
+                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+                : m,
+            ),
+          }),
+        },
+      ));
+      streamingTargetRef.current = null;
+      setStreamingChatId(null);
+      setIsLoading(false);
+    });
+  };
+
+  /// Step launcher: start a Mock Interview. Creates an empty "Mock Interview"
+  /// thread and selects it; the interviewer persona kicks in on the first
+  /// message (sendMessage maps that title to `mode: "interviewer"`).
+  const startMockInterview = (job: Job, config: InterviewConfig) => {
+    const mockThreadId = `c-mock-${job.id}-${Date.now()}`;
+    setJobs((prev) => prev.map((j) =>
+      j.id !== job.id ? j : {
+        ...j,
+        chats: [...j.chats, {
+          id: mockThreadId, title: "Mock Interview", messages: [],
+          mode: "interviewer", interviewConfig: config,
+        }],
+      },
+    ));
+    setSelectedJobId(job.id);
+    setSelectedChatId(mockThreadId);
+    // Auto-ask the first question. Deferred to an effect (see above) so it
+    // runs after the new thread is committed + selected — otherwise
+    // onSendMessage would read stale state and mis-route / default to coach.
+    pendingMockKickoffRef.current = mockThreadId;
+  };
+
+  /// End the active mock interview and request structured feedback. Stops any
+  /// in-flight voice (the question being spoken / the mic) and suppresses
+  /// speaking the feedback block.
+  const onEndInterview = () => {
+    invoke("voice_interrupt").catch(() => {});       // stop current TTS + drain queue
+    invoke("voice_stop_listening").catch(() => {});  // close the mic if open
+    voiceListenActiveRef.current = false;
+    setVoiceListening(false);
+    onSendMessage("That's the end. Please end the interview now and give me my full structured feedback.");
+    // onSendMessage reset voiceSkipRef; re-set so the feedback isn't read aloud
+    // and the drained-queue speak_done doesn't re-open the mic.
+    voiceSkipRef.current = true;
+    setVoicePhase("idle");
+  };
+
   return (
     <div style={{
       display: "flex", height: "100vh", width: "100vw",
@@ -3041,6 +3842,7 @@ const App = () => {
         selectedChatId={selectedChatId}
         onSelectJob={onSelectJob}
         onSelectChat={setSelectedChatId}
+        onDeleteChat={onDeleteChat}
         onNewJob={() => setShowNewJobModal(true)}
         onSettings={() => setShowSettings(true)}
         onArchiveJob={onArchiveJob}
@@ -3066,6 +3868,8 @@ const App = () => {
               job={selectedJob}
               onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
               backend={backend}
+              onStartApplicationPrep={startApplicationPrep}
+              onStartMockInterview={(job) => setMockConfigForJob(job)}
             />
             {selectedJob ? (
               <>
@@ -3083,6 +3887,12 @@ const App = () => {
                   onSimulateKnockout={() => {
                     if (selectedJob) startKnockoutScreen(selectedJob);
                   }}
+                  onRegenerate={onRegenerate}
+                  onEndInterview={onEndInterview}
+                  voiceEnabled={voiceEnabled}
+                  voiceListening={voiceListening}
+                  voiceStatus={voiceStatus}
+                  onOpenVoice={onOpenVoice}
                 />
                 <InputComposer onSend={onSendMessage} disabled={isLoading} />
               </>
@@ -3094,6 +3904,25 @@ const App = () => {
       </div>
 
       {showNewJobModal && <NewJobModal onClose={() => setShowNewJobModal(false)} onSubmit={onCreateJob} />}
+      {mockConfigForJob && (
+        <MockInterviewModal
+          job={mockConfigForJob}
+          onClose={() => setMockConfigForJob(null)}
+          onStart={(config) => { const j = mockConfigForJob; setMockConfigForJob(null); startMockInterview(j, config); }}
+        />
+      )}
+      {voiceOverlayOpen && (
+        <VoiceOverlay
+          levelRef={voiceLevelRef}
+          phase={voicePhase}
+          subtitle={selectedJob ? `${selectedJob.role} · ${selectedJob.company}` : undefined}
+          bargeEnabled={bargeEnabled}
+          onToggleBarge={onToggleBarge}
+          onMinimize={() => setVoiceOverlayOpen(false)}
+          onStop={disableVoice}
+          onEnd={() => { onEndInterview(); setVoiceOverlayOpen(false); }}
+        />
+      )}
       {showSettings && (
         <SettingsModal
           credentials={credentials}

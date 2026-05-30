@@ -10,6 +10,7 @@
 //! system Python, so the user's pinned dependency set is what runs.
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,17 +32,56 @@ pub struct PythonSidecar {
 
 impl PythonSidecar {
     pub fn start() -> Result<Self, String> {
+        // Always prepare the log file FIRST so diagnostic info survives even
+        // when discovery/spawn fails. Truncate on every boot — old log noise
+        // makes the current failure harder to spot.
+        let log_path = log_dir().join("sidecar.log");
+        let _ = fs::create_dir_all(log_dir());
+        let mut diag = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&log_path)
+            .ok();
+        let mut log = |msg: &str| {
+            if let Some(f) = diag.as_mut() {
+                let _ = writeln!(f, "[sidecar] {msg}");
+                let _ = f.flush();
+            }
+        };
+
+        log(&format!(
+            "cwd={:?}",
+            std::env::current_dir().ok()
+        ));
+        log(&format!(
+            "exe={:?}",
+            std::env::current_exe().ok()
+        ));
+
         let backend_dir = find_backend_dir().ok_or_else(|| {
-            "Could not locate the backend directory. \
-             Set INTERPREP_BACKEND_DIR or place a `backend/` folder next to the executable."
-                .to_string()
+            let msg = "Could not locate the backend directory. \
+                Set INTERPREP_BACKEND_DIR or place a `backend/` folder next to the executable.";
+            log(msg);
+            msg.to_string()
         })?;
+        log(&format!("backend_dir={}", backend_dir.display()));
 
         let port = find_free_port().unwrap_or(8765);
-        let (python_exe, python_prefix_args) = find_python()?;
+        let (python_exe, python_prefix_args) = find_python().map_err(|e| {
+            log(&format!("find_python failed: {e}"));
+            e
+        })?;
+        log(&format!(
+            "python_exe={python_exe} prefix_args={python_prefix_args:?} port={port}"
+        ));
 
         let mut args: Vec<String> = python_prefix_args.clone();
         args.extend([
+            // Unbuffered stdio so uvicorn/import errors land in sidecar.log in
+            // real time. Without this, a crash during the ~18s cold import
+            // walk surfaces as a silent timeout.
+            "-u".into(),
             "-m".into(),
             "uvicorn".into(),
             "main:app".into(),
@@ -54,41 +94,88 @@ impl PythonSidecar {
             "--log-level".into(),
             "info".into(),
         ]);
+        log(&format!("spawn args: {args:?}"));
 
-        // Pipe stdout + stderr to a log file under %LOCALAPPDATA%\InterPrep so
-        // boot failures are diagnosable. Falls back to /dev/null on failure.
-        let log_path = log_dir().join("sidecar.log");
-        let _ = fs::create_dir_all(log_dir());
-        let stdout = fs::File::create(&log_path)
-            .map(Stdio::from)
-            .unwrap_or_else(|_| Stdio::null());
-        let stderr = fs::OpenOptions::new()
+        // Drop the diagnostic handle BEFORE re-opening for stdio so Windows
+        // doesn't block uvicorn from writing (default File handle sharing
+        // excludes write).
+        drop(diag.take());
+
+        // Pipe stdout + stderr to the same log file. Open once and clone so
+        // both streams share a single handle with write sharing implicit.
+        let stdio_handle = match fs::OpenOptions::new()
+            .write(true)
             .append(true)
-            .create(true)
             .open(&log_path)
-            .map(Stdio::from)
-            .unwrap_or_else(|_| Stdio::null());
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(format!(
+                    "could not open sidecar.log for writing ({}): {e}",
+                    log_path.display()
+                ));
+            }
+        };
+        let stderr_handle = match stdio_handle.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(format!("could not clone stdio handle: {e}"));
+            }
+        };
 
         let child = Command::new(&python_exe)
             .args(&args)
             .current_dir(&backend_dir)
-            .stdout(stdout)
-            .stderr(stderr)
+            .stdout(Stdio::from(stdio_handle))
+            .stderr(Stdio::from(stderr_handle))
             .spawn()
-            .map_err(|e| format!("failed to spawn Python ({python_exe}): {e}"))?;
+            .map_err(|e| {
+                let msg = format!("failed to spawn Python ({python_exe}): {e}");
+                // Best-effort append the spawn error to the log too.
+                if let Ok(mut f) = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(f, "[sidecar] {msg}");
+                }
+                msg
+            })?;
 
-        let sidecar = Self {
+        let mut sidecar = Self {
             process: Some(child),
             port,
         };
-        sidecar.wait_ready()?;
+        sidecar.wait_ready().map_err(|e| {
+            if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&log_path) {
+                let _ = writeln!(f, "[sidecar] wait_ready failed: {e}");
+            }
+            e
+        })?;
         Ok(sidecar)
     }
 
-    fn wait_ready(&self) -> Result<(), String> {
+    fn wait_ready(&mut self) -> Result<(), String> {
+        // Cold-start budget. Warm boot is ~9s, but a COLD first import (after a
+        // reboot or a fresh dependency install) can hit ~45s — and once the
+        // optional voice stack (torch/CUDA, ~GB of DLLs) is installed, Windows
+        // Defender scanning those DLLs on first load can push it well past a
+        // minute. 90s occasionally lost that race ("backend failed"); 180s
+        // gives ample slack. Warm boots still return as soon as /health answers,
+        // so this only affects the genuinely-slow first launch.
+        const READY_TIMEOUT_SECS: u64 = 180;
         let url = format!("http://127.0.0.1:{}/health", self.port);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(READY_TIMEOUT_SECS);
         while Instant::now() < deadline {
+            // Fail fast if the process crashed during import (e.g. a bad
+            // dependency) instead of waiting out the whole timeout. The real
+            // traceback is in sidecar.log.
+            if let Some(child) = self.process.as_mut() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(format!(
+                        "Python backend exited during startup ({status}). See sidecar.log for the traceback."
+                    ));
+                }
+            }
             let ok = reqwest::blocking::get(&url)
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
@@ -97,7 +184,9 @@ impl PythonSidecar {
             }
             std::thread::sleep(Duration::from_millis(300));
         }
-        Err("Python backend did not become ready within 30 seconds".into())
+        Err(format!(
+            "Python backend did not become ready within {READY_TIMEOUT_SECS} seconds"
+        ))
     }
 
     pub fn base_url(&self) -> String {

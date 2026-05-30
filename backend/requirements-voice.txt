@@ -1,0 +1,8 @@
+# Optional voice stack for the live mock interview.
+# Install via:  .\setup.ps1 -Voice   (handles the right torch build for your GPU)
+#
+# torch is intentionally NOT pinned here — setup.ps1 installs it first, picking
+# the CUDA build when an NVIDIA GPU is detected, else the CPU build.
+numpy>=1.26
+voxcpm>=0.1.0          # OpenBMB VoxCPM-0.5B neural TTS
+faster-whisper>=1.0.0  # local STT, auto GPU/CPU

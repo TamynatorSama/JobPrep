@@ -17,8 +17,30 @@
 
 use std::io::{BufRead, BufReader};
 
+use serde::Deserialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
+
+/// Payload shape the Tauri command receives for each master resume before
+/// forwarding it to the Python backend. Mirrors the `MasterResume` pydantic
+/// model. `docx_b64` is the raw .docx bytes when available, used by the
+/// backend as the styling base for in-place section editing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MasterResumePayload {
+    pub name: String,
+    pub text: String,
+    #[serde(default)]
+    pub docx_b64: Option<String>,
+}
+
+/// One document from a job's corpus, forwarded to the backend for RAG
+/// retrieval. Mirrors the `RagDoc` pydantic model. `source` is a short label
+/// ("resume", "company_research", "chat: <title>") shown to the LLM.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RagDocPayload {
+    pub source: String,
+    pub text: String,
+}
 
 const EV_TOKEN:           &str = "chat:token";
 const EV_LOG:             &str = "chat:log";
@@ -30,6 +52,7 @@ const EV_TAILORED_RESUME: &str = "chat:tailored_resume"; // plain-text tailored 
 
 /// Sends a chat message and forwards the resulting SSE stream to the
 /// frontend. Runs on its own thread so the Tauri command returns instantly.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_chat(
     app: AppHandle,
     base_url: String,
@@ -38,11 +61,16 @@ pub fn stream_chat(
     history: Vec<(String, String)>,
     mode: String,
     api_key: String,
+    documents: Vec<RagDocPayload>,
 ) {
     let url = format!("{base_url}/chat/stream");
     let history_json: Vec<_> = history
         .into_iter()
         .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+        .collect();
+    let documents_json: Vec<_> = documents
+        .into_iter()
+        .map(|d| serde_json::json!({ "source": d.source, "text": d.text }))
         .collect();
     let body = serde_json::json!({
         "message":     message,
@@ -50,6 +78,7 @@ pub fn stream_chat(
         "history":     history_json,
         "mode":        mode,
         "api_key":     api_key,
+        "documents":   documents_json,
     });
     spawn_stream(app, url, body);
 }
@@ -118,13 +147,19 @@ pub fn stream_application_tailor(
     role: String,
     location: String,
     job_description: String,
-    master_resumes: Vec<(String, String)>,
+    master_resumes: Vec<MasterResumePayload>,
     api_key: String,
 ) {
     let url = format!("{base_url}/application/tailor-resume");
     let resumes_json: Vec<_> = master_resumes
         .into_iter()
-        .map(|(name, text)| serde_json::json!({ "name": name, "text": text }))
+        .map(|r| {
+            serde_json::json!({
+                "name":     r.name,
+                "text":     r.text,
+                "docx_b64": r.docx_b64,
+            })
+        })
         .collect();
     let body = serde_json::json!({
         "company":         company,
@@ -158,6 +193,56 @@ pub fn stream_knockout_screen(
         "api_key":         api_key,
     });
     spawn_stream(app, url, body);
+}
+
+// ─── Voice (blocking request/response, not SSE) ──────────────────────────────
+
+/// GET /voice/status — capability + device (cuda/cpu) report.
+pub fn voice_status(base_url: &str) -> Result<Value, String> {
+    let client = reqwest::blocking::Client::new();
+    client
+        .get(format!("{base_url}/voice/status"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .and_then(|r| r.json::<Value>())
+        .map_err(|e| e.to_string())
+}
+
+/// POST /voice/tts — synthesize `text`, returning decoded WAV bytes.
+pub fn voice_tts(base_url: &str, text: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let client = reqwest::blocking::Client::new();
+    let resp: Value = client
+        .post(format!("{base_url}/voice/tts"))
+        .json(&serde_json::json!({ "text": text }))
+        // First call also loads the model — allow generous time.
+        .timeout(std::time::Duration::from_secs(180))
+        .send()
+        .and_then(|r| r.json::<Value>())
+        .map_err(|e| e.to_string())?;
+    if let Some(err) = resp["error"].as_str() {
+        return Err(err.to_string());
+    }
+    let b64 = resp["audio_b64"].as_str().ok_or("no audio in TTS response")?;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("base64 decode failed: {e}"))
+}
+
+/// POST /voice/stt — transcribe base64-encoded WAV, returning the text.
+pub fn voice_stt(base_url: &str, wav_b64: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::new();
+    let resp: Value = client
+        .post(format!("{base_url}/voice/stt"))
+        .json(&serde_json::json!({ "audio_b64": wav_b64 }))
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .and_then(|r| r.json::<Value>())
+        .map_err(|e| e.to_string())?;
+    if let Some(err) = resp["error"].as_str() {
+        return Err(err.to_string());
+    }
+    Ok(resp["text"].as_str().unwrap_or("").to_string())
 }
 
 fn spawn_stream(app: AppHandle, url: String, body: Value) {
