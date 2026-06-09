@@ -86,6 +86,18 @@ pub struct Job {
     pub job_description: Option<String>,
     #[serde(default)]
     pub archived: bool,
+    /// Display metadata captured by the browser extension (JSON-LD / AI parse).
+    /// All optional — a job created in-app simply leaves them empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub employment_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub work_mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub salary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub posted: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<String>,
     /// Plain-text tailored resume from the Application-Prep step.
     /// Fed into Company Research as candidate background.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -23,6 +23,21 @@ fn log_dir() -> PathBuf {
     base.join("InterPrep")
 }
 
+/// Write `%LOCALAPPDATA%\InterPrep\bridge.json` = `{port, token}` so the
+/// browser extension can discover the (dynamic) port and the shared secret.
+/// The Gemini key is never written here. Best-effort: a failure just means the
+/// user pairs manually from the values shown in the app.
+fn write_bridge_file(port: u16, token: &str) {
+    let dir = log_dir();
+    let _ = fs::create_dir_all(&dir);
+    let body = format!("{{\n  \"port\": {port},\n  \"token\": \"{token}\"\n}}\n");
+    let path = dir.join("bridge.json");
+    let tmp = dir.join("bridge.json.tmp");
+    if fs::write(&tmp, body.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
 pub struct PythonSidecar {
     /// Held only so the child process is killed when `Drop` runs.
     /// Stored in `Option<>` because we use `.take()` on shutdown.
@@ -31,7 +46,11 @@ pub struct PythonSidecar {
 }
 
 impl PythonSidecar {
-    pub fn start() -> Result<Self, String> {
+    /// `token` is the bridge shared secret; `gemini_key` seeds the in-memory
+    /// Gemini key so the extension's autofill requests don't have to carry it.
+    /// Both are passed to Python via env vars (never over HTTP / never to disk
+    /// for the key).
+    pub fn start(token: &str, gemini_key: &str) -> Result<Self, String> {
         // Always prepare the log file FIRST so diagnostic info survives even
         // when discovery/spawn fails. Truncate on every boot — old log noise
         // makes the current failure harder to spot.
@@ -126,6 +145,11 @@ impl PythonSidecar {
         let child = Command::new(&python_exe)
             .args(&args)
             .current_dir(&backend_dir)
+            // Bridge secret + Gemini key handed to Python via env (the key is
+            // never written to disk; the token is also published to bridge.json
+            // below so the extension can be paired).
+            .env("INTERPREP_BRIDGE_TOKEN", token)
+            .env("INTERPREP_GEMINI_KEY", gemini_key)
             .stdout(Stdio::from(stdio_handle))
             .stderr(Stdio::from(stderr_handle))
             .spawn()
@@ -151,6 +175,9 @@ impl PythonSidecar {
             }
             e
         })?;
+        // Publish {port, token} so the browser extension can be paired. The
+        // Gemini key is deliberately NOT written here — secrets stay in memory.
+        write_bridge_file(port, token);
         Ok(sidecar)
     }
 
@@ -192,6 +219,10 @@ impl PythonSidecar {
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 impl PythonSidecar {
@@ -220,6 +251,9 @@ impl PythonSidecar {
             let _ = child.wait();
             let _ = pid;
         }
+        // The bridge is only valid while the sidecar runs — remove the pairing
+        // file so a stale port/token can't be used after shutdown.
+        let _ = fs::remove_file(log_dir().join("bridge.json"));
     }
 }
 

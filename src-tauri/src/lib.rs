@@ -32,6 +32,25 @@ struct SidecarInner {
     sidecar:  Option<PythonSidecar>,
     base_url: Option<String>,
     last_err: Option<String>,
+    /// Bridge shared secret + port, mirrored from the sidecar so commands can
+    /// hand a pairing code to the frontend without re-reading the process.
+    token:    Option<String>,
+    port:     Option<u16>,
+}
+
+/// Generate a 256-bit hex token from the OS CSPRNG. `getrandom` is backed by
+/// `BCryptGenRandom` on Windows, so the 32 bytes are full-entropy and mutually
+/// independent. (Chaining `RandomState::new().finish()` does NOT give 256 bits:
+/// std advances a thread's hasher seed by 1 between calls, so successive outputs
+/// are correlated and the real entropy is only the single ~128-bit seed.)
+fn gen_token() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 #[derive(Default)]
@@ -41,7 +60,9 @@ struct RecorderState {
 
 /// Queue item for the serialized TTS playback worker.
 enum TtsMsg {
-    Speak(String),
+    /// One chunk (typically a sentence) plus the panelist voice to speak it in
+    /// (`speaker` is used only by the "vibe-rt" engine; Piper ignores it).
+    Speak { text: String, speaker: String },
     Flush, // end of one utterance → emit `voice:speak_done`
 }
 
@@ -57,6 +78,9 @@ struct VoiceState {
     /// Barge-in (interrupt the AI by talking) only works with headphones —
     /// on speakers the mic hears the AI's own voice. Off by default.
     barge_enabled: Arc<AtomicBool>,
+    /// TTS engine for the next utterance: "vibe-rt" = VibeVoice (humanlike),
+    /// anything else (incl. empty) = Piper (fast default).
+    engine: Arc<Mutex<String>>,
     listen_stop: Mutex<Option<Arc<AtomicBool>>>,
 }
 
@@ -110,6 +134,86 @@ fn backend_status(state: State<SidecarState>) -> serde_json::Value {
     }
 }
 
+// ─── Extension bridge ──────────────────────────────────────────────────────
+
+/// Pairing info for the browser extension: the bridge port + shared secret, and
+/// a single copy-paste `pairingCode` (base64 of "port:token"). Returns
+/// `ready: false` until the sidecar is up. The token is a localhost-only secret
+/// — surfacing it to our own frontend is fine; it never leaves the machine.
+#[tauri::command]
+fn bridge_info(state: State<SidecarState>) -> serde_json::Value {
+    use base64::Engine;
+    let inner = state.inner.lock().unwrap();
+    match (&inner.port, &inner.token) {
+        (Some(port), Some(token)) => {
+            let code = base64::engine::general_purpose::STANDARD
+                .encode(format!("{port}:{token}"));
+            serde_json::json!({
+                "ready": true,
+                "port": port,
+                "token": token,
+                "pairingCode": code,
+            })
+        }
+        _ => serde_json::json!({ "ready": false }),
+    }
+}
+
+/// Push the currently-stored Gemini key to the running sidecar. Call after the
+/// user saves credentials so the extension keeps working without an app restart.
+#[tauri::command]
+fn reseed_backend_key(state: State<SidecarState>) -> Result<(), String> {
+    let (url, token) = {
+        let inner = state.inner.lock().unwrap();
+        match (inner.base_url.clone(), inner.token.clone()) {
+            (Some(u), Some(t)) => (u, t),
+            _ => return Err("Backend is not ready yet".to_string()),
+        }
+    };
+    let key = Credentials::load().gemini_api_key;
+    backend_client::seed_config(&url, &token, &key)
+}
+
+/// Poll the extension's job-capture inbox. Returns the pending captures (JDs the
+/// user grabbed from a browser); the frontend turns each into a job + research
+/// run, then calls `ack_job_inbox`.
+#[tauri::command]
+fn poll_job_inbox(state: State<SidecarState>) -> Result<serde_json::Value, String> {
+    let (url, token) = bridge_url_token(&state)?;
+    backend_client::inbox_pending(&url, &token)
+}
+
+/// Acknowledge consumed inbox captures so they aren't processed again.
+#[tauri::command]
+fn ack_job_inbox(state: State<SidecarState>, ids: Vec<String>) -> Result<(), String> {
+    let (url, token) = bridge_url_token(&state)?;
+    backend_client::inbox_ack(&url, &token, ids)
+}
+
+/// Poll the extension's timeline-event queue. Returns "mark Applied + note"
+/// events the extension logged after an autofill; the frontend applies each to
+/// the job's stage timeline, then calls `ack_timeline_inbox`.
+#[tauri::command]
+fn poll_timeline_inbox(state: State<SidecarState>) -> Result<serde_json::Value, String> {
+    let (url, token) = bridge_url_token(&state)?;
+    backend_client::timeline_pending(&url, &token)
+}
+
+/// Acknowledge applied timeline events so they aren't applied again.
+#[tauri::command]
+fn ack_timeline_inbox(state: State<SidecarState>, ids: Vec<String>) -> Result<(), String> {
+    let (url, token) = bridge_url_token(&state)?;
+    backend_client::timeline_ack(&url, &token, ids)
+}
+
+fn bridge_url_token(state: &State<SidecarState>) -> Result<(String, String), String> {
+    let inner = state.inner.lock().unwrap();
+    match (inner.base_url.clone(), inner.token.clone()) {
+        (Some(u), Some(t)) => Ok((u, t)),
+        _ => Err("Backend is not ready yet".to_string()),
+    }
+}
+
 // ─── Streams (chat / research / company research) ─────────────────────────
 
 fn require_url(state: &State<SidecarState>) -> Result<String, String> {
@@ -133,9 +237,10 @@ fn start_chat_stream(
     mode: String,
     api_key: String,
     documents: Vec<backend_client::RagDocPayload>,
+    stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
-    backend_client::stream_chat(app, url, message, job_context, history, mode, api_key, documents);
+    backend_client::stream_chat(app, url, message, job_context, history, mode, api_key, documents, stream_id);
     Ok(())
 }
 
@@ -147,9 +252,10 @@ fn start_research_stream(
     role: String,
     job_description: String,
     api_key: String,
+    stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
-    backend_client::stream_research(app, url, company, role, job_description, api_key);
+    backend_client::stream_research(app, url, company, role, job_description, api_key, stream_id);
     Ok(())
 }
 
@@ -168,6 +274,7 @@ fn start_company_research_stream(
     glassdoor_password: String,
     indeed_email: String,
     indeed_password: String,
+    stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
     backend_client::stream_company_research(
@@ -183,6 +290,7 @@ fn start_company_research_stream(
         glassdoor_password,
         indeed_email,
         indeed_password,
+        stream_id,
     );
     Ok(())
 }
@@ -198,6 +306,7 @@ fn start_application_tailor_stream(
     job_description: String,
     master_resumes: Vec<backend_client::MasterResumePayload>,
     api_key: String,
+    stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
     backend_client::stream_application_tailor(
@@ -209,6 +318,7 @@ fn start_application_tailor_stream(
         job_description,
         master_resumes,
         api_key,
+        stream_id,
     );
     Ok(())
 }
@@ -223,6 +333,7 @@ fn start_knockout_screen_stream(
     job_description: String,
     tailored_resume: String,
     api_key: String,
+    stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
     backend_client::stream_knockout_screen(
@@ -234,6 +345,7 @@ fn start_knockout_screen_stream(
         job_description,
         tailored_resume,
         api_key,
+        stream_id,
     );
     Ok(())
 }
@@ -380,9 +492,23 @@ fn voice_status(state: State<SidecarState>) -> Result<serde_json::Value, String>
     backend_client::voice_status(&url)
 }
 
-/// Serialized TTS playback worker. Pulls chunks off the queue, synthesizes +
-/// plays each in order (so streamed sentences never overlap), runs a barge-in
-/// monitor during playback, and emits `voice:speak_done` on each `Flush`.
+/// Item handed from the synth stage to the playback stage.
+enum PlayItem {
+    /// A streaming sentence: the player pulls decoded mono-f32 PCM blocks off
+    /// `pcm` and plays them as they arrive (synth runs slower than real-time,
+    /// so streaming is what gets audio out fast).
+    Stream {
+        sample_rate: u32,
+        pcm: std::sync::mpsc::Receiver<Vec<f32>>,
+    },
+    Flush, // end of one utterance → emit `voice:speak_done`
+}
+
+/// TTS synthesis stage. Pulls chunks off the queue, synthesizes each WAV, and
+/// hands it to the playback stage through a capacity-1 channel. The bound means
+/// we synthesize at most ONE chunk ahead of playback — so sentence N+1 is being
+/// generated while sentence N plays (hiding synth latency behind audio), without
+/// racing ahead and wasting work that a barge-in would throw away.
 fn voice_worker(
     app: AppHandle,
     url: String,
@@ -390,24 +516,107 @@ fn voice_worker(
     interrupt_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     abort: Arc<AtomicBool>,
     barge_enabled: Arc<AtomicBool>,
+    engine: Arc<Mutex<String>>,
 ) {
+    let (ptx, prx) = std::sync::mpsc::sync_channel::<PlayItem>(1);
+    {
+        let app = app.clone();
+        let slot = Arc::clone(&interrupt_slot);
+        let abort = Arc::clone(&abort);
+        let barge = Arc::clone(&barge_enabled);
+        std::thread::spawn(move || play_worker(app, prx, slot, abort, barge));
+    }
+
     while let Ok(msg) = rx.recv() {
         match msg {
             TtsMsg::Flush => {
-                // `abort` is set if a barge-in/stop cut this utterance short.
-                let interrupted = abort.swap(false, Ordering::SeqCst);
-                let _ = app.emit("voice:speak_done", serde_json::json!({ "interrupted": interrupted }));
+                if ptx.send(PlayItem::Flush).is_err() {
+                    break; // playback stage gone
+                }
             }
-            TtsMsg::Speak(text) => {
+            TtsMsg::Speak { text, speaker } => {
                 if abort.load(Ordering::SeqCst) {
                     continue; // draining the rest of an aborted utterance
                 }
-                let wav = match backend_client::voice_tts(&url, &text) {
-                    Ok(w) => w,
+                // Read the engine fresh each utterance so a Settings toggle
+                // mid-interview applies to the next reply. `speaker` rides with
+                // the chunk so a panel can switch voices turn to turn.
+                let engine = engine.lock().unwrap().clone();
+                let (sample_rate, mut resp) = match backend_client::voice_tts_stream(&url, &text, &engine, &speaker) {
+                    Ok(v) => v,
                     Err(e) => { let _ = app.emit("voice:error", e); continue; }
                 };
                 if abort.load(Ordering::SeqCst) {
                     continue;
+                }
+                // Hand the player a receiver to start draining immediately, then
+                // pump decoded PCM into it as the HTTP body streams in. The bound
+                // back-pressures synth if the player ever falls behind.
+                let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
+                if ptx.send(PlayItem::Stream { sample_rate, pcm: pcm_rx }).is_err() {
+                    break;
+                }
+                use std::io::Read;
+                let mut buf = [0u8; 8192];
+                let mut leftover: Vec<u8> = Vec::new(); // holds a trailing odd byte
+                loop {
+                    if abort.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let n = match resp.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    leftover.extend_from_slice(&buf[..n]);
+                    let pairs = leftover.len() / 2;
+                    if pairs == 0 {
+                        continue;
+                    }
+                    let mut block = Vec::with_capacity(pairs);
+                    for i in 0..pairs {
+                        let s = i16::from_le_bytes([leftover[2 * i], leftover[2 * i + 1]]);
+                        block.push(s as f32 / 32768.0);
+                    }
+                    // Carry a leftover odd byte into the next read.
+                    if leftover.len() % 2 == 1 {
+                        let last = leftover[leftover.len() - 1];
+                        leftover.clear();
+                        leftover.push(last);
+                    } else {
+                        leftover.clear();
+                    }
+                    // Player dropped the receiver (interrupt/stop) → stop reading.
+                    if pcm_tx.send(block).is_err() {
+                        break;
+                    }
+                }
+                // Dropping pcm_tx signals end-of-sentence to the player.
+            }
+        }
+    }
+}
+
+/// TTS playback stage. Plays each streamed sentence in order (so they never
+/// overlap), runs a barge-in monitor during playback, and emits
+/// `voice:speak_done` on each `Flush`.
+fn play_worker(
+    app: AppHandle,
+    rx: std::sync::mpsc::Receiver<PlayItem>,
+    interrupt_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    abort: Arc<AtomicBool>,
+    barge_enabled: Arc<AtomicBool>,
+) {
+    while let Ok(item) = rx.recv() {
+        match item {
+            PlayItem::Flush => {
+                // `abort` is set if a barge-in/stop cut this utterance short.
+                let interrupted = abort.swap(false, Ordering::SeqCst);
+                let _ = app.emit("voice:speak_done", serde_json::json!({ "interrupted": interrupted }));
+            }
+            PlayItem::Stream { sample_rate, pcm } => {
+                if abort.load(Ordering::SeqCst) {
+                    continue; // draining the rest of an aborted utterance (drops pcm)
                 }
 
                 let interrupt = Arc::new(AtomicBool::new(false));
@@ -441,7 +650,7 @@ fn voice_worker(
                         let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "speaking" }));
                     }
                 };
-                let played = voice_audio::play_wav(&wav, &interrupt, &mut on_level).unwrap_or(false);
+                let played = voice_audio::play_pcm_stream(pcm, sample_rate, &interrupt, &mut on_level).unwrap_or(false);
                 let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "speaking" }));
                 monitor_stop.store(true, Ordering::SeqCst);
                 *interrupt_slot.lock().unwrap() = None;
@@ -468,7 +677,8 @@ fn ensure_voice_worker(
     let slot = Arc::clone(&voice.interrupt);
     let abort = Arc::clone(&voice.abort);
     let barge = Arc::clone(&voice.barge_enabled);
-    std::thread::spawn(move || voice_worker(app2, url, rx, slot, abort, barge));
+    let engine = Arc::clone(&voice.engine);
+    std::thread::spawn(move || voice_worker(app2, url, rx, slot, abort, barge, engine));
     *guard = Some(tx.clone());
     tx
 }
@@ -481,12 +691,13 @@ fn voice_speak_chunk(
     sidecar: State<SidecarState>,
     voice: State<VoiceState>,
     text: String,
+    speaker: Option<String>,
 ) -> Result<(), String> {
     let url = require_url(&sidecar)?;
     // A fresh utterance is starting — clear any stale abort from a prior turn.
     voice.abort.store(false, Ordering::SeqCst);
     let tx = ensure_voice_worker(&app, url, &voice);
-    let _ = tx.send(TtsMsg::Speak(text));
+    let _ = tx.send(TtsMsg::Speak { text, speaker: speaker.unwrap_or_default() });
     Ok(())
 }
 
@@ -509,6 +720,28 @@ fn voice_speak_flush(
 #[tauri::command]
 fn voice_set_barge(voice: State<VoiceState>, enabled: bool) {
     voice.barge_enabled.store(enabled, Ordering::SeqCst);
+}
+
+/// Select the TTS engine for the interview voice: "vibe-rt" = VibeVoice
+/// (humanlike), anything else = Piper (fast default). Takes effect on the next
+/// spoken utterance.
+#[tauri::command]
+fn voice_set_engine(voice: State<VoiceState>, engine: String) {
+    *voice.engine.lock().unwrap() = engine;
+}
+
+/// Warm up an engine's cold start off the critical path. vibe-rt's first load +
+/// first synth take ~2.5 min on a laptop GPU; calling this when the user enables
+/// the humanlike voice moves that cost off the first interview question. Fire-
+/// and-forget: spawns a thread so the UI isn't blocked, and ignores errors (the
+/// sidecar may not be up yet / the engine may not be installed).
+#[tauri::command]
+fn voice_warm(sidecar: State<SidecarState>, engine: String, speaker: Option<String>) {
+    let Ok(url) = require_url(&sidecar) else { return };
+    let speaker = speaker.unwrap_or_default();
+    std::thread::spawn(move || {
+        let _ = backend_client::voice_warm(&url, &engine, &speaker);
+    });
 }
 
 /// Abort current playback + drain the rest of the queued utterance.
@@ -598,12 +831,20 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let state = handle.state::<SidecarState>();
-                match PythonSidecar::start() {
+                // Mint the bridge token and seed the sidecar with the stored
+                // Gemini key so the extension's autofill works without the app
+                // forwarding the key on every request.
+                let token = gen_token();
+                let gemini_key = Credentials::load().gemini_api_key;
+                match PythonSidecar::start(&token, &gemini_key) {
                     Ok(sidecar) => {
                         let url = sidecar.base_url();
+                        let port = sidecar.port();
                         {
                             let mut inner = state.inner.lock().unwrap();
                             inner.base_url = Some(url.clone());
+                            inner.token    = Some(token);
+                            inner.port     = Some(port);
                             inner.sidecar  = Some(sidecar);
                             inner.last_err = None;
                         }
@@ -628,6 +869,12 @@ pub fn run() {
             list_resumes,
             save_resumes,
             backend_status,
+            bridge_info,
+            reseed_backend_key,
+            poll_job_inbox,
+            ack_job_inbox,
+            poll_timeline_inbox,
+            ack_timeline_inbox,
             start_chat_stream,
             start_research_stream,
             start_company_research_stream,
@@ -642,6 +889,8 @@ pub fn run() {
             voice_speak_chunk,
             voice_speak_flush,
             voice_set_barge,
+            voice_set_engine,
+            voice_warm,
             voice_interrupt,
             voice_listen,
             voice_stop_listening,

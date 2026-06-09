@@ -86,3 +86,74 @@ class KnockoutRequest(BaseModel):
     job_description: str
     tailored_resume: str
     api_key: str
+
+
+# ── Browser-extension bridge ────────────────────────────────────────────────
+
+class SeedConfigRequest(BaseModel):
+    """Refresh the in-memory Gemini key. Token-guarded; called by the Rust
+    shell on startup and whenever the user edits the key in Settings."""
+    api_key: str
+
+
+class FieldSpec(BaseModel):
+    """One form field scraped from an application page by the extension."""
+    key: str                              # stable id the extension maps answers back to
+    label: str                            # human label / question shown next to the field
+    type: str = "text"                    # text | textarea | select | radio | checkbox | email | tel | ...
+    options: List[str] = []               # for select / radio: the choosable option labels
+
+
+class AnswerFieldsRequest(BaseModel):
+    """Ask the backend to answer scraped application-form fields from the
+    candidate's resume + the job context."""
+    job_id: Optional[str] = ""            # picks JD/company/role from the store
+    resume_ids: List[int] = []            # which master resumes; empty = all
+    fields: List[FieldSpec]
+    # Optional direct overrides if the extension already has the context.
+    company: Optional[str] = ""
+    role: Optional[str] = ""
+    job_description: Optional[str] = ""
+
+
+class RememberRequest(BaseModel):
+    """Persist a user-supplied answer into the reusable answer bank."""
+    label: str
+    value: str
+
+
+class JobCaptureRequest(BaseModel):
+    """A JD captured by the extension, queued for the app to turn into a job +
+    company-research run."""
+    company: str = ""
+    role: str = ""
+    location: str = ""
+    url: str = ""
+    job_description: str = ""
+    # Display metadata parsed at capture time (JSON-LD or AI). Optional — the app
+    # creates the job fine without them; they enrich the record when present.
+    employment_type: str = ""
+    work_mode: str = ""
+    salary: str = ""
+    posted: str = ""
+    requirements: List[str] = []
+
+
+class InboxAckRequest(BaseModel):
+    """Ids the app has consumed from the capture inbox."""
+    ids: List[str] = []
+
+
+class TimelineEventRequest(BaseModel):
+    """Queued by the extension after an autofill finishes — the app applies it to
+    the job's stage timeline (e.g. mark Applied + a note)."""
+    job_id: str = ""
+    status: str = "Applied"
+    note: str = ""
+
+
+class PageExtractRequest(BaseModel):
+    """Raw page content for the LLM to parse a JD out of when heuristics fail."""
+    url: str = ""
+    title: str = ""
+    page_text: str = ""

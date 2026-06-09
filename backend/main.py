@@ -11,6 +11,10 @@ from routes.research import router as research_router
 from routes.company_research import router as company_research_router
 from routes.application import router as application_router
 from routes.voice import router as voice_router
+from routes.bridge import router as bridge_router
+from routes.store import router as store_router
+from routes.autofill import router as autofill_router
+from routes.inbox import router as inbox_router
 
 
 @asynccontextmanager
@@ -25,7 +29,18 @@ async def lifespan(_app: FastAPI):
         except Exception:
             pass
 
+    async def _warm_voice():
+        # Load the TTS model + reference clip off the event loop so the first
+        # interview question doesn't pay the cold start. Heavy (torch + model
+        # download on first ever run) so it runs in a thread, best-effort.
+        try:
+            from routes.voice import prewarm
+            await asyncio.to_thread(prewarm)
+        except Exception:
+            pass
+
     asyncio.create_task(_warm())
+    asyncio.create_task(_warm_voice())
     yield
 
     try:
@@ -49,6 +64,12 @@ app.include_router(research_router, prefix="/research")
 app.include_router(company_research_router, prefix="/company-research")
 app.include_router(application_router, prefix="/application")
 app.include_router(voice_router, prefix="/voice")
+# Browser-extension bridge. /config, /store and /autofill are all guarded by the
+# X-InterPrep-Token shared secret (set via INTERPREP_BRIDGE_TOKEN by the shell).
+app.include_router(bridge_router, prefix="/config")
+app.include_router(store_router, prefix="/store")
+app.include_router(autofill_router, prefix="/autofill")
+app.include_router(inbox_router, prefix="/inbox")
 
 
 @app.get("/health")

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "InterPrep Autofill",
+  "version": "0.1.0",
+  "description": "Auto-fill job applications from your InterPrep resume and saved jobs. Asks you when it hits a question it can't answer.",
+  "permissions": ["storage", "scripting", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["inject.js", "background.js"]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "InterPrep Autofill"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "interprep-autofill@interprep.local",
+      "strict_min_version": "121.0"
+    }
+  }
+}

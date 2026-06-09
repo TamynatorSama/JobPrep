@@ -1,8 +1,13 @@
-# Optional voice stack for the live mock interview.
-# Install via:  .\setup.ps1 -Voice   (handles the right torch build for your GPU)
+# Optional voice stack for the live mock interview — the DEFAULT (fast) path.
+# Install via:  .\setup.ps1 -Voice
+#
+# These are light and conflict-free, so the default Piper voice + STT always
+# install cleanly. The heavier, humanlike VibeVoice engine is installed in a
+# SEPARATE step by setup.ps1 (it pins an older transformers, so it must not be
+# resolved together with these — see the -Voice block in setup.ps1).
 #
 # torch is intentionally NOT pinned here — setup.ps1 installs it first, picking
 # the CUDA build when an NVIDIA GPU is detected, else the CPU build.
 numpy>=1.26
-voxcpm>=0.1.0          # OpenBMB VoxCPM-0.5B neural TTS
+piper-tts             # fast neural TTS (default interview voice; offline, CPU, onnxruntime)
 faster-whisper>=1.0.0  # local STT, auto GPU/CPU

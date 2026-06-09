@@ -29,6 +29,14 @@ use wasapi::{
 const BUFFER_DURATION_HNS: i64 = 200_000;
 const POLL_MS: u32 = 100;
 
+// Streaming-TTS pre-roll: how many seconds of audio to buffer before playback
+// starts. A slower-than-real-time engine (e.g. VibeVoice on CPU) drains
+// `pending` faster than it fills mid-sentence; this head start absorbs that
+// deficit and prevents underrun crackle. Bigger = fewer cracks on long
+// sentences but slower to first sound. Faster-than-real-time engines (Piper)
+// and short sentences finish synthesizing before this fills and play at once.
+const PREROLL_SECS: f64 = 1.0;
+
 // VAD tuning. RMS is over mono samples normalized to [-1, 1]. Hysteresis: it
 // takes SPEECH_RMS to *start*, but only CONTINUE_RMS (lower) to keep the turn
 // alive — so a mid-sentence pause / breath doesn't get cut as "done".
@@ -161,6 +169,135 @@ pub fn play_wav(
             on_level(r, z);
         }
         pos += frames * block_align;
+    }
+
+    // Let the queued tail drain (unless interrupted).
+    if completed {
+        let start = Instant::now();
+        while start.elapsed().as_secs_f64() < 3.0 {
+            if interrupt.load(Ordering::SeqCst) {
+                completed = false;
+                break;
+            }
+            let padding = client.get_current_padding().unwrap_or(0);
+            if padding == 0 {
+                break;
+            }
+            let _ = event.wait_for_event(POLL_MS);
+        }
+    }
+
+    client.stop_stream().ok();
+    Ok(completed)
+}
+
+/// Render a live PCM stream (mono f32 blocks pulled from `rx`) to the default
+/// output. Used for streaming TTS: playback starts as soon as the first blocks
+/// arrive instead of waiting for the whole sentence WAV. A short pre-roll
+/// buffers a head start so brief synth stalls don't immediately starve the
+/// device. `on_level(rms, zcr)` drives the orb. Returns `Ok(true)` if it played
+/// the whole stream, `Ok(false)` if `interrupt` cut it short.
+pub fn play_pcm_stream(
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    sample_rate: u32,
+    interrupt: &Arc<AtomicBool>,
+    on_level: &mut dyn FnMut(f32, f32),
+) -> Result<bool> {
+    use std::collections::VecDeque;
+    use std::sync::mpsc::TryRecvError;
+
+    let sr = sample_rate.max(8000) as usize;
+    let wave_format = WaveFormat::new(32, 32, &SampleType::Float, sr, 1, None);
+
+    let _com = init_mta()?;
+    let enumerator = DeviceEnumerator::new().context("failed to create device enumerator")?;
+    let device = enumerator
+        .get_default_device(&Direction::Render)
+        .context("no default output device")?;
+    let mut client = device.get_iaudioclient().context("failed to create render audio client")?;
+    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: BUFFER_DURATION_HNS };
+    client
+        .initialize_client(&wave_format, &Direction::Render, &mode)
+        .context("failed to initialize render stream")?;
+    let event = client.set_get_eventhandle().context("failed to get render event handle")?;
+    let render = client.get_audiorenderclient().context("failed to get render client")?;
+    let buffer_frames = client.get_buffer_size().context("failed to read render buffer size")?;
+    let block_align = wave_format.get_blockalign() as usize; // 4 bytes/frame (mono f32)
+
+    // Samples received but not yet written to the device.
+    let mut pending: VecDeque<f32> = VecDeque::new();
+    let mut disconnected = false;
+
+    // Pre-roll: buffer PREROLL_SECS of audio (or until the producer finishes)
+    // before starting playback so a brief synth stall doesn't instantly
+    // underrun. Matters most for slower-than-real-time engines; faster engines
+    // (Piper) usually finish a short sentence before this fills.
+    let preroll = (sr as f64 * PREROLL_SECS) as usize;
+    while pending.len() < preroll && !disconnected {
+        if interrupt.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match rx.recv() {
+            Ok(block) => pending.extend(block),
+            Err(_) => disconnected = true,
+        }
+    }
+
+    client.start_stream().context("failed to start render stream")?;
+    let mut completed = true;
+
+    loop {
+        if interrupt.load(Ordering::SeqCst) {
+            completed = false;
+            break;
+        }
+        // Pull whatever the producer has ready without blocking.
+        if !disconnected {
+            loop {
+                match rx.try_recv() {
+                    Ok(block) => pending.extend(block),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => { disconnected = true; break; }
+                }
+            }
+        }
+        if pending.is_empty() {
+            if disconnected {
+                break; // produced everything and it's all been written
+            }
+            // Producer behind — block for the next block rather than spin.
+            match rx.recv() {
+                Ok(block) => pending.extend(block),
+                Err(_) => disconnected = true,
+            }
+            continue;
+        }
+        match event.wait_for_event(POLL_MS) {
+            Ok(()) => {}
+            Err(WasapiError::EventTimeout) => continue,
+            Err(e) => return Err(e).context("render event wait failed"),
+        }
+        let padding = client.get_current_padding().context("failed to read padding")?;
+        let avail = buffer_frames.saturating_sub(padding) as usize;
+        if avail == 0 {
+            continue;
+        }
+        let frames = avail.min(pending.len());
+        if frames == 0 {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(frames * block_align);
+        let mut meter = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            let s = pending.pop_front().unwrap();
+            meter.push(s);
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        render
+            .write_to_device(frames, &bytes, None)
+            .context("render write failed")?;
+        let (r, z) = level_of(&meter);
+        on_level(r, z);
     }
 
     // Let the queued tail drain (unless interrupted).

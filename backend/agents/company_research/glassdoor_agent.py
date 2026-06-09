@@ -10,7 +10,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from playwright.async_api import BrowserContext
 
 from .browser_agent import LLMBrowserAgent
-from .browser_manager import session_path, new_context
+from .browser_manager import session_path, new_context, save_storage_state
 
 
 class GlassdoorAgent:
@@ -74,10 +74,7 @@ class GlassdoorAgent:
 
             # Persist session after successful navigation
             if sp:
-                try:
-                    await ctx.storage_state(path=sp)
-                except Exception:
-                    pass
+                await save_storage_state(ctx, sp)
 
             await page.close()
 
@@ -116,9 +113,6 @@ class GlassdoorAgent:
             )
             await asyncio.sleep(1.5)
             if sp:
-                try:
-                    await ctx.storage_state(path=sp)
-                except Exception:
-                    pass
+                await save_storage_state(ctx, sp)
         finally:
             await page.close()

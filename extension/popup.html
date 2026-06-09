@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="popup.css" />
+  <title>InterPrep Autofill</title>
+</head>
+<body>
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header>
+    <button id="back-btn" class="icon-btn hidden" title="Back" aria-label="Back">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="#fff"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg>
+      </span>
+      <span class="brand-name">InterPrep</span>
+    </div>
+    <div class="header-right">
+      <span id="ctx-pill" class="pill hidden"></span>
+      <span id="status" class="pill pill-muted">…</span>
+      <button id="gear-btn" class="icon-btn hidden" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Pairing ────────────────────────────────────────────────────────── -->
+  <section id="view-pairing" class="view hidden">
+    <h2 class="title">Pair with InterPrep</h2>
+    <p class="muted">
+      Open InterPrep, then paste the pairing code from the app's Settings
+      (or <code>%LOCALAPPDATA%\InterPrep\bridge.json</code>).
+    </p>
+    <textarea id="pairing-input" rows="2" placeholder="paste pairing code"></textarea>
+    <button id="pair-btn" class="btn btn-primary btn-block">Pair</button>
+    <p id="pair-err" class="err"></p>
+  </section>
+
+  <!-- ── Job picker (hub) ───────────────────────────────────────────────── -->
+  <section id="view-jobs" class="view hidden">
+    <h2 class="title">Which job is this for?</h2>
+    <p class="subtitle">Captures &amp; autofills get saved to the job you pick.</p>
+    <p class="section-label">Your tracked jobs</p>
+    <div id="job-list" class="job-list"></div>
+    <button id="create-job-btn" class="btn btn-ghost btn-block">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      Create new job from this page
+    </button>
+  </section>
+
+  <!-- ── Capture a JD ───────────────────────────────────────────────────── -->
+  <section id="view-capture" class="view hidden">
+    <div class="urlbar"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 12-9 12s-9-5-9-12a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg><span id="cap-url"></span></div>
+    <p class="section-label">Job detected on this page</p>
+
+    <div class="detect-card">
+      <div class="detect-head">
+        <span id="cap-avatar" class="avatar">?</span>
+        <div class="detect-meta">
+          <div id="cap-title" class="detect-title">—</div>
+          <div id="cap-sub" class="detect-sub muted"></div>
+        </div>
+      </div>
+      <div id="cap-chips" class="chips"></div>
+    </div>
+
+    <div id="cap-req-wrap" class="hidden">
+      <div class="req-head">
+        <span class="section-label">Key requirements</span>
+        <span id="cap-ai-badge" class="pill pill-accent hidden">
+          <svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg>
+          AI parsed
+        </span>
+      </div>
+      <div id="cap-reqs" class="chips"></div>
+    </div>
+
+    <details id="cap-edit" class="edit-block">
+      <summary class="muted">Edit details</summary>
+      <label class="field"><span>Company</span><input id="cap-company" type="text" /></label>
+      <label class="field"><span>Role</span><input id="cap-role" type="text" /></label>
+      <label class="field"><span>Location</span><input id="cap-location" type="text" /></label>
+    </details>
+
+    <p id="cap-jd" class="muted hint"></p>
+    <p id="capture-status" class="muted hint"></p>
+
+    <div class="capture-actions">
+      <button id="ai-extract-btn" class="btn btn-ghost">Re-analyze with AI</button>
+      <button id="capture-btn" class="btn btn-white btn-block">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+        Capture job description
+      </button>
+    </div>
+    <p class="footnote">Saves the full JD, requirements &amp; company info to your workspace.</p>
+  </section>
+
+  <!-- ── Scan preview (img3) ────────────────────────────────────────────── -->
+  <section id="view-actions" class="view hidden">
+    <div class="urlbar"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 12-9 12s-9-5-9-12a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg><span id="act-url"></span></div>
+
+    <div class="row-between">
+      <span class="section-label">Application form found</span>
+      <span id="form-kind" class="pill pill-muted">scanning…</span>
+    </div>
+
+    <div class="ctx-cards">
+      <div class="ctx-card">
+        <span id="prof-avatar" class="avatar sm">?</span>
+        <div class="ctx-meta"><div id="prof-name" class="ctx-title">Your profile</div><div id="prof-sub" class="ctx-sub muted">CV attached</div></div>
+      </div>
+      <div class="ctx-card">
+        <span id="job-avatar" class="avatar sm">?</span>
+        <div class="ctx-meta"><div id="job-name" class="ctx-title">—</div><div class="ctx-sub muted">Target job</div></div>
+      </div>
+    </div>
+
+    <div class="row-between">
+      <span class="section-label">Mapped fields</span>
+      <span id="ready-count" class="ready muted"></span>
+    </div>
+    <div id="mapped" class="mapped"></div>
+
+    <p id="ctx-note" class="muted hint"></p>
+    <p id="run-status" class="muted hint"></p>
+
+    <button id="autofill-btn" class="btn btn-white btn-block" disabled>
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg>
+      <span id="autofill-label">Autofill</span>
+    </button>
+  </section>
+
+  <!-- ── Multi-page stepper (img4) ──────────────────────────────────────── -->
+  <section id="view-progress" class="view hidden">
+    <div class="row-between">
+      <h2 class="title sm" id="prog-title">Application</h2>
+      <span id="prog-step" class="muted"></span>
+    </div>
+    <div class="progress-track"><div id="progress-bar" class="progress-fill"></div></div>
+
+    <div id="steps" class="steps"></div>
+
+    <div class="info-card">
+      <div class="info-head">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg>
+        <span>Pulling from your profile</span>
+      </div>
+      <p class="info-body">InterPrep maps this step's fields, advances pages automatically, and pauses on anything that needs you.</p>
+    </div>
+
+    <p id="prog-status" class="muted hint"></p>
+
+    <div class="prog-actions">
+      <button id="step-btn" class="btn btn-white btn-block">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg>
+        Fill step &amp; continue
+      </button>
+      <button id="all-btn" class="btn btn-ghost btn-block">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5M3 17l9 5 9-5"/></svg>
+        <span id="all-label">Autofill all steps</span>
+      </button>
+      <button id="stop-btn" class="btn btn-ghost btn-block hidden">Stop</button>
+    </div>
+  </section>
+
+  <!-- ── Done summary (img5) ────────────────────────────────────────────── -->
+  <section id="view-done" class="view hidden">
+    <div class="done-check">
+      <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+    </div>
+    <h2 class="title center">Application autofilled</h2>
+    <p id="done-sub" class="subtitle center"></p>
+
+    <div class="stats">
+      <div class="stat"><div id="stat-fields" class="stat-num">0</div><div class="stat-label">Fields filled</div></div>
+      <div class="stat"><div id="stat-pages" class="stat-num">0</div><div class="stat-label">Pages</div></div>
+      <div class="stat"><div id="stat-time" class="stat-num">~0m</div><div class="stat-label">Time saved</div></div>
+    </div>
+
+    <div id="eyes-card" class="eyes-card hidden">
+      <div class="eyes-head">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        <span id="eyes-title"></span>
+      </div>
+      <p id="eyes-body" class="eyes-body"></p>
+    </div>
+
+    <div class="done-actions">
+      <button id="jump-btn" class="btn btn-white btn-block">› Jump to first blank field</button>
+      <button id="timeline-btn" class="btn btn-ghost btn-block">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        <span id="timeline-label">Log to timeline</span>
+      </button>
+    </div>
+    <p id="done-status" class="muted hint center"></p>
+  </section>
+
+  <!-- ── Settings ───────────────────────────────────────────────────────── -->
+  <section id="view-settings" class="view hidden">
+    <h2 class="title">Settings</h2>
+    <details class="edit-block" open>
+      <summary class="muted">Master resumes — all used for contact details; tick to limit</summary>
+      <div id="resumes" class="resumes"></div>
+    </details>
+    <button id="unpair-btn" class="btn btn-ghost btn-block">Unpair this browser</button>
+  </section>
+
+  <!-- ── Shared review + log (render under the active run view) ──────────── -->
+  <div id="questions" class="gblock hidden">
+    <p class="section-label">Review &amp; confirm</p>
+    <div id="q-list"></div>
+    <button id="apply-btn" class="btn btn-primary btn-block">Apply &amp; continue</button>
+  </div>
+  <div id="log" class="gblock log hidden"></div>
+
+  <script src="inject.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

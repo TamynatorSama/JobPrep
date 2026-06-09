@@ -9,7 +9,7 @@ import re
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .browser_agent import LLMBrowserAgent
-from .browser_manager import session_path, new_context
+from .browser_manager import session_path, new_context, save_storage_state
 
 
 def _company_slug(name: str) -> str:
@@ -73,10 +73,7 @@ class IndeedAgent:
             await page.close()
 
             if sp:
-                try:
-                    await ctx.storage_state(path=sp)
-                except Exception:
-                    pass
+                await save_storage_state(ctx, sp)
 
             if results:
                 import json
@@ -111,9 +108,6 @@ class IndeedAgent:
             )
             await asyncio.sleep(1.5)
             if sp:
-                try:
-                    await ctx.storage_state(path=sp)
-                except Exception:
-                    pass
+                await save_storage_state(ctx, sp)
         finally:
             await page.close()

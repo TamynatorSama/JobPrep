@@ -148,6 +148,10 @@ interface ChatMsg {
   logs?: string[];
   /** True while tokens are still streaming into `content`. */
   streaming?: boolean;
+  /** Id of the stream currently filling this bubble. Lets several streams run
+   *  at once — each event routes to its own message by this id — and is cleared
+   *  (with `streaming`) when the stream ends. Not persisted meaningfully. */
+  streamId?: string;
   /** Sent to the backend but not rendered (e.g. the Mock Interview kickoff). */
   hidden?: boolean;
 }
@@ -225,6 +229,12 @@ interface Job {
   chats: ChatThread[];
   /** Full job description text. Used as context for chat + research. */
   jobDescription?: string;
+  /** Display metadata parsed at capture time by the browser extension. */
+  employmentType?: string;
+  workMode?: string;
+  salary?: string;
+  posted?: string;
+  requirements?: string[];
   /** Hidden from the main sidebar list once true. */
   archived?: boolean;
   /** Plain-text tailored resume produced by the Application-Prep step. */
@@ -1691,10 +1701,9 @@ interface ChatAreaProps {
   chat: ChatThread | null;
   job: Job | null;
   onSendMessage: (text: string) => void;
-  isLoading: boolean;
-  /// ID of the chat thread currently streaming. Used to scope the loading
-  /// indicator so it only appears in the active thread, not every chat.
-  streamingChatId: string | null;
+  /// Chat-thread ids with an active stream. Scopes the loading indicator to the
+  /// thread the tokens flow into — several can stream at once.
+  streamingChatIds: string[];
   /// Launches the saved .docx in the OS default app (Word, etc.).
   onOpenResumeDocx?: (path: string) => void;
   /// Kicks off the recruiter-knockout simulation thread for the current job.
@@ -1711,11 +1720,11 @@ interface ChatAreaProps {
   onOpenVoice?: () => void;
 }
 
-const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpenResumeDocx, onSimulateKnockout, onRegenerate, onEndInterview, voiceEnabled, voiceListening, voiceStatus, onOpenVoice }: ChatAreaProps) => {
-  // Loader is per-thread, not global. Even if isLoading is true (some other
-  // stream is running), don't draw the bouncing dots unless the user is
-  // looking at the thread the tokens are flowing into.
-  const showLoader = isLoading && chat != null && chat.id === streamingChatId;
+const ChatArea = ({ chat, job, onSendMessage, streamingChatIds, onOpenResumeDocx, onSimulateKnockout, onRegenerate, onEndInterview, voiceEnabled, voiceListening, voiceStatus, onOpenVoice }: ChatAreaProps) => {
+  // Loader is per-thread: draw the bouncing dots only in the thread whose
+  // tokens are flowing, even though other threads may be streaming too.
+  const chatStreaming = chat != null && streamingChatIds.includes(chat.id);
+  const showLoader = chatStreaming;
   const endRef = useRef<HTMLDivElement>(null);
   const [hoveredMsg, setHoveredMsg] = useState<number | null>(null);
 
@@ -1815,12 +1824,12 @@ const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpen
           {!interviewComplete && (
             <button
               onClick={() => onEndInterview?.()}
-              disabled={isLoading}
+              disabled={chatStreaming}
               style={{
                 padding: "5px 12px", borderRadius: 100,
                 border: `1px solid ${T.border}`, background: T.surface2, color: T.text,
                 fontSize: 11.5, fontWeight: 500, fontFamily: T.fontBody,
-                cursor: isLoading ? "not-allowed" : "pointer", opacity: isLoading ? 0.5 : 1,
+                cursor: chatStreaming ? "not-allowed" : "pointer", opacity: chatStreaming ? 0.5 : 1,
               }}
             >
               End &amp; get feedback
@@ -1988,19 +1997,23 @@ const ChatArea = ({ chat, job, onSendMessage, isLoading, streamingChatId, onOpen
 // ─── Input composer ───────────────────────────────────────────────────────
 
 interface InputComposerProps {
+  /// Draft text for the *currently selected* chat (lifted to the parent so each
+  /// chat keeps its own in-progress message).
+  value: string;
+  onChange: (v: string) => void;
   onSend: (text: string) => void;
   disabled: boolean;
+  /// Small line under the box (e.g. "queued — sending next"). Optional.
+  hint?: string;
 }
 
-const InputComposer = ({ onSend, disabled }: InputComposerProps) => {
-  const [value, setValue] = useState("");
+const InputComposer = ({ value, onChange, onSend, disabled, hint }: InputComposerProps) => {
   const taRef = useRef<HTMLTextAreaElement>(null);
 
   const send = () => {
     const t = value.trim();
     if (!t || disabled) return;
     onSend(t);
-    setValue("");
   };
 
   useEffect(() => {
@@ -2022,7 +2035,7 @@ const InputComposer = ({ onSend, disabled }: InputComposerProps) => {
         <textarea
           ref={taRef}
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
           placeholder="Ask anything about this role, practice questions, review your resume…"
           style={{
@@ -2068,10 +2081,10 @@ const InputComposer = ({ onSend, disabled }: InputComposerProps) => {
         </div>
       </div>
       <p style={{
-        fontSize: 11, color: T.textTertiary,
+        fontSize: 11, color: hint ? T.accent : T.textTertiary,
         textAlign: "center", marginTop: 6, letterSpacing: "-0.11px",
       }}>
-        InterPrep AI may make mistakes. Always verify important information.
+        {hint || "InterPrep AI may make mistakes. Always verify important information."}
       </p>
     </div>
   );
@@ -2491,12 +2504,18 @@ interface SettingsModalProps {
   onCredentialsChange: (c: Credentials) => void;
   resumes: Resume[];
   onResumesChange: (r: Resume[]) => void;
+  voxVoice: boolean;
+  onVoxVoiceChange: (v: boolean) => void;
+  panelSize: number;
+  onPanelSizeChange: (n: number) => void;
+  voiceStatus: { available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string } | null;
   onClose: () => void;
 }
 
 const SettingsModal = ({
   credentials, onCredentialsChange,
   resumes, onResumesChange,
+  voxVoice, onVoxVoiceChange, panelSize, onPanelSizeChange, voiceStatus,
   onClose,
 }: SettingsModalProps) => {
   const [section, setSection] = useState("resume");
@@ -2504,9 +2523,11 @@ const SettingsModal = ({
     { id: "account",       label: "Account",        icon: "user"      as IconName },
     { id: "appearance",    label: "Appearance",     icon: "sun"       as IconName },
     { id: "resume",        label: "Resume",         icon: "upload"    as IconName },
+    { id: "voice",         label: "Voice",          icon: "mic"       as IconName },
     { id: "notifications", label: "Notifications",  icon: "bell"      as IconName },
     { id: "data",          label: "Data & Privacy", icon: "briefcase" as IconName },
     { id: "apiKeys",       label: "API Keys",       icon: "key"       as IconName },
+    { id: "integrations",  label: "Integrations",   icon: "link"      as IconName },
   ];
 
   const update = (patch: Partial<Credentials>) =>
@@ -2569,8 +2590,12 @@ const SettingsModal = ({
 
           {section === "apiKeys" ? (
             <CredentialsTab credentials={credentials} update={update} />
+          ) : section === "integrations" ? (
+            <IntegrationsTab />
           ) : section === "resume" ? (
             <ResumeTab resumes={resumes} onChange={onResumesChange} />
+          ) : section === "voice" ? (
+            <VoiceTab voxVoice={voxVoice} onVoxVoiceChange={onVoxVoiceChange} panelSize={panelSize} onPanelSizeChange={onPanelSizeChange} voiceStatus={voiceStatus} />
           ) : (
             <p style={{ fontSize: 12, color: T.textTertiary, letterSpacing: "-0.12px" }}>
               Settings for this section coming soon.
@@ -2578,6 +2603,110 @@ const SettingsModal = ({
           )}
         </div>
       </div>
+    </div>
+  );
+};
+
+// ─── Voice tab ──────────────────────────────────────────────────────────
+
+interface VoiceTabProps {
+  voxVoice: boolean;
+  onVoxVoiceChange: (v: boolean) => void;
+  panelSize: number;
+  onPanelSizeChange: (n: number) => void;
+  voiceStatus: { available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string } | null;
+}
+
+const VoiceTab = ({ voxVoice, onVoxVoiceChange, panelSize, onPanelSizeChange, voiceStatus }: VoiceTabProps) => {
+  // Only block enabling VibeVoice when we positively know it's unavailable
+  // (status reported it missing). If status hasn't loaded, allow the toggle.
+  const vibeInstalled = voiceStatus?.vibe_available !== false;
+  const blocked = !voxVoice && !vibeInstalled;
+  const toggle = () => { if (!blocked) onVoxVoiceChange(!voxVoice); };
+  // How many distinct preset voices VibeVoice ships (caps the panel size). When
+  // status hasn't loaded (undefined) assume the full 4; a known-empty list means
+  // no presets, but keep at least one button so the control still renders.
+  const maxPanel = Math.min(4, voiceStatus?.voices?.length ?? 4) || 1;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <Card>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
+          <div style={{ flex: 1 }}>
+            <CardTitle>Humanlike voice (VibeVoice)</CardTitle>
+            <CardDesc>
+              Off uses Piper — a fast voice that starts speaking almost instantly.
+              On uses Microsoft VibeVoice for a warmer, more humanlike interviewer,
+              at the cost of slower replies (noticeably slower without a GPU).
+            </CardDesc>
+          </div>
+          <button
+            type="button"
+            onClick={toggle}
+            aria-pressed={voxVoice}
+            disabled={blocked}
+            style={{
+              flexShrink: 0, marginTop: 2, position: "relative",
+              width: 36, height: 20, borderRadius: 100, border: "none",
+              background: voxVoice ? T.accent : T.surface2,
+              cursor: blocked ? "not-allowed" : "pointer",
+              opacity: blocked ? 0.5 : 1, transition: "background 0.15s",
+            }}
+          >
+            <div style={{
+              position: "absolute", top: 2, left: voxVoice ? 18 : 2,
+              width: 16, height: 16, borderRadius: "50%", background: "#fff",
+              transition: "left 0.15s",
+            }} />
+          </button>
+        </div>
+        {voiceStatus?.device && (
+          <CardHint>Running on {voiceStatus.device === "cuda" ? "GPU (fast)" : "CPU"}.</CardHint>
+        )}
+        {!vibeInstalled && (
+          <CardHint>
+            VibeVoice isn't installed — run <code>backend\setup.ps1 -Voice</code> to enable the humanlike voice.
+          </CardHint>
+        )}
+      </Card>
+
+      {voxVoice && (
+        <Card>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
+            <div style={{ flex: 1 }}>
+              <CardTitle>Interviewer panel</CardTitle>
+              <CardDesc>
+                Simulate a panel: each question is asked by a different voice,
+                rotating through this many of VibeVoice's preset interviewers.
+                Set to 1 for a single interviewer.
+              </CardDesc>
+            </div>
+            <div style={{ display: "flex", gap: 4, flexShrink: 0, marginTop: 2 }}>
+              {Array.from({ length: maxPanel }, (_, i) => i + 1).map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => onPanelSizeChange(n)}
+                  aria-pressed={panelSize === n}
+                  style={{
+                    width: 28, height: 28, borderRadius: 8, cursor: "pointer",
+                    border: `0.5px solid ${T.border}`,
+                    background: panelSize === n ? T.accent : T.surface2,
+                    color: panelSize === n ? "#fff" : T.text,
+                    fontSize: 12, fontWeight: 600,
+                  }}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          </div>
+          {voiceStatus?.voices?.length ? (
+            <CardHint>
+              Panel voices: {voiceStatus.voices.slice(0, panelSize).join(", ")}.
+            </CardHint>
+          ) : null}
+        </Card>
+      )}
     </div>
   );
 };
@@ -2852,6 +2981,130 @@ const SecretField = ({ value, placeholder, onChange }: CredentialFieldProps) => 
   );
 };
 
+// ─── Integrations tab ──────────────────────────────────────────────────────
+
+interface BridgeInfo {
+  ready: boolean;
+  port?: number;
+  token?: string;
+  pairingCode?: string;
+}
+
+const IntegrationsTab = () => {
+  const [info, setInfo] = useState<BridgeInfo | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const load = () => {
+    invoke<BridgeInfo>("bridge_info")
+      .then(setInfo)
+      .catch(() => setInfo({ ready: false }));
+  };
+  useEffect(load, []);
+
+  const copy = async () => {
+    if (!info?.pairingCode) return;
+    try {
+      await navigator.clipboard.writeText(info.pairingCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked — user can select the field manually */ }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <Card>
+        <CardTitle>InterPrep Autofill (browser extension)</CardTitle>
+        <CardDesc>
+          Pair the browser extension with this app to auto-fill job applications
+          from your tailored resumes and company research. Paste the code below
+          into the extension popup, then click Pair.
+        </CardDesc>
+
+        {info?.ready ? (
+          <>
+            <FieldLabel>Pairing code</FieldLabel>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input
+                readOnly
+                value={info.pairingCode || ""}
+                onFocus={(e) => e.currentTarget.select()}
+                style={{ ...fieldInputStyle(), flex: 1, fontFamily: "monospace", fontSize: 11 }}
+              />
+              <button
+                type="button"
+                onClick={copy}
+                style={{
+                  display: "flex", alignItems: "center", gap: 5,
+                  padding: "0 12px", borderRadius: 8, flexShrink: 0,
+                  background: copied ? T.accent : T.surface2,
+                  color: copied ? "#fff" : T.textSecondary,
+                  border: `0.5px solid ${T.border}`, cursor: "pointer",
+                  fontSize: 12, fontFamily: T.fontBody,
+                }}
+              >
+                <Icon name={copied ? "check" : "copy"} size={13} />
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <CardHint>
+              Listening on port {info.port}. The code changes every time you
+              restart InterPrep — re-pair if the extension says it can't connect.
+            </CardHint>
+            <div style={{ height: 10 }} />
+            <button
+              type="button"
+              onClick={load}
+              style={{
+                display: "flex", alignItems: "center", gap: 6,
+                padding: "7px 12px", borderRadius: 8, alignSelf: "flex-start",
+                background: T.surface2, color: T.textSecondary,
+                border: `0.5px solid ${T.border}`, cursor: "pointer",
+                fontSize: 12, fontFamily: T.fontBody,
+              }}
+            >
+              <Icon name="refresh" size={12} /> Refresh
+            </button>
+          </>
+        ) : (
+          <CardHint>
+            Backend isn't ready yet — wait a few seconds after launch, then click
+            Refresh.
+            <span style={{ display: "block", marginTop: 8 }}>
+              <button
+                type="button"
+                onClick={load}
+                style={{
+                  display: "inline-flex", alignItems: "center", gap: 6,
+                  padding: "7px 12px", borderRadius: 8,
+                  background: T.surface2, color: T.textSecondary,
+                  border: `0.5px solid ${T.border}`, cursor: "pointer",
+                  fontSize: 12, fontFamily: T.fontBody,
+                }}
+              >
+                <Icon name="refresh" size={12} /> Refresh
+              </button>
+            </span>
+          </CardHint>
+        )}
+      </Card>
+
+      <Card>
+        <CardTitle>How to install the extension</CardTitle>
+        <CardDesc>
+          In Chrome/Edge open the extensions page, enable Developer mode, choose
+          “Load unpacked”, and select the <code>extension/</code> folder from the
+          InterPrep project. Then open the popup and paste the pairing code above.
+        </CardDesc>
+        <CardHint>
+          The pairing code is a shared secret — anyone with it (and access to this
+          machine) can read your saved resumes through the local bridge. Don't
+          share it.
+        </CardHint>
+      </Card>
+    </div>
+  );
+};
+
 // ─── Main app ─────────────────────────────────────────────────────────────
 
 const App = () => {
@@ -2869,12 +3122,23 @@ const App = () => {
   /// Voice-mode UI state for the interview (spoken Q&A + barge-in).
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
-  const [voiceStatus, setVoiceStatus] = useState<{ available: boolean; device?: string; detail?: string } | null>(null);
+  const [voiceStatus, setVoiceStatus] = useState<{ available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string } | null>(null);
   const [voiceOverlayOpen, setVoiceOverlayOpen] = useState(false);
   const [voicePhase, setVoicePhase] = useState<string>("idle");
   /// Barge-in (talk over the AI). Off by default — only safe with headphones.
   const [bargeEnabled, setBargeEnabled] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
+  /// TTS engine: false = Piper (fast default), true = VibeVoice ("vibe-rt",
+  /// humanlike). Persisted in localStorage; pushed to Rust on load + toggle.
+  const [voxVoice, setVoxVoice] = useState(() => {
+    try { return localStorage.getItem("interprep.voxVoice") === "1"; }
+    catch { return false; }
+  });
+  /// Interviewer panel size (1–4). With VibeVoice on, each interviewer turn
+  /// rotates through this many distinct preset voices, simulating a panel.
+  const [panelSize, setPanelSize] = useState(() => {
+    try { return Math.min(4, Math.max(1, parseInt(localStorage.getItem("interprep.panelSize") || "1", 10))); }
+    catch { return 1; }
+  });
   const [activeScreen, setActiveScreen] = useState<Screen>("chat");
 
   // ── Backend lifecycle ──────────────────────────────────────────────────
@@ -2909,14 +3173,44 @@ const App = () => {
   // The Rust side broadcasts `chat:token` / `chat:log` / `chat:done` /
   // `chat:error` events for whichever stream is currently active. The
   // frontend appends to the most recent AI message in the current thread —
-  // since we disable send while a stream is running, there's only ever one.
-  const streamingTargetRef = useRef<{ jobId: string; chatId: string } | null>(null);
-  /// Mirror of `streamingTargetRef.current?.chatId` exposed as React state so
-  /// the loader indicator can be scoped to the active thread.
-  const [streamingChatId, setStreamingChatId] = useState<string | null>(null);
-  /// Buffers the tailored-resume text emitted mid-stream so we can persist it
-  /// to the Job *and* hand it to the Company-Research chain on `chat:done`.
-  const pendingTailoredResumeRef = useRef<string | null>(null);
+  // sends are single-flighted (a new one while a stream runs is queued, not
+  // started), so there's only ever one active stream.
+  /// Active streams, keyed by a unique stream id that every SSE event carries.
+  /// Concurrent streams stay fully separated: each tags its own AI bubble with
+  /// the id and every `chat:*` event routes by it, so two streams — even in the
+  /// same thread — never cross-contaminate. `tailored` caches the tailored
+  /// resume for the Prep→Research chain fired on `done`.
+  const streamsRef = useRef<Map<string, { jobId: string; chatId: string; tailored?: string }>>(new Map());
+  /// Chat ids with ≥1 active stream — drives the per-thread loader. State (not
+  /// just the ref) so the UI re-renders as streams start/stop.
+  const [streamingChatIds, setStreamingChatIds] = useState<string[]>([]);
+  /// In-progress composer text, kept PER chat (keyed by chat id; "" for a job
+  /// with no thread selected yet) so switching chats doesn't clobber a draft.
+  const [draftsByChat, setDraftsByChat] = useState<Record<string, string>>({});
+
+  const newStreamId = () => `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  // Register a starting stream and mark its chat as streaming.
+  const beginStream = (streamId: string, jobId: string, chatId: string) => {
+    streamsRef.current.set(streamId, { jobId, chatId });
+    setStreamingChatIds((ids) => (ids.includes(chatId) ? ids : [...ids, chatId]));
+  };
+  // Retire a finished/failed stream; clear its chat's loader only if no OTHER
+  // stream is still feeding that same chat.
+  const endStream = (streamId: string) => {
+    const t = streamsRef.current.get(streamId);
+    streamsRef.current.delete(streamId);
+    if (!t) return;
+    if (![...streamsRef.current.values()].some((s) => s.chatId === t.chatId)) {
+      setStreamingChatIds((ids) => ids.filter((c) => c !== t.chatId));
+    }
+  };
+  // Drop every stream targeting a chat (used when that chat is deleted).
+  const endStreamsForChat = (chatId: string) => {
+    for (const [id, t] of [...streamsRef.current.entries()]) {
+      if (t.chatId === chatId) streamsRef.current.delete(id);
+    }
+    setStreamingChatIds((ids) => ids.filter((c) => c !== chatId));
+  };
   /// Set to a freshly-created Mock Interview thread id; an effect fires the
   /// kickoff prompt once that thread is committed + selected, so onSendMessage
   /// reads fresh state (avoids the stale-closure trap of calling it inline).
@@ -2927,7 +3221,7 @@ const App = () => {
   /// `{ jobId, chatId }` of the interview the voice loop is driving.
   const voiceTargetRef = useRef<{ jobId: string; chatId: string } | null>(null);
   /// Always points at the latest `onSendMessage` closure (fresh selection).
-  const sendMessageRef = useRef<((text: string, opts?: { hidden?: boolean }) => void) | null>(null);
+  const sendMessageRef = useRef<((text: string, opts?: { hidden?: boolean; jobId?: string; chatId?: string }) => void) | null>(null);
   /// Live audio level/pitch for the voice orb (updated ~20×/s; a ref so the
   /// high-frequency events don't trigger React re-renders).
   const voiceLevelRef = useRef<VoiceLevel>({ level: 0, pitch: 0, mode: "idle" });
@@ -2936,15 +3230,133 @@ const App = () => {
   const voiceUtteranceTextRef = useRef(""); // full text this turn (marker detection)
   const voiceSkipRef = useRef(false);       // stop speaking this turn (feedback/barge)
   const voiceListenActiveRef = useRef(false); // mic already opened for this answer
+  /// Panelist voice for the current interviewer turn (vibe-rt only). Set at
+  /// turn start in onSendMessage; read by the chat:token TTS handler. Rotates
+  /// across the active panel so successive questions sound like different people.
+  const voiceSpeakerRef = useRef("");
+  const voiceTurnRef = useRef(0); // turn counter driving the round-robin
 
   // Refs so listener callbacks can read latest credentials + jobs without
   // re-registering listeners on every state change.
   const credentialsRef = useRef<Credentials>(EMPTY_CREDS);
   const jobsRef        = useRef<Job[]>([]);
+  const resumesRef     = useRef<Resume[]>([]);
   /// Populated once `startCompanyResearchFor` is defined further down. Lets
   /// the `chat:done` listener (registered in a one-shot useEffect) call into
   /// the latest closure.
   const startCompanyResearchForRef = useRef<((job: Job, tailoredResume: string) => void) | null>(null);
+  /// Latest `startApplicationPrep` closure, so the inbox poller can launch the
+  /// full Prep → Research chain with fresh `resumes`.
+  const startApplicationPrepRef = useRef<((job: Job) => void) | null>(null);
+  /// Guards the job-capture poller so two ticks can't process the same item.
+  const captureBusyRef = useRef(false);
+
+  // Poll the extension's job-capture inbox. When the user grabs a JD from the
+  // browser, a capture lands here; we create the job + start company research so
+  // they can watch it stream in the app. One capture per tick (captureBusyRef);
+  // its stream runs concurrently with any others.
+  useEffect(() => {
+    let stopped = false;
+    const tick = async () => {
+      if (stopped || captureBusyRef.current) return;
+      let items: Array<Record<string, string>> = [];
+      try { items = await invoke<Array<Record<string, string>>>("poll_job_inbox"); }
+      catch { return; } // backend not ready / unreachable — try again next tick
+      if (!items || !items.length) return;
+
+      captureBusyRef.current = true;
+      try {
+        const item = items[0];
+        const id = `job-${Date.now()}`;
+        const palette = ["#6366F1", "#10B981", "#F59E0B", "#EC4899", "#8B5CF6"];
+        const company = (item.company || "Unknown").trim() || "Unknown";
+        // `requirements` is a string[] in the capture (the loose Record type
+        // doesn't capture that), so read it through a cast.
+        const reqs = (item as unknown as { requirements?: string[] }).requirements;
+        const job: Job = {
+          id,
+          company,
+          role: (item.role || "Role").trim() || "Role",
+          location: item.location || "",
+          url: item.url || "",
+          status: "Applied",
+          appliedDate: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+          currentStage: 0,
+          stageNotes: {},
+          avatar: company[0]?.toUpperCase() ?? "?",
+          avatarColor: palette[jobsRef.current.length % palette.length],
+          chats: [],
+          jobDescription: item.job_description || undefined,
+          // Preserve the extension's parsed display metadata instead of dropping
+          // it when the inbox item is acked (and gone).
+          employmentType: item.employment_type || undefined,
+          workMode: item.work_mode || undefined,
+          salary: item.salary || undefined,
+          posted: item.posted || undefined,
+          requirements: Array.isArray(reqs) && reqs.length ? reqs : undefined,
+        };
+        flushSync(() => { setJobs((prev) => [...prev, job]); });
+        setSelectedJobId(id);
+        // Same flow as creating a job in-app: run Application Prep (resume
+        // tailoring) first — it auto-chains into Company Research on `chat:done`.
+        // Fall back to research-only when there are no master resumes to tailor.
+        if (resumesRef.current.length > 0 && startApplicationPrepRef.current) {
+          startApplicationPrepRef.current(job);
+        } else {
+          setSelectedChatId(`c-research-${id}`);
+          startCompanyResearchForRef.current?.(job, "");
+        }
+        await invoke("ack_job_inbox", { ids: [item.id] }).catch(() => {});
+      } finally {
+        captureBusyRef.current = false;
+      }
+    };
+    const h = setInterval(tick, 4000);
+    return () => { stopped = true; clearInterval(h); };
+  }, []);
+
+  // Poll the extension's timeline-event queue. After an autofill the extension
+  // logs a "mark Applied + note" event here; we apply each to its job's stage
+  // timeline (status + a note on the Applied stage), then ack it. These never
+  // start a stream, so — unlike the capture poller — this runs anytime.
+  useEffect(() => {
+    let stopped = false;
+    const STAGE_APPLIED = 0; // STAGES[0] === "Applied"
+    const apply = (job: Job, ev: { status?: string; note?: string }): Job => {
+      const status: JobStatusKey =
+        ev.status && ev.status in STATUS_CONFIG ? (ev.status as JobStatusKey) : job.status;
+      const prev = job.stageNotes[STAGE_APPLIED];
+      const note = (ev.note || "").trim();
+      const merged: StageNote = {
+        date: prev?.date || new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+        outcome: prev?.outcome || status,
+        notes: [prev?.notes, note].filter(Boolean).join("\n"),
+      };
+      return { ...job, status, stageNotes: { ...job.stageNotes, [STAGE_APPLIED]: merged } };
+    };
+    const tick = async () => {
+      if (stopped) return;
+      let events: Array<{ id: string; job_id: string; status?: string; note?: string }> = [];
+      try { events = await invoke("poll_timeline_inbox"); }
+      catch { return; } // backend not ready / unreachable — retry next tick
+      if (!events || !events.length) return;
+      const byJob = new Map<string, typeof events>();
+      for (const ev of events) {
+        const list = byJob.get(ev.job_id) ?? [];
+        list.push(ev);
+        byJob.set(ev.job_id, list);
+      }
+      setJobs((prev) => prev.map((j) => {
+        const evs = byJob.get(j.id);
+        return evs ? evs.reduce(apply, j) : j;
+      }));
+      // Ack everything we polled (events for unknown jobs are dropped rather
+      // than re-polled forever).
+      await invoke("ack_timeline_inbox", { ids: events.map((e) => e.id) }).catch(() => {});
+    };
+    const h = setInterval(tick, 4000);
+    return () => { stopped = true; clearInterval(h); };
+  }, []);
 
   useEffect(() => {
     // StrictMode-safe listener registration. React's dev StrictMode runs
@@ -2952,8 +3364,8 @@ const App = () => {
     // unsubs.push(u))`, the first cleanup fires BEFORE the async listen()
     // resolves, so its `u` never lands in `unsubs` and the first set of
     // listeners stays registered forever. Two live `chat:done` listeners
-    // then race: one chains Prep→Research and sets the next streamingTargetRef,
-    // the other immediately nulls it, dropping every subsequent SSE event.
+    // then double-handle every completion (chaining Prep→Research twice,
+    // retiring a stream that another listener already removed, etc.).
     //
     // The fix: a `cancelled` flag + `register()` helper that either pushes
     // each unlisten into the active list or unsubscribes it inline if
@@ -2976,38 +3388,36 @@ const App = () => {
       setJobs((prev) => prev.map((j) => j.id === jobId ? mutate(j) : j));
     };
 
-    const appendToLast = (mutate: (m: ChatMsg) => ChatMsg) => {
-      const target = streamingTargetRef.current;
+    // Mutate the AI bubble a specific stream is filling — matched by the
+    // message's `streamId`, so concurrent streams in one thread never collide.
+    const appendToStream = (streamId: string, mutate: (m: ChatMsg) => ChatMsg) => {
+      const target = streamsRef.current.get(streamId);
       if (!target) return;
       updateJob(target.jobId, (j) => ({
         ...j,
         chats: j.chats.map((c) =>
           c.id !== target.chatId
             ? c
-            : {
-                ...c,
-                messages: c.messages.map((m, i) =>
-                  i === c.messages.length - 1 ? mutate(m) : m,
-                ),
-              },
+            : { ...c, messages: c.messages.map((m) => (m.streamId === streamId ? mutate(m) : m)) },
         ),
       }));
     };
 
-    register<string>("chat:token", (e) => {
-      appendToLast((m) => ({ ...m, content: m.content + e.payload }));
+    register<{ streamId: string; content: string }>("chat:token", (e) => {
+      const { streamId, content } = e.payload;
+      appendToStream(streamId, (m) => ({ ...m, content: m.content + content }));
 
       // Streaming TTS: as the interviewer's reply streams, speak complete
       // sentences immediately instead of waiting for the whole message.
       if (!voiceEnabledRef.current) return;
-      const target = streamingTargetRef.current;
+      const target = streamsRef.current.get(streamId);
       if (!target) return;
       const job = jobsRef.current.find((j) => j.id === target.jobId);
       const thread = job?.chats.find((c) => c.id === target.chatId);
       if (!thread || !(thread.mode === "interviewer" || thread.title === "Mock Interview")) return;
       voiceTargetRef.current = { jobId: target.jobId, chatId: target.chatId };
 
-      voiceUtteranceTextRef.current += e.payload;
+      voiceUtteranceTextRef.current += content;
       if (voiceSkipRef.current) return;
       // Don't speak the end-of-interview feedback block.
       if (voiceUtteranceTextRef.current.includes(INTERVIEW_DONE_MARKER)) {
@@ -3015,7 +3425,7 @@ const App = () => {
         voiceSpeakBufferRef.current = "";
         return;
       }
-      voiceSpeakBufferRef.current += e.payload;
+      voiceSpeakBufferRef.current += content;
       // Flush each complete sentence (punctuation + trailing space/newline).
       const buf = voiceSpeakBufferRef.current;
       const re = /[^.!?\n]*[.!?\n]+(?:\s|$)/g;
@@ -3030,27 +3440,27 @@ const App = () => {
       if (sentences.length) {
         voiceSpeakBufferRef.current = buf.slice(lastIdx);
         setVoicePhase("speaking");
-        for (const s of sentences) invoke("voice_speak_chunk", { text: s }).catch(() => {});
+        for (const s of sentences) invoke("voice_speak_chunk", { text: s, speaker: voiceSpeakerRef.current }).catch(() => {});
       }
     });
 
-    register<string>("chat:log", (e) => {
-      appendToLast((m) => ({ ...m, logs: [...(m.logs ?? []), e.payload] }));
+    register<{ streamId: string; content: string }>("chat:log", (e) => {
+      appendToStream(e.payload.streamId, (m) => ({ ...m, logs: [...(m.logs ?? []), e.payload.content] }));
     });
 
-    register<Scorecard>("chat:scorecard", (e) => {
-      const target = streamingTargetRef.current;
+    register<{ streamId: string; content: Scorecard }>("chat:scorecard", (e) => {
+      const target = streamsRef.current.get(e.payload.streamId);
       if (!target) return;
-      updateJob(target.jobId, (j) => ({ ...j, scorecard: e.payload }));
+      updateJob(target.jobId, (j) => ({ ...j, scorecard: e.payload.content }));
     });
 
-    register<string>("chat:resume_docx", async (e) => {
-      const target = streamingTargetRef.current;
+    register<{ streamId: string; content: string }>("chat:resume_docx", async (e) => {
+      const target = streamsRef.current.get(e.payload.streamId);
       if (!target) return;
       try {
         const path = await invoke<string>("save_resume_docx", {
           jobId: target.jobId,
-          b64:   e.payload,
+          b64:   e.payload.content,
         });
         updateJob(target.jobId, (j) => ({ ...j, resumeDocxPath: path }));
       } catch (err) {
@@ -3058,11 +3468,11 @@ const App = () => {
       }
     });
 
-    register<string>("chat:tailored_resume", (e) => {
-      const target = streamingTargetRef.current;
+    register<{ streamId: string; content: string }>("chat:tailored_resume", (e) => {
+      const target = streamsRef.current.get(e.payload.streamId);
       if (!target) return;
-      pendingTailoredResumeRef.current = e.payload;
-      updateJob(target.jobId, (j) => ({ ...j, tailoredResume: e.payload }));
+      target.tailored = e.payload.content; // consumed by the Prep→Research chain on done
+      updateJob(target.jobId, (j) => ({ ...j, tailoredResume: e.payload.content }));
     });
 
     // ── Voice loop ─────────────────────────────────────────────────────────
@@ -3104,12 +3514,12 @@ const App = () => {
       console.error("voice error:", e.payload);
     });
 
-    register<string>("chat:done", () => {
-      const target = streamingTargetRef.current;
-      appendToLast((m) => ({ ...m, streaming: false }));
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      setIsLoading(false);
+    register<{ streamId: string }>("chat:done", (e) => {
+      const streamId = e.payload.streamId;
+      const target = streamsRef.current.get(streamId);
+      appendToStream(streamId, (m) => ({ ...m, streaming: false, streamId: undefined }));
+      const tailored = target?.tailored ?? "";
+      endStream(streamId);
 
       // Resolve the just-finished thread from `target` (state may lag).
       if (!target) return;
@@ -3140,7 +3550,7 @@ const App = () => {
           setVoicePhase("speaking");
           const tail = voiceSpeakBufferRef.current.trim();
           voiceSpeakBufferRef.current = "";
-          if (tail) invoke("voice_speak_chunk", { text: tail }).catch(() => {});
+          if (tail) invoke("voice_speak_chunk", { text: tail, speaker: voiceSpeakerRef.current }).catch(() => {});
           invoke("voice_speak_flush").catch(() => {});
         }
         return;
@@ -3149,21 +3559,18 @@ const App = () => {
       // Chain: Application Prep → Company Research, using the tailored resume
       // as candidate context.
       if (thread.title !== "Application Prep") return;
-      const tailored = pendingTailoredResumeRef.current ?? job.tailoredResume ?? "";
-      pendingTailoredResumeRef.current = null;
-      startCompanyResearchForRef.current?.(job, tailored);
+      startCompanyResearchForRef.current?.(job, tailored || job.tailoredResume || "");
     });
 
-    register<string>("chat:error", (e) => {
-      appendToLast((m) => ({
+    register<{ streamId: string; content: string }>("chat:error", (e) => {
+      const { streamId, content } = e.payload;
+      appendToStream(streamId, (m) => ({
         ...m,
         streaming: false,
-        content: m.content || `**Error:** ${e.payload}`,
+        streamId: undefined,
+        content: m.content || `**Error:** ${content}`,
       }));
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      pendingTailoredResumeRef.current = null;
-      setIsLoading(false);
+      endStream(streamId);
     });
 
     return () => {
@@ -3185,6 +3592,41 @@ const App = () => {
       .finally(() => setCredentialsLoaded(true));
   }, []);
 
+  // Persist the voice-engine choice and push it to the Rust voice state. The
+  // command only mutates in-process state (no sidecar round-trip), so it's safe
+  // to call on mount before the backend is ready. Runs on mount + every toggle.
+  useEffect(() => {
+    try { localStorage.setItem("interprep.voxVoice", voxVoice ? "1" : "0"); } catch { /* ignore */ }
+    invoke("voice_set_engine", { engine: voxVoice ? "vibe-rt" : "piper" }).catch(() => {});
+    // VibeVoice has a brutal cold start (~2.5 min: model load + first-synth JIT
+    // on a laptop GPU). Kick the warmup the moment the user enables it so that
+    // cost lands here, not on the first interview question. Idempotent server-side.
+    if (voxVoice) invoke("voice_warm", { engine: "vibe-rt" }).catch(() => {});
+  }, [voxVoice]);
+
+  // Persist the panel size so it survives restarts.
+  useEffect(() => {
+    try { localStorage.setItem("interprep.panelSize", String(panelSize)); } catch { /* ignore */ }
+  }, [panelSize]);
+
+  // Fetch voice capability once the sidecar is up so the Settings → Voice tab
+  // knows whether VibeVoice is actually installed BEFORE the user toggles it.
+  // (Without this, voiceStatus is null until the user first enters voice mode,
+  // so the toggle is enabled and the "not installed" hint hidden.) `voice_status`
+  // only checks for the deps — it doesn't load any model — so it's cheap.
+  // Best-effort: retry until the sidecar answers.
+  useEffect(() => {
+    let cancelled = false;
+    let tries = 0;
+    const fetchStatus = () => {
+      invoke<{ available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string }>("voice_status")
+        .then((s) => { if (!cancelled) setVoiceStatus(s); })
+        .catch(() => { if (!cancelled && tries++ < 15) setTimeout(fetchStatus, 2000); });
+    };
+    fetchStatus();
+    return () => { cancelled = true; };
+  }, []);
+
   // Keep refs in sync so the one-shot SSE listeners read latest state.
   useEffect(() => { credentialsRef.current = credentials; }, [credentials]);
   useEffect(() => { jobsRef.current        = jobs; },        [jobs]);
@@ -3193,6 +3635,7 @@ const App = () => {
   // Load on mount, save on every mutation (cheap; the file is small).
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [resumesLoaded, setResumesLoaded] = useState(false);
+  useEffect(() => { resumesRef.current = resumes; }, [resumes]);
 
   useEffect(() => {
     invoke<Resume[]>("list_resumes")
@@ -3284,30 +3727,42 @@ const App = () => {
     ));
     // If the open thread was deleted, drop the selection so the empty state shows.
     if (selectedChatId === chatId) setSelectedChatId(null);
-    // If it was mid-stream, stop tracking it (incoming tokens have nowhere to land).
-    if (streamingTargetRef.current?.chatId === chatId) {
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      setIsLoading(false);
-    }
+    // Drop any streams feeding it — their incoming events have nowhere to land.
+    endStreamsForChat(chatId);
   };
 
   const onUpdateJob = (id: string, updater: (j: Job) => Job) => {
     setJobs((prev) => prev.map((j) => j.id === id ? updater(j) : j));
   };
 
-  const onSendMessage = (text: string, opts?: { hidden?: boolean }) => {
-    if (!selectedJobId) return;
+  const onSendMessage = (text: string, opts?: { hidden?: boolean; jobId?: string; chatId?: string }) => {
+    // A queued send carries its own target so it lands in the thread it was
+    // composed in; a normal send targets the current selection.
+    const sjid = opts?.jobId ?? selectedJobId;
+    if (!sjid) return;
     // New turn → reset streaming-TTS buffers for the upcoming AI reply.
     voiceSpeakBufferRef.current = "";
     voiceUtteranceTextRef.current = "";
     voiceSkipRef.current = false;
-    let chatId = selectedChatId;
+    // Pick the panelist voice for the upcoming interviewer reply. With VibeVoice
+    // on and a panel of 2+, round-robin across the first `panelSize` presets so
+    // each question sounds like a different interviewer. Otherwise use the
+    // single default voice (empty string → backend default).
+    {
+      const voices = voiceStatus?.voices ?? [];
+      const n = Math.max(1, Math.min(panelSize, voices.length || 1));
+      voiceSpeakerRef.current =
+        voxVoice && n > 1 && voices.length
+          ? voices[voiceTurnRef.current % n]
+          : (voxVoice ? (voiceStatus?.default_speaker ?? "") : "");
+      voiceTurnRef.current += 1;
+    }
+    let chatId = opts?.chatId ?? selectedChatId;
 
     if (!chatId) {
       chatId = `c-${Date.now()}`;
       const newChat: ChatThread = { id: chatId, title: text.slice(0, 30) + "...", preview: text, messages: [] };
-      setJobs((prev) => prev.map((j) => j.id === selectedJobId ? { ...j, chats: [...j.chats, newChat] } : j));
+      setJobs((prev) => prev.map((j) => j.id === sjid ? { ...j, chats: [...j.chats, newChat] } : j));
       setSelectedChatId(chatId);
     }
     const targetChatId = chatId;
@@ -3315,10 +3770,11 @@ const App = () => {
     // Append the user's message AND an empty AI bubble that the SSE stream
     // will fill in tokens-first. Keeping them in one setJobs call avoids a
     // wasted re-render between the two appends.
+    const streamId = newStreamId();
     const userMsg: ChatMsg = { role: "user", content: text, ...(opts?.hidden ? { hidden: true } : {}) };
-    const aiPlaceholder: ChatMsg = { role: "ai", content: "", streaming: true, logs: [] };
+    const aiPlaceholder: ChatMsg = { role: "ai", content: "", streaming: true, logs: [], streamId };
     setJobs((prev) => prev.map((j) =>
-      j.id !== selectedJobId
+      j.id !== sjid
         ? j
         : {
             ...j,
@@ -3332,7 +3788,7 @@ const App = () => {
 
     // Context for the backend system prompt. `job` is the pre-append snapshot
     // (history below must exclude the message we just added).
-    const job = jobs.find((j) => j.id === selectedJobId);
+    const job = jobs.find((j) => j.id === sjid);
     const targetThread = job?.chats.find((c) => c.id === targetChatId);
     const isInterview =
       (targetThread?.mode ?? (targetThread?.title === "Mock Interview" ? "interviewer" : "coach"))
@@ -3376,9 +3832,7 @@ const App = () => {
       }
     }
 
-    streamingTargetRef.current = { jobId: selectedJobId, chatId: targetChatId };
-    setStreamingChatId(targetChatId);
-    setIsLoading(true);
+    beginStream(streamId, sjid, targetChatId);
 
     // Chronological history from completed turns BEFORE the message above.
     const history: [string, string][] = targetThread
@@ -3396,10 +3850,11 @@ const App = () => {
       mode,
       apiKey: credentials.geminiApiKey,
       documents: ragDocs,
+      streamId,
     }).catch((e) => {
       const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
-        j.id !== selectedJobId
+        j.id !== sjid
           ? j
           : {
               ...j,
@@ -3408,18 +3863,16 @@ const App = () => {
                   ? c
                   : {
                       ...c,
-                      messages: c.messages.map((m, i) =>
-                        i === c.messages.length - 1
-                          ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+                      messages: c.messages.map((m) =>
+                        m.streamId === streamId
+                          ? { ...m, streaming: false, streamId: undefined, content: `**Error:** ${errMsg}` }
                           : m,
                       ),
                     },
               ),
             },
       ));
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      setIsLoading(false);
+      endStream(streamId);
     });
   };
 
@@ -3445,7 +3898,7 @@ const App = () => {
   /// truncation first so onSendMessage reads the trimmed thread, not stale
   /// state that would duplicate the turn.
   const onRegenerate = () => {
-    if (!selectedJobId || !selectedChatId || isLoading) return;
+    if (!selectedJobId || !selectedChatId || streamingChatIds.includes(selectedChatId)) return;
     const job = jobs.find((j) => j.id === selectedJobId);
     const chat = job?.chats.find((c) => c.id === selectedChatId);
     if (!chat) return;
@@ -3479,6 +3932,7 @@ const App = () => {
     // immediately. Playwright cold-start + supervisor's first hop can take
     // ~30s before the backend emits its own stage banner; an empty bubble
     // during that window reads as "broken" even though it's working.
+    const streamId = newStreamId();
     const placeholderThread: ChatThread = {
       id: researchThreadId,
       title: "Company Research",
@@ -3486,6 +3940,7 @@ const App = () => {
         role: "ai",
         content: "",
         streaming: true,
+        streamId,
         logs: ["**Spinning up company research** — warming Playwright + supervisor…"],
       }],
     };
@@ -3498,9 +3953,7 @@ const App = () => {
       setJobs((prev) => prev.map((j) =>
         j.id !== job.id ? j : { ...j, chats: [...j.chats, placeholderThread] },
       ));
-      streamingTargetRef.current = { jobId: job.id, chatId: researchThreadId };
-      setStreamingChatId(researchThreadId);
-      setIsLoading(true);
+      beginStream(streamId, job.id, researchThreadId);
     });
 
     // Don't auto-switch view — user is reading the cover letter + scorecard
@@ -3518,6 +3971,7 @@ const App = () => {
       glassdoorPassword: creds.glassdoorPassword,
       indeedEmail:       creds.indeedEmail,
       indeedPassword:    creds.indeedPassword,
+      streamId,
     }).catch((e) => {
       const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
@@ -3525,17 +3979,15 @@ const App = () => {
           ...j,
           chats: j.chats.map((c) => c.id !== researchThreadId ? c : {
             ...c,
-            messages: c.messages.map((m, i) =>
-              i === c.messages.length - 1
-                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+            messages: c.messages.map((m) =>
+              m.streamId === streamId
+                ? { ...m, streaming: false, streamId: undefined, content: `**Error:** ${errMsg}` }
                 : m,
             ),
           }),
         },
       ));
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      setIsLoading(false);
+      endStream(streamId);
     });
   };
 
@@ -3551,7 +4003,7 @@ const App = () => {
   const enableVoice = () => {
     setVoiceEnabled(true);
     voiceEnabledRef.current = true;
-    invoke<{ available: boolean; device?: string; detail?: string }>("voice_status")
+    invoke<{ available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string }>("voice_status")
       .then((s) => {
         setVoiceStatus(s);
         if (!s.available) {
@@ -3559,6 +4011,10 @@ const App = () => {
           voiceEnabledRef.current = false;
           setVoiceOverlayOpen(false);
           alert(`Voice unavailable: ${s.detail ?? "voice stack not installed"}\n\nRun: backend\\setup.ps1 -Voice`);
+        } else if (voxVoice) {
+          // Warm VibeVoice now (idempotent) so its cold start doesn't stall the
+          // first question if the user jumped straight into the interview.
+          invoke("voice_warm", { engine: "vibe-rt", speaker: s.default_speaker ?? "" }).catch(() => {});
         }
       })
       .catch((e) => {
@@ -3602,21 +4058,20 @@ const App = () => {
       return;
     }
     const koThreadId = `c-knockout-${job.id}-${Date.now()}`;
+    const streamId = newStreamId();
     setJobs((prev) => prev.map((j) =>
       j.id !== job.id ? j : {
         ...j,
         chats: [...j.chats, {
           id: koThreadId,
           title: "Knockout Screen",
-          messages: [{ role: "ai", content: "", streaming: true, logs: [] }],
+          messages: [{ role: "ai", content: "", streaming: true, logs: [], streamId }],
         }],
       },
     ));
     setSelectedChatId(koThreadId);
 
-    streamingTargetRef.current = { jobId: job.id, chatId: koThreadId };
-    setStreamingChatId(koThreadId);
-    setIsLoading(true);
+    beginStream(streamId, job.id, koThreadId);
     invoke("start_knockout_screen_stream", {
       company:        job.company,
       role:           job.role,
@@ -3624,6 +4079,7 @@ const App = () => {
       jobDescription: job.jobDescription ?? "",
       tailoredResume: resume,
       apiKey:         credentialsRef.current.geminiApiKey,
+      streamId,
     }).catch((e) => {
       const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
@@ -3631,17 +4087,15 @@ const App = () => {
           ...j,
           chats: j.chats.map((c) => c.id !== koThreadId ? c : {
             ...c,
-            messages: c.messages.map((m, i) =>
-              i === c.messages.length - 1
-                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+            messages: c.messages.map((m) =>
+              m.streamId === streamId
+                ? { ...m, streaming: false, streamId: undefined, content: `**Error:** ${errMsg}` }
                 : m,
             ),
           }),
         },
       ));
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      setIsLoading(false);
+      endStream(streamId);
     });
   };
 
@@ -3655,6 +4109,7 @@ const App = () => {
     const id = `job-${Date.now()}`;
     const palette = ["#6366F1", "#10B981", "#F59E0B", "#EC4899", "#8B5CF6"];
     const prepThreadId = `c-prep-${id}`;
+    const streamId = newStreamId();
     const jd = form.jobDescription.trim();
     const newJob: Job = {
       id,
@@ -3682,7 +4137,7 @@ const App = () => {
         {
           id: prepThreadId,
           title: "Application Prep",
-          messages: [{ role: "ai", content: "", streaming: true, logs: [] }],
+          messages: [{ role: "ai", content: "", streaming: true, logs: [], streamId }],
         },
       ],
       jobDescription: jd || undefined,
@@ -3701,9 +4156,7 @@ const App = () => {
       docx_b64: r.docx_b64 ?? null,
     }));
 
-    streamingTargetRef.current = { jobId: id, chatId: prepThreadId };
-    setStreamingChatId(prepThreadId);
-    setIsLoading(true);
+    beginStream(streamId, id, prepThreadId);
     invoke("start_application_tailor_stream", {
       company:        newJob.company,
       role:           newJob.role,
@@ -3711,6 +4164,7 @@ const App = () => {
       jobDescription: jd,
       masterResumes,
       apiKey:         credentials.geminiApiKey,
+      streamId,
     }).catch((e) => {
       const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
@@ -3718,17 +4172,15 @@ const App = () => {
           ...j,
           chats: j.chats.map((c) => c.id !== prepThreadId ? c : {
             ...c,
-            messages: c.messages.map((m, i) =>
-              i === c.messages.length - 1
-                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+            messages: c.messages.map((m) =>
+              m.streamId === streamId
+                ? { ...m, streaming: false, streamId: undefined, content: `**Error:** ${errMsg}` }
                 : m,
             ),
           }),
         },
       ));
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      setIsLoading(false);
+      endStream(streamId);
     });
   };
 
@@ -3743,6 +4195,7 @@ const App = () => {
       return;
     }
     const prepThreadId = `c-prep-${job.id}-${Date.now()}`;
+    const streamId = newStreamId();
     flushSync(() => {
       setJobs((prev) => prev.map((j) =>
         j.id !== job.id ? j : {
@@ -3750,15 +4203,13 @@ const App = () => {
           chats: [...j.chats, {
             id: prepThreadId,
             title: "Application Prep",
-            messages: [{ role: "ai", content: "", streaming: true, logs: [] }],
+            messages: [{ role: "ai", content: "", streaming: true, logs: [], streamId }],
           }],
         },
       ));
       setSelectedJobId(job.id);
       setSelectedChatId(prepThreadId);
-      streamingTargetRef.current = { jobId: job.id, chatId: prepThreadId };
-      setStreamingChatId(prepThreadId);
-      setIsLoading(true);
+      beginStream(streamId, job.id, prepThreadId);
     });
 
     const masterResumes = resumes.map((r) => ({
@@ -3773,6 +4224,7 @@ const App = () => {
       jobDescription: job.jobDescription ?? "",
       masterResumes,
       apiKey:         credentialsRef.current.geminiApiKey,
+      streamId,
     }).catch((e) => {
       const errMsg = String(e);
       setJobs((prev) => prev.map((j) =>
@@ -3780,19 +4232,18 @@ const App = () => {
           ...j,
           chats: j.chats.map((c) => c.id !== prepThreadId ? c : {
             ...c,
-            messages: c.messages.map((m, i) =>
-              i === c.messages.length - 1
-                ? { ...m, streaming: false, content: `**Error:** ${errMsg}` }
+            messages: c.messages.map((m) =>
+              m.streamId === streamId
+                ? { ...m, streaming: false, streamId: undefined, content: `**Error:** ${errMsg}` }
                 : m,
             ),
           }),
         },
       ));
-      streamingTargetRef.current = null;
-      setStreamingChatId(null);
-      setIsLoading(false);
+      endStream(streamId);
     });
   };
+  startApplicationPrepRef.current = startApplicationPrep;
 
   /// Step launcher: start a Mock Interview. Creates an empty "Mock Interview"
   /// thread and selects it; the interviewer persona kicks in on the first
@@ -3877,8 +4328,7 @@ const App = () => {
                   chat={selectedChat}
                   job={selectedJob}
                   onSendMessage={onSendMessage}
-                  isLoading={isLoading}
-                  streamingChatId={streamingChatId}
+                  streamingChatIds={streamingChatIds}
                   onOpenResumeDocx={(path) => {
                     invoke("open_path", { path }).catch((e) =>
                       console.error("open_path failed:", e),
@@ -3894,7 +4344,20 @@ const App = () => {
                   voiceStatus={voiceStatus}
                   onOpenVoice={onOpenVoice}
                 />
-                <InputComposer onSend={onSendMessage} disabled={isLoading} />
+                <InputComposer
+                  value={draftsByChat[selectedChatId ?? ""] ?? ""}
+                  onChange={(v) => setDraftsByChat((d) => ({ ...d, [selectedChatId ?? ""]: v }))}
+                  onSend={(t) => { onSendMessage(t); setDraftsByChat((d) => ({ ...d, [selectedChatId ?? ""]: "" })); }}
+                  disabled={false}
+                  hint={(() => {
+                    // Each send streams concurrently, so you can keep chatting
+                    // here or in any other thread while a reply generates.
+                    const key = selectedChatId ?? "";
+                    if (streamingChatIds.includes(key)) return "Generating a reply… you can send again or switch chats.";
+                    if (streamingChatIds.length > 0) return `${streamingChatIds.length} other chat${streamingChatIds.length > 1 ? "s" : ""} generating — send here anytime.`;
+                    return undefined;
+                  })()}
+                />
               </>
             ) : (
               <EmptyState onNewJob={() => setShowNewJobModal(true)} />
@@ -3929,13 +4392,21 @@ const App = () => {
           onCredentialsChange={setCredentials}
           resumes={resumes}
           onResumesChange={setResumes}
+          voxVoice={voxVoice}
+          onVoxVoiceChange={setVoxVoice}
+          panelSize={panelSize}
+          onPanelSizeChange={setPanelSize}
+          voiceStatus={voiceStatus}
           onClose={() => {
             setShowSettings(false);
             // Flush credentials to the OS keychain. Don't block close on it.
             if (credentialsLoaded) {
-              invoke("save_credentials", { credentials }).catch((e) =>
-                console.error("save_credentials failed:", e),
-              );
+              invoke("save_credentials", { credentials })
+                // Push the (possibly changed) Gemini key to the running sidecar
+                // so the browser-extension autofill keeps working without an app
+                // restart. Best-effort — the backend may not be up yet.
+                .then(() => invoke("reseed_backend_key").catch(() => {}))
+                .catch((e) => console.error("save_credentials failed:", e));
             }
           }}
         />

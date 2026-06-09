@@ -27,6 +27,7 @@ anyhow = "1.0"
 base64 = "0.22"
 dirs = "5"
 opener = "0.7"
+getrandom = "0.2"          # OS CSPRNG for the bridge pairing token
 
 [profile.release]
 opt-level = "s"
