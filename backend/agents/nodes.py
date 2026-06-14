@@ -1,19 +1,17 @@
 from langchain_core.messages import HumanMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+
+import llm_provider as llm_factory
+from models import LLMConfig
 
 from .state import ResearchState
 
 
-def make_llm(api_key: str, streaming: bool = False) -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
-        google_api_key=api_key,
-        streaming=streaming,
-    )
+def make_llm(cfg: LLMConfig):
+    return llm_factory.make_chat_model(cfg, tier="fast")
 
 
-async def extract_requirements(state: ResearchState, api_key: str) -> ResearchState:
-    llm = make_llm(api_key)
+async def extract_requirements(state: ResearchState, cfg: LLMConfig) -> ResearchState:
+    llm = make_llm(cfg)
     prompt = f"""Extract the key requirements from this job posting. Format your response as:
 
 **Must-Have Skills:** list the hard requirements
@@ -31,8 +29,8 @@ Job Description:
     return {**state, "requirements": response.content}
 
 
-async def generate_questions(state: ResearchState, api_key: str) -> ResearchState:
-    llm = make_llm(api_key)
+async def generate_questions(state: ResearchState, cfg: LLMConfig) -> ResearchState:
+    llm = make_llm(cfg)
     prompt = f"""Based on these job requirements, generate 8 likely interview questions:
 - 4 behavioral questions (expect STAR format answers)
 - 4 technical/role-specific questions
@@ -50,8 +48,8 @@ Number each question. Be specific to this role, not generic."""
     return {**state, "questions": questions or [response.content]}
 
 
-async def create_prep_tips(state: ResearchState, api_key: str) -> ResearchState:
-    llm = make_llm(api_key)
+async def create_prep_tips(state: ResearchState, cfg: LLMConfig) -> ResearchState:
+    llm = make_llm(cfg)
     questions_text = "\n".join(state.get("questions", []))
     prompt = f"""Create a targeted preparation strategy for this interview:
 

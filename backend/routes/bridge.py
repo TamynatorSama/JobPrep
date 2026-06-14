@@ -1,6 +1,6 @@
 """Bridge auth + config endpoints for the browser extension.
 
-  POST /config/seed   {api_key}        -> refresh the in-memory Gemini key
+  POST /config/seed   {llm: {...}}     -> refresh the in-memory LLM config
   GET  /config/ping                    -> connectivity + auth check for the popup
 
 Both require the shared secret in the ``X-InterPrep-Token`` header. The token is
@@ -29,10 +29,12 @@ async def require_token(x_interprep_token: str = Header(default="")) -> None:
 
 @router.post("/seed")
 async def seed(req: SeedConfigRequest, _: None = Depends(require_token)):
-    runtime_config.set_api_key(req.api_key)
+    runtime_config.set_llm_config(req.llm)
     return {"ok": True}
 
 
 @router.get("/ping")
 async def ping(_: None = Depends(require_token)):
-    return {"ok": True, "has_key": bool(runtime_config.get_api_key())}
+    import llm_provider as llm_factory
+    cfg = runtime_config.get_llm_config()
+    return {"ok": True, "has_key": llm_factory.missing_key_error(cfg) is None}

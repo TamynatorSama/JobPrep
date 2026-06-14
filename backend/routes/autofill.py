@@ -6,25 +6,24 @@
 
 Answer resolution order per field:
   1. Answer bank (qa_memory.json)  — free + instant, set by the user previously.
-  2. Gemini                        — one JSON call for everything not in the bank.
+  2. The configured LLM            — one JSON call for everything not in the bank.
   3. needs_user                    — subjective / no resume evidence / no API key.
 
-All endpoints are token-guarded (see routes/bridge.py). The Gemini key is the
-in-memory one seeded by the Rust shell — the extension never sends it.
+All endpoints are token-guarded (see routes/bridge.py). The LLM config (provider
+toggle + keys) is the in-memory one seeded by the Rust shell — the extension
+never sends it.
 """
 from __future__ import annotations
 
 import json
 
 from fastapi import APIRouter, Depends
-from google import genai
 
+import llm_provider as llm_factory
 import runtime_config
 import store_reader
 from models import AnswerFieldsRequest, FieldSpec, RememberRequest
 from routes.bridge import require_token
-# Reuse the resilient model-call + lenient-JSON-parse helpers from the tailor.
-from routes.application import _generate_json, _loads_lenient, _response_text
 
 router = APIRouter(dependencies=[Depends(require_token)])
 
@@ -129,13 +128,14 @@ async def answer_fields(req: AnswerFieldsRequest):
         else:
             to_model.append(f)
 
-    # ── Gemini for the rest ──────────────────────────────────────────────────
-    api_key = runtime_config.get_api_key()
+    # ── The configured LLM for the rest ──────────────────────────────────────
+    cfg = runtime_config.get_llm_config()
+    key_err = llm_factory.missing_key_error(cfg)
     have_context = bool(evidence or research)
-    if to_model and api_key and have_context:
+    if to_model and not key_err and have_context:
         try:
             model_answers = await _ask_model(
-                api_key, company, role, location, jd, evidence, research, to_model
+                cfg, company, role, location, jd, evidence, research, to_model
             )
             for f in to_model:
                 answers[f.key] = model_answers.get(f.key, _unanswered(f, "model returned no answer"))
@@ -146,7 +146,7 @@ async def answer_fields(req: AnswerFieldsRequest):
     else:
         reason = (
             "no resume/research for this job" if not have_context
-            else "Gemini key not set — open InterPrep Settings" if not api_key
+            else "AI provider not configured — open InterPrep Settings" if key_err
             else "answer manually"
         )
         for f in to_model:
@@ -179,7 +179,7 @@ def _field_line(f: FieldSpec) -> str:
     return f'- key="{f.key}" type={f.type} label="{f.label}"{opts}'
 
 
-async def _ask_model(api_key, company, role, location, jd, evidence, research, fields: list[FieldSpec]) -> dict:
+async def _ask_model(cfg, company, role, location, jd, evidence, research, fields: list[FieldSpec]) -> dict:
     loc = f"\nLocation: {location}" if location else ""
     fields_block = "\n".join(_field_line(f) for f in fields)
     research_block = (
@@ -195,9 +195,8 @@ async def _ask_model(api_key, company, role, location, jd, evidence, research, f
         + research_block
         + f"=== FIELDS TO ANSWER ({len(fields)}) ===\n{fields_block}\n"
     )
-    client = genai.Client(api_key=api_key)
-    resp, _model = await _generate_json(client, contents, temperature=0.2)
-    parsed = _loads_lenient_array(_response_text(resp))
+    raw, _model = await llm_factory.generate_raw(cfg, contents, tier="smart", temperature=0.2)
+    parsed = _loads_lenient_array(raw)
     out: dict[str, dict] = {}
     valid_keys = {f.key for f in fields}
     for item in parsed:
@@ -228,7 +227,7 @@ def _loads_lenient_array(text: str) -> list:
     start = t.find("[")
     if start == -1:
         # Some models wrap the array in {"answers": [...]}; fall back to that.
-        obj = _loads_lenient(text)
+        obj = llm_factory.loads_lenient(text)
         if isinstance(obj, dict):
             for v in obj.values():
                 if isinstance(v, list):

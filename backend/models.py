@@ -8,6 +8,19 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class LLMConfig(BaseModel):
+    """Which LLM powers a request, plus the keys for every provider the user
+    has configured. The Rust shell builds this from Windows Credential Manager
+    and attaches it to every request; `provider` is the Settings toggle.
+    Spare keys ride along so company research can use them as fallback lanes
+    and RAG can pick an embeddings-capable provider."""
+    provider: str = "gemini"      # gemini | openai | anthropic
+    model: str = ""               # optional model override for the selected provider
+    gemini_api_key: str = ""
+    openai_api_key: str = ""
+    anthropic_api_key: str = ""
+
+
 class RagDoc(BaseModel):
     """One retrievable document from a job's corpus. `source` is a short label
     (e.g. "resume", "company_research", "chat: Mock Interview") surfaced to the
@@ -19,7 +32,7 @@ class RagDoc(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     job_context: Optional[str] = ""
-    api_key: Optional[str] = ""
+    llm: LLMConfig = LLMConfig()
     # Prior conversation turns, oldest first. Empty for the first message.
     history: List[ChatMessage] = []
     # "coach" (default, friendly assistant) or "interviewer" (in-character live interview).
@@ -34,7 +47,7 @@ class ResearchRequest(BaseModel):
     job_description: str
     company: str
     role: str
-    api_key: Optional[str] = ""
+    llm: LLMConfig = LLMConfig()
 
 
 class CompanyResearchRequest(BaseModel):
@@ -43,11 +56,7 @@ class CompanyResearchRequest(BaseModel):
     location: Optional[str] = ""          # narrows site searches to the right office
     job_description: Optional[str] = ""   # used by compose node for role-specific advice
     tailored_resume: Optional[str] = ""   # output of the application-prep step
-    api_key: Optional[str] = ""
-    glassdoor_email: Optional[str] = ""
-    glassdoor_password: Optional[str] = ""
-    indeed_email: Optional[str] = ""
-    indeed_password: Optional[str] = ""
+    llm: LLMConfig = LLMConfig()
 
 
 class MasterResume(BaseModel):
@@ -70,7 +79,7 @@ class ApplicationRequest(BaseModel):
     location: Optional[str] = ""
     job_description: str
     master_resumes: List[MasterResume]
-    api_key: str
+    llm: LLMConfig = LLMConfig()
 
 
 class KnockoutRequest(BaseModel):
@@ -85,15 +94,17 @@ class KnockoutRequest(BaseModel):
     location: Optional[str] = ""
     job_description: str
     tailored_resume: str
-    api_key: str
+    llm: LLMConfig = LLMConfig()
 
 
 # ── Browser-extension bridge ────────────────────────────────────────────────
 
 class SeedConfigRequest(BaseModel):
-    """Refresh the in-memory Gemini key. Token-guarded; called by the Rust
-    shell on startup and whenever the user edits the key in Settings."""
-    api_key: str
+    """Refresh the in-memory LLM config (provider toggle + all keys).
+    Token-guarded; called by the Rust shell on startup and whenever the user
+    saves Settings, so the browser-extension endpoints pick up changes without
+    an app restart."""
+    llm: LLMConfig = LLMConfig()
 
 
 class FieldSpec(BaseModel):

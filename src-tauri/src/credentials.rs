@@ -13,36 +13,69 @@ use serde::{Deserialize, Serialize};
 
 const SERVICE: &str = "InterPrep";
 
+/// Retired keyring entries, deleted on every save so they don't linger in the
+/// OS keychain after the upgrade. Glassdoor/Indeed: pre-multi-LLM browser-
+/// scraping logins. Groq/Ollama: dropped when the provider set was narrowed
+/// back to Gemini/OpenAI/Anthropic.
+const LEGACY_FIELDS: &[&str] = &[
+    "glassdoor_email",
+    "glassdoor_password",
+    "indeed_email",
+    "indeed_password",
+    "groq_api_key",
+    "ollama_base_url",
+    "ollama_model",
+];
+
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Credentials {
-    pub gemini_api_key:     String,
-    pub glassdoor_email:    String,
-    pub glassdoor_password: String,
-    pub indeed_email:       String,
-    pub indeed_password:    String,
+    /// Which provider powers LLM calls: "gemini" | "openai" | "anthropic".
+    /// Empty means gemini (back-compat default).
+    pub llm_provider:      String,
+    pub gemini_api_key:    String,
+    pub openai_api_key:    String,
+    pub anthropic_api_key: String,
 }
 
 impl Credentials {
     pub fn load() -> Self {
         Self {
-            gemini_api_key:     get("gemini_api_key"),
-            glassdoor_email:    get("glassdoor_email"),
-            glassdoor_password: get("glassdoor_password"),
-            indeed_email:       get("indeed_email"),
-            indeed_password:    get("indeed_password"),
+            llm_provider:      get("llm_provider"),
+            gemini_api_key:    get("gemini_api_key"),
+            openai_api_key:    get("openai_api_key"),
+            anthropic_api_key: get("anthropic_api_key"),
         }
     }
 
     /// Writes every field. Empty fields delete the corresponding keyring
     /// entry so clearing a field in the UI really removes it from the OS.
     pub fn save(&self) -> Result<(), String> {
-        set("gemini_api_key",     &self.gemini_api_key)?;
-        set("glassdoor_email",    &self.glassdoor_email)?;
-        set("glassdoor_password", &self.glassdoor_password)?;
-        set("indeed_email",       &self.indeed_email)?;
-        set("indeed_password",    &self.indeed_password)?;
+        set("llm_provider",      &self.llm_provider)?;
+        set("gemini_api_key",    &self.gemini_api_key)?;
+        set("openai_api_key",    &self.openai_api_key)?;
+        set("anthropic_api_key", &self.anthropic_api_key)?;
+        // Best-effort cleanup of retired entries.
+        for field in LEGACY_FIELDS {
+            let _ = set(field, "");
+        }
         Ok(())
+    }
+
+    /// The `llm` payload attached to every backend request (snake_case to
+    /// match the Python `LLMConfig` pydantic model).
+    pub fn llm_json(&self) -> serde_json::Value {
+        let provider = if self.llm_provider.trim().is_empty() {
+            "gemini"
+        } else {
+            self.llm_provider.trim()
+        };
+        serde_json::json!({
+            "provider":          provider,
+            "gemini_api_key":    self.gemini_api_key,
+            "openai_api_key":    self.openai_api_key,
+            "anthropic_api_key": self.anthropic_api_key,
+        })
     }
 }
 

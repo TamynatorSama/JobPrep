@@ -62,6 +62,8 @@ fn emit_ev(app: &AppHandle, event: &str, stream_id: &str, content: Value) -> tau
 
 /// Sends a chat message and forwards the resulting SSE stream to the
 /// frontend. Runs on its own thread so the Tauri command returns instantly.
+/// `llm` is the provider config (Settings toggle + per-provider keys) built
+/// by `Credentials::llm_json`.
 #[allow(clippy::too_many_arguments)]
 pub fn stream_chat(
     app: AppHandle,
@@ -70,7 +72,7 @@ pub fn stream_chat(
     job_context: String,
     history: Vec<(String, String)>,
     mode: String,
-    api_key: String,
+    llm: Value,
     documents: Vec<RagDocPayload>,
     stream_id: String,
 ) {
@@ -88,7 +90,7 @@ pub fn stream_chat(
         "job_context": job_context,
         "history":     history_json,
         "mode":        mode,
-        "api_key":     api_key,
+        "llm":         llm,
         "documents":   documents_json,
     });
     spawn_stream(app, url, body, stream_id);
@@ -101,7 +103,7 @@ pub fn stream_research(
     company: String,
     role: String,
     jd: String,
-    api_key: String,
+    llm: Value,
     stream_id: String,
 ) {
     let url = format!("{base_url}/research/stream");
@@ -109,13 +111,14 @@ pub fn stream_research(
         "company":         company,
         "role":            role,
         "job_description": jd,
-        "api_key":         api_key,
+        "llm":             llm,
     });
     spawn_stream(app, url, body, stream_id);
 }
 
-/// Full company research — runs the scraping agents that need the user's
-/// Glassdoor / Indeed logins to bypass paywalls.
+/// Full company research — the embedded research_scraper engine. The `llm`
+/// config carries every provider key; the backend maps the selected provider
+/// onto the engine's primary lane and the spares onto fallback lanes.
 #[allow(clippy::too_many_arguments)]
 pub fn stream_company_research(
     app: AppHandle,
@@ -125,25 +128,17 @@ pub fn stream_company_research(
     location: String,
     job_description: String,
     tailored_resume: String,
-    api_key: String,
-    glassdoor_email: String,
-    glassdoor_password: String,
-    indeed_email: String,
-    indeed_password: String,
+    llm: Value,
     stream_id: String,
 ) {
     let url = format!("{base_url}/company-research/stream");
     let body = serde_json::json!({
-        "company":            company,
-        "role":               role,
-        "location":           location,
-        "job_description":    job_description,
-        "tailored_resume":    tailored_resume,
-        "api_key":            api_key,
-        "glassdoor_email":    glassdoor_email,
-        "glassdoor_password": glassdoor_password,
-        "indeed_email":       indeed_email,
-        "indeed_password":    indeed_password,
+        "company":         company,
+        "role":            role,
+        "location":        location,
+        "job_description": job_description,
+        "tailored_resume": tailored_resume,
+        "llm":             llm,
     });
     spawn_stream(app, url, body, stream_id);
 }
@@ -161,7 +156,7 @@ pub fn stream_application_tailor(
     location: String,
     job_description: String,
     master_resumes: Vec<MasterResumePayload>,
-    api_key: String,
+    llm: Value,
     stream_id: String,
 ) {
     let url = format!("{base_url}/application/tailor-resume");
@@ -181,7 +176,7 @@ pub fn stream_application_tailor(
         "location":        location,
         "job_description": job_description,
         "master_resumes":  resumes_json,
-        "api_key":         api_key,
+        "llm":             llm,
     });
     spawn_stream(app, url, body, stream_id);
 }
@@ -196,7 +191,7 @@ pub fn stream_knockout_screen(
     location: String,
     job_description: String,
     tailored_resume: String,
-    api_key: String,
+    llm: Value,
     stream_id: String,
 ) {
     let url = format!("{base_url}/application/knockout-screen");
@@ -206,22 +201,23 @@ pub fn stream_knockout_screen(
         "location":        location,
         "job_description": job_description,
         "tailored_resume": tailored_resume,
-        "api_key":         api_key,
+        "llm":             llm,
     });
     spawn_stream(app, url, body, stream_id);
 }
 
 // ─── Extension bridge ────────────────────────────────────────────────────────
 
-/// POST /config/seed — refresh the backend's in-memory Gemini key. Sends the
-/// shared secret so the token-guarded endpoint accepts it. Called on startup and
-/// whenever the user changes the key in Settings (no app restart needed).
-pub fn seed_config(base_url: &str, token: &str, api_key: &str) -> Result<(), String> {
+/// POST /config/seed — refresh the backend's in-memory LLM config (provider
+/// toggle + every provider key). Sends the shared secret so the token-guarded
+/// endpoint accepts it. Called on startup and whenever the user saves
+/// Settings (no app restart needed).
+pub fn seed_config(base_url: &str, token: &str, llm: &Value) -> Result<(), String> {
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("{base_url}/config/seed"))
         .header("X-InterPrep-Token", token)
-        .json(&serde_json::json!({ "api_key": api_key }))
+        .json(&serde_json::json!({ "llm": llm }))
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .map_err(|e| e.to_string())?;

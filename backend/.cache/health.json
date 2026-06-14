@@ -1,0 +1,42 @@
+{
+  "github": {
+    "consecutive_failures": 0,
+    "last_ok": "2026-06-09T22:16:54",
+    "last_error": ""
+  },
+  "sec_edgar": {
+    "consecutive_failures": 0,
+    "last_ok": "2026-06-09T22:16:56",
+    "last_error": ""
+  },
+  "reddit": {
+    "consecutive_failures": 0,
+    "last_ok": "2026-06-09T22:16:56",
+    "last_error": ""
+  },
+  "levels": {
+    "consecutive_failures": 0,
+    "last_ok": "2026-06-09T22:17:37",
+    "last_error": ""
+  },
+  "glassdoor": {
+    "consecutive_failures": 0,
+    "last_ok": "2026-06-09T22:17:00",
+    "last_error": ""
+  },
+  "comparably": {
+    "consecutive_failures": 2,
+    "last_ok": "2026-06-09T22:17:03",
+    "last_error": "2026-06-09T22:17:05 "
+  },
+  "google": {
+    "consecutive_failures": 0,
+    "last_error": "",
+    "last_ok": "2026-06-09T22:17:19"
+  },
+  "web": {
+    "consecutive_failures": 0,
+    "last_ok": "2026-06-09T22:17:28",
+    "last_error": ""
+  }
+}

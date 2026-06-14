@@ -110,25 +110,24 @@ async def ack_timeline(req: InboxAckRequest):
 
 @router.post("/extract")
 async def extract(req: PageExtractRequest):
-    """Parse company/role/location/JD out of raw page text with Gemini, for pages
-    where the client-side heuristics (JSON-LD / DOM) come up short."""
-    key = runtime_config.get_api_key()
-    if not key:
-        raise HTTPException(status_code=400, detail="Gemini key not set — open InterPrep Settings")
+    """Parse company/role/location/JD out of raw page text with the configured
+    LLM, for pages where the client-side heuristics (JSON-LD / DOM) come up
+    short."""
+    import llm_provider as llm_factory
+
+    cfg = runtime_config.get_llm_config()
+    key_err = llm_factory.missing_key_error(cfg)
+    if key_err:
+        raise HTTPException(status_code=400, detail="AI provider not configured — open InterPrep Settings")
     if not req.page_text.strip():
         raise HTTPException(status_code=400, detail="no page text provided")
-
-    from google import genai
-    from routes.application import _generate_json, _loads_lenient, _response_text
 
     contents = (
         EXTRACT_PROMPT
         + f"\n\n=== URL ===\n{req.url}\n\n=== TITLE ===\n{req.title}\n\n=== PAGE TEXT ===\n{req.page_text[:30000]}"
     )
     try:
-        client = genai.Client(api_key=key)
-        resp, _model = await _generate_json(client, contents, temperature=0.1)
-        data = _loads_lenient(_response_text(resp))
+        data, _model = await llm_factory.generate_json(cfg, contents, tier="smart", temperature=0.1)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"extraction failed: {exc}")
 

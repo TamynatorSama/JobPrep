@@ -2,7 +2,7 @@
 Application-tailoring route.
 
 POST /application/tailor-resume — given a job (company, role, JD) and the user's
-master resumes, ask Gemini 2.5 Pro to:
+master resumes, ask the configured LLM (Settings provider toggle) to:
   1. pick the closest-matching master resume
   2. produce a tailored, ATS-friendly resume (returned as a .docx)
   3. produce a cover letter (streamed as tokens for the chat bubble)
@@ -24,13 +24,13 @@ import re
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
-from google import genai
-from google.genai import types as genai_types
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
+import llm_provider as llm_factory
+import model_router
 from models import ApplicationRequest, KnockoutRequest
 from routes.docx_editor import sections_to_text
 
@@ -167,8 +167,9 @@ Operational Guardrails:
 * Tone: Professional, authoritative, and tactical coach.
 """
 
-# Output schema the LLM must follow. Embedded into the user prompt because
-# google-genai's `response_schema` rejects long descriptions.
+# Output schema the LLM must follow. Embedded into the user prompt (rather
+# than a provider-specific response_schema) so it works identically across
+# every provider; the lenient parser in llm_provider.py handles fences/prose.
 OUTPUT_SHAPE = """\
 Return ONLY a single JSON object (no markdown fences, no leading prose) with \
 this exact shape:
@@ -236,8 +237,9 @@ IMPORTANT:
 @router.post("/tailor-resume")
 async def tailor_resume(req: ApplicationRequest):
     async def generate():
-        if not req.api_key:
-            yield _evt("error", "No Gemini API key set. Open Settings → API Keys.")
+        key_err = llm_factory.missing_key_error(req.llm)
+        if key_err:
+            yield _evt("error", key_err)
             return
         if not req.master_resumes:
             yield _evt("error", "No master resumes provided. Add one in Settings → Resume.")
@@ -251,46 +253,69 @@ async def tailor_resume(req: ApplicationRequest):
 
         prompt = _build_prompt(req)
 
-        try:
-            client = genai.Client(api_key=req.api_key)
+        # ── Orchestrator: pick the draft tier for THIS job. One cheap fast-tier
+        #    router call classifies difficulty; it falls back to "smart" on any
+        #    failure, so it can only save cost, never break the flow.
+        resume_blob = "\n\n".join(r.text for r in req.master_resumes)
+        plan = await model_router.route_resume(
+            req.llm,
+            company=req.company,
+            role=req.role,
+            jd=req.job_description,
+            resume_text=resume_blob,
+        )
+        if plan.routed:
+            yield _evt("stage", f"\n🧭 **Routing:** `{plan.draft_tier}` draft · complexity _{plan.complexity}_ — {plan.reason}\n\n")
+            await asyncio.sleep(0)
 
+        try:
             yield _evt("stage", "\n📝 **Drafting tailored resume + cover letter…**\n\n")
             await asyncio.sleep(0)
 
             # ── Pass 1: draft. Structured JSON — we don't token-stream this
             #    because mid-stream JSON is unparseable.
             try:
-                draft_resp, model_name = await _generate_json(client, prompt, temperature=0.4)
+                data, model_name = await llm_factory.generate_json(
+                    req.llm, prompt, tier=plan.draft_tier, temperature=0.4,
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                yield _evt("error", f"Model returned non-JSON output: {exc}")
+                return
             except Exception as exc:
                 yield _evt("error", f"Model call failed: {exc}")
                 return
             yield _evt("stage", f"\n🧠 **Model:** `{model_name}`\n\n")
             await asyncio.sleep(0)
 
-            try:
-                data = _loads_lenient(_response_text(draft_resp))
-            except (json.JSONDecodeError, ValueError) as exc:
-                yield _evt("error", f"Model returned non-JSON output: {exc}")
-                return
-
-            # ── Pass 2: self-critique + refine against the JD. Best-effort —
-            #    a failed or garbled refine falls back to the draft so we never
-            #    lose a usable result.
-            yield _evt("stage", "\n🔬 **Refining against the JD (closing keyword gaps + tightening bullets)…**\n\n")
-            await asyncio.sleep(0)
-            try:
-                refine_prompt = _build_refine_prompt(req, json.dumps(data, ensure_ascii=False))
-                refine_resp, _ = await _generate_json(client, refine_prompt, temperature=0.3)
-                refined = _loads_lenient(_response_text(refine_resp))
-                if isinstance(refined, dict) and refined.get("sections"):
-                    data = refined
-                    yield _evt("stage", "\n✅ **Refinement applied.**\n\n")
-                else:
-                    yield _evt("stage", "\n↩️ Refinement skipped (no sections in output) — kept the draft.\n\n")
-            except Exception as exc:
-                print(f"[application] refine pass failed: {exc!r}", flush=True)
-                yield _evt("stage", f"\n↩️ Refinement skipped ({type(exc).__name__}) — kept the draft.\n\n")
-            await asyncio.sleep(0)
+            # ── Pass 2: conditional self-critique + refine. The orchestrator
+            #    skips this entirely when the draft scorecard is already strong
+            #    (saving a whole call), escalates to "smart" when the draft is
+            #    weak, else runs it on the cheaper "mid" tier. Best-effort — a
+            #    failed/garbled refine falls back to the draft so we never lose a
+            #    usable result.
+            should_refine, refine_tier = model_router.refine_decision(
+                plan, data.get("scorecard"),
+            )
+            if not should_refine:
+                yield _evt("stage", "\n⏭️ **Draft already strong — skipping refine (saved a call).**\n\n")
+                await asyncio.sleep(0)
+            else:
+                yield _evt("stage", f"\n🔬 **Refining against the JD on `{refine_tier}` (closing keyword gaps + tightening bullets)…**\n\n")
+                await asyncio.sleep(0)
+                try:
+                    refine_prompt = _build_refine_prompt(req, json.dumps(data, ensure_ascii=False))
+                    refined, _ = await llm_factory.generate_json(
+                        req.llm, refine_prompt, tier=refine_tier, temperature=0.3,
+                    )
+                    if isinstance(refined, dict) and refined.get("sections"):
+                        data = refined
+                        yield _evt("stage", "\n✅ **Refinement applied.**\n\n")
+                    else:
+                        yield _evt("stage", "\n↩️ Refinement skipped (no sections in output) — kept the draft.\n\n")
+                except Exception as exc:
+                    print(f"[application] refine pass failed: {exc!r}", flush=True)
+                    yield _evt("stage", f"\n↩️ Refinement skipped ({type(exc).__name__}) — kept the draft.\n\n")
+                await asyncio.sleep(0)
 
             sections     = data.get("sections") or {}
             cover_letter = (data.get("cover_letter") or "").strip()
@@ -461,8 +486,9 @@ After the questions, output a final section:
 @router.post("/knockout-screen")
 async def knockout_screen(req: KnockoutRequest):
     async def generate():
-        if not req.api_key:
-            yield _evt("error", "No Gemini API key set. Open Settings → API Keys.")
+        key_err = llm_factory.missing_key_error(req.llm)
+        if key_err:
+            yield _evt("error", key_err)
             return
         if not req.tailored_resume.strip():
             yield _evt(
@@ -488,43 +514,39 @@ async def knockout_screen(req: KnockoutRequest):
         )
 
         try:
-            client = genai.Client(api_key=req.api_key)
-
-            # Try Gemini 3 first for sharper recruiter judgement; fall back
-            # gracefully when a model name isn't available on the account.
-            candidate_models = [
-                "gemini-3.1-pro-preview",
-                "gemini-3-pro-preview",
-                "gemini-2.5-pro",
-            ]
-            stream = None
+            # Smart tier for sharper recruiter judgement; fall through the
+            # provider's candidate list when a model name isn't available on
+            # the account. True streaming — these questions form a narrative
+            # the user wants to watch render in the chat bubble. Once tokens
+            # have streamed we can't switch models, so only pre-token failures
+            # try the next candidate.
             last_err: Exception | None = None
-            for model_name in candidate_models:
+            for model_name in llm_factory.candidate_models(req.llm, "smart"):
+                started = False
                 try:
-                    stream = await client.aio.models.generate_content_stream(
-                        model=model_name,
-                        contents=contents,
-                        config=genai_types.GenerateContentConfig(temperature=0.5),
+                    model = llm_factory.make_chat_model(
+                        req.llm, model_name, temperature=0.5,
                     )
-                    yield _evt("stage", f"\n🧠 **Model:** `{model_name}`\n\n")
-                    await asyncio.sleep(0)
-                    break
+                    first = True
+                    async for chunk in model.astream(contents):
+                        text = llm_factory.content_text(chunk)
+                        if text:
+                            if first:
+                                yield _evt("stage", f"\n🧠 **Model:** `{model_name}`\n\n")
+                                first = False
+                            started = True
+                            yield _evt("token", text)
+                            await asyncio.sleep(0)
+                    yield _evt("done", "")
+                    return
                 except Exception as exc:
                     last_err = exc
+                    if started:
+                        yield _evt("error", f"Knockout screen error: {exc}")
+                        return
                     yield _evt("stage", f"\n⚠️ {model_name} unavailable — trying next…\n\n")
                     await asyncio.sleep(0)
-            if stream is None:
-                raise last_err or RuntimeError("No model available")
-
-            # True streaming — these questions form a narrative the user wants
-            # to watch render in the chat bubble.
-            async for chunk in stream:
-                text = _response_text(chunk)
-                if text:
-                    yield _evt("token", text)
-                    await asyncio.sleep(0)
-
-            yield _evt("done", "")
+            raise last_err or RuntimeError("No model available")
 
         except Exception as exc:
             yield _evt("error", f"Knockout screen error: {exc}")
@@ -536,39 +558,6 @@ async def knockout_screen(req: KnockoutRequest):
 
 def _evt(etype: str, content: str) -> dict:
     return {"data": json.dumps({"type": etype, "content": content})}
-
-
-def _strip_fences(text: str) -> str:
-    t = text.strip()
-    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.MULTILINE)
-    t = re.sub(r"\s*```$", "", t, flags=re.MULTILINE)
-    return t.strip()
-
-
-def _loads_lenient(text: str) -> dict:
-    """Parse the first complete JSON object out of a model response.
-
-    Tolerates leading prose, code fences, and — importantly — trailing junk
-    after the object (Gemini sometimes appends stray `}` braces, which makes
-    a plain `json.loads` raise "Extra data"). Uses `raw_decode` so we take the
-    first balanced object and ignore whatever follows.
-    """
-    t = _strip_fences(text)
-    start = t.find("{")
-    if start == -1:
-        raise ValueError("no JSON object found in model output")
-    obj, _ = json.JSONDecoder().raw_decode(t[start:])
-    return obj
-
-
-def _response_text(response) -> str:
-    if hasattr(response, "text") and response.text:
-        return response.text
-    try:
-        parts = response.candidates[0].content.parts
-        return "".join(getattr(p, "text", "") for p in parts)
-    except Exception:
-        return str(response)
 
 
 def _build_prompt(req: ApplicationRequest) -> str:
@@ -642,32 +631,6 @@ def _build_refine_prompt(req: ApplicationRequest, draft_json: str) -> str:
         + "\n\n=== REQUIRED OUTPUT SHAPE ===\n"
         + OUTPUT_SHAPE
     )
-
-
-async def _generate_json(client, contents: str, *, temperature: float):
-    """Call Gemini for JSON output, trying preview models then stable so a
-    404 / model-not-found doesn't block the feature. Returns
-    (response, model_name); raises the last error if every model fails."""
-    candidate_models = [
-        "gemini-3.1-pro-preview",
-        "gemini-3-pro-preview",
-        "gemini-2.5-pro",
-    ]
-    last_err: Exception | None = None
-    for model_name in candidate_models:
-        try:
-            resp = await client.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=temperature,
-                ),
-            )
-            return resp, model_name
-        except Exception as exc:
-            last_err = exc
-    raise last_err or RuntimeError("No model available")
 
 
 def _add_bottom_border(paragraph) -> None:

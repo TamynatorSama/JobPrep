@@ -191,18 +191,31 @@ interface Resume {
   docx_b64?: string | null;
 }
 
+type LlmProvider = "gemini" | "openai" | "anthropic";
+
 interface Credentials {
+  /** Which provider powers every AI call. The keys for all providers are kept
+   *  so switching is instant and company research can use spares as fallback
+   *  lanes. */
+  llmProvider:      string;
   geminiApiKey:     string;
-  glassdoorEmail:   string;
-  glassdoorPassword:string;
-  indeedEmail:      string;
-  indeedPassword:   string;
+  openaiApiKey:     string;
+  anthropicApiKey:  string;
 }
 
 const EMPTY_CREDS: Credentials = {
-  geminiApiKey: "", glassdoorEmail: "", glassdoorPassword: "",
-  indeedEmail: "", indeedPassword: "",
+  llmProvider: "gemini", geminiApiKey: "", openaiApiKey: "",
+  anthropicApiKey: "",
 };
+
+/** Snake_cased provider config attached to every backend request — mirrors
+ *  the Python `LLMConfig` pydantic model. */
+const llmPayload = (c: Credentials) => ({
+  provider:          c.llmProvider || "gemini",
+  gemini_api_key:    c.geminiApiKey,
+  openai_api_key:    c.openaiApiKey,
+  anthropic_api_key: c.anthropicApiKey,
+});
 
 interface Scorecard {
   verbatim_match_score?: number;
@@ -2718,63 +2731,74 @@ interface CredentialsTabProps {
   update: (patch: Partial<Credentials>) => void;
 }
 
-const CredentialsTab = ({ credentials, update }: CredentialsTabProps) => (
-  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-    <Card>
-      <CardTitle>Gemini API Key</CardTitle>
-      <CardDesc>
-        Powers AI chat and JD analysis. Get yours from Google AI Studio.
-      </CardDesc>
-      <SecretField
-        value={credentials.geminiApiKey}
-        placeholder="AIza..."
-        onChange={(v) => update({ geminiApiKey: v })}
-      />
-      <CardHint>Stored in Windows Credential Manager — encrypted with your user account.</CardHint>
-    </Card>
+const LLM_PROVIDERS: { id: LlmProvider; label: string }[] = [
+  { id: "gemini",    label: "Gemini" },
+  { id: "openai",    label: "OpenAI" },
+  { id: "anthropic", label: "Claude" },
+];
 
-    <Card>
-      <CardTitle>Glassdoor Account</CardTitle>
-      <CardDesc>
-        Optional. Unlocks salary data and reviews behind the login wall.
-      </CardDesc>
-      <FieldLabel>Email</FieldLabel>
-      <PlainField
-        value={credentials.glassdoorEmail}
-        placeholder="you@example.com"
-        onChange={(v) => update({ glassdoorEmail: v })}
-      />
-      <div style={{ height: 8 }} />
-      <FieldLabel>Password</FieldLabel>
-      <SecretField
-        value={credentials.glassdoorPassword}
-        placeholder="Password"
-        onChange={(v) => update({ glassdoorPassword: v })}
-      />
-    </Card>
+const KEY_CARDS: {
+  id: LlmProvider;
+  title: string;
+  desc: string;
+  placeholder: string;
+  field: keyof Credentials;
+}[] = [
+  { id: "gemini",    title: "Gemini API Key",    desc: "Get yours from Google AI Studio. Also powers company-research web grounding — worth setting even when another provider is active.", placeholder: "AIza...",   field: "geminiApiKey" },
+  { id: "openai",    title: "OpenAI API Key",    desc: "From platform.openai.com → API keys.",            placeholder: "sk-...",      field: "openaiApiKey" },
+  { id: "anthropic", title: "Anthropic API Key", desc: "From console.anthropic.com → API keys.",          placeholder: "sk-ant-...",  field: "anthropicApiKey" },
+];
 
-    <Card>
-      <CardTitle>Indeed Account</CardTitle>
-      <CardDesc>
-        Optional. Unlocks detailed company reviews and salary data.
-      </CardDesc>
-      <FieldLabel>Email</FieldLabel>
-      <PlainField
-        value={credentials.indeedEmail}
-        placeholder="you@example.com"
-        onChange={(v) => update({ indeedEmail: v })}
-      />
-      <div style={{ height: 8 }} />
-      <FieldLabel>Password</FieldLabel>
-      <SecretField
-        value={credentials.indeedPassword}
-        placeholder="Password"
-        onChange={(v) => update({ indeedPassword: v })}
-      />
-      <CardHint>Credentials used only to automate your own account. Encrypted at rest.</CardHint>
-    </Card>
-  </div>
-);
+const CredentialsTab = ({ credentials, update }: CredentialsTabProps) => {
+  const active = (credentials.llmProvider || "gemini") as LlmProvider;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <Card>
+        <CardTitle>AI Provider</CardTitle>
+        <CardDesc>
+          Pick which model powers chat, mock interviews, resume tailoring and
+          research. Keys you enter for the other providers are kept and used as
+          fallbacks by company research.
+        </CardDesc>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {LLM_PROVIDERS.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => update({ llmProvider: p.id })}
+              aria-pressed={active === p.id}
+              style={{
+                padding: "6px 14px", borderRadius: 8, cursor: "pointer",
+                border: `0.5px solid ${T.border}`,
+                background: active === p.id ? T.accent : T.surface2,
+                color: active === p.id ? "#fff" : T.text,
+                fontSize: 12, fontWeight: 600,
+              }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <CardHint>Stored in Windows Credential Manager — encrypted with your user account.</CardHint>
+      </Card>
+
+      {KEY_CARDS.map((card) => (
+        <Card key={card.id}>
+          <CardTitle>
+            {card.title}
+            {active === card.id ? " · Active" : ""}
+          </CardTitle>
+          <CardDesc>{card.desc}</CardDesc>
+          <SecretField
+            value={credentials[card.field]}
+            placeholder={card.placeholder}
+            onChange={(v) => update({ [card.field]: v } as Partial<Credentials>)}
+          />
+        </Card>
+      ))}
+    </div>
+  );
+};
 
 const Card = ({ children }: { children: ReactNode }) => (
   <div style={{
@@ -2937,18 +2961,6 @@ interface CredentialFieldProps {
   placeholder?: string;
   onChange: (v: string) => void;
 }
-
-const PlainField = ({ value, placeholder, onChange }: CredentialFieldProps) => (
-  <input
-    type="text"
-    value={value}
-    placeholder={placeholder}
-    onChange={(e) => onChange(e.target.value)}
-    onFocus={(e) => { e.target.style.borderColor = T.accent; e.target.style.boxShadow = T.accentRing; }}
-    onBlur={(e)  => { e.target.style.borderColor = T.border; e.target.style.boxShadow = "none"; }}
-    style={fieldInputStyle()}
-  />
-);
 
 const SecretField = ({ value, placeholder, onChange }: CredentialFieldProps) => {
   const [visible, setVisible] = useState(false);
@@ -3848,7 +3860,7 @@ const App = () => {
       jobContext,
       history,
       mode,
-      apiKey: credentials.geminiApiKey,
+      llm: llmPayload(credentials),
       documents: ragDocs,
       streamId,
     }).catch((e) => {
@@ -3961,16 +3973,12 @@ const App = () => {
     // available via the sidebar once it lands.
 
     invoke("start_company_research_stream", {
-      company:           job.company,
-      role:              job.role,
-      location:          job.location,
-      jobDescription:    job.jobDescription ?? "",
+      company:        job.company,
+      role:           job.role,
+      location:       job.location,
+      jobDescription: job.jobDescription ?? "",
       tailoredResume,
-      apiKey:            creds.geminiApiKey,
-      glassdoorEmail:    creds.glassdoorEmail,
-      glassdoorPassword: creds.glassdoorPassword,
-      indeedEmail:       creds.indeedEmail,
-      indeedPassword:    creds.indeedPassword,
+      llm:            llmPayload(creds),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);
@@ -4078,7 +4086,7 @@ const App = () => {
       location:       job.location,
       jobDescription: job.jobDescription ?? "",
       tailoredResume: resume,
-      apiKey:         credentialsRef.current.geminiApiKey,
+      llm:            llmPayload(credentialsRef.current),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);
@@ -4163,7 +4171,7 @@ const App = () => {
       location:       newJob.location,
       jobDescription: jd,
       masterResumes,
-      apiKey:         credentials.geminiApiKey,
+      llm:            llmPayload(credentials),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);
@@ -4223,7 +4231,7 @@ const App = () => {
       location:       job.location,
       jobDescription: job.jobDescription ?? "",
       masterResumes,
-      apiKey:         credentialsRef.current.geminiApiKey,
+      llm:            llmPayload(credentialsRef.current),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);
@@ -4402,9 +4410,10 @@ const App = () => {
             // Flush credentials to the OS keychain. Don't block close on it.
             if (credentialsLoaded) {
               invoke("save_credentials", { credentials })
-                // Push the (possibly changed) Gemini key to the running sidecar
-                // so the browser-extension autofill keeps working without an app
-                // restart. Best-effort — the backend may not be up yet.
+                // Push the (possibly changed) provider config to the running
+                // sidecar so the browser-extension autofill keeps working
+                // without an app restart. Best-effort — the backend may not
+                // be up yet.
                 .then(() => invoke("reseed_backend_key").catch(() => {}))
                 .catch((e) => console.error("save_credentials failed:", e));
             }

@@ -159,8 +159,9 @@ fn bridge_info(state: State<SidecarState>) -> serde_json::Value {
     }
 }
 
-/// Push the currently-stored Gemini key to the running sidecar. Call after the
-/// user saves credentials so the extension keeps working without an app restart.
+/// Push the currently-stored LLM config (provider toggle + keys) to the
+/// running sidecar. Call after the user saves credentials so the extension
+/// keeps working without an app restart.
 #[tauri::command]
 fn reseed_backend_key(state: State<SidecarState>) -> Result<(), String> {
     let (url, token) = {
@@ -170,8 +171,8 @@ fn reseed_backend_key(state: State<SidecarState>) -> Result<(), String> {
             _ => return Err("Backend is not ready yet".to_string()),
         }
     };
-    let key = Credentials::load().gemini_api_key;
-    backend_client::seed_config(&url, &token, &key)
+    let llm = Credentials::load().llm_json();
+    backend_client::seed_config(&url, &token, &llm)
 }
 
 /// Poll the extension's job-capture inbox. Returns the pending captures (JDs the
@@ -235,12 +236,12 @@ fn start_chat_stream(
     job_context: String,
     history: Vec<(String, String)>,
     mode: String,
-    api_key: String,
+    llm: serde_json::Value,
     documents: Vec<backend_client::RagDocPayload>,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
-    backend_client::stream_chat(app, url, message, job_context, history, mode, api_key, documents, stream_id);
+    backend_client::stream_chat(app, url, message, job_context, history, mode, llm, documents, stream_id);
     Ok(())
 }
 
@@ -251,11 +252,11 @@ fn start_research_stream(
     company: String,
     role: String,
     job_description: String,
-    api_key: String,
+    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
-    backend_client::stream_research(app, url, company, role, job_description, api_key, stream_id);
+    backend_client::stream_research(app, url, company, role, job_description, llm, stream_id);
     Ok(())
 }
 
@@ -269,11 +270,7 @@ fn start_company_research_stream(
     location: String,
     job_description: String,
     tailored_resume: String,
-    api_key: String,
-    glassdoor_email: String,
-    glassdoor_password: String,
-    indeed_email: String,
-    indeed_password: String,
+    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
@@ -285,11 +282,7 @@ fn start_company_research_stream(
         location,
         job_description,
         tailored_resume,
-        api_key,
-        glassdoor_email,
-        glassdoor_password,
-        indeed_email,
-        indeed_password,
+        llm,
         stream_id,
     );
     Ok(())
@@ -305,7 +298,7 @@ fn start_application_tailor_stream(
     location: String,
     job_description: String,
     master_resumes: Vec<backend_client::MasterResumePayload>,
-    api_key: String,
+    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
@@ -317,13 +310,14 @@ fn start_application_tailor_stream(
         location,
         job_description,
         master_resumes,
-        api_key,
+        llm,
         stream_id,
     );
     Ok(())
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_knockout_screen_stream(
     app: AppHandle,
     state: State<SidecarState>,
@@ -332,7 +326,7 @@ fn start_knockout_screen_stream(
     location: String,
     job_description: String,
     tailored_resume: String,
-    api_key: String,
+    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
@@ -344,7 +338,7 @@ fn start_knockout_screen_stream(
         location,
         job_description,
         tailored_resume,
-        api_key,
+        llm,
         stream_id,
     );
     Ok(())
@@ -835,11 +829,17 @@ pub fn run() {
                 // Gemini key so the extension's autofill works without the app
                 // forwarding the key on every request.
                 let token = gen_token();
-                let gemini_key = Credentials::load().gemini_api_key;
-                match PythonSidecar::start(&token, &gemini_key) {
+                let creds = Credentials::load();
+                match PythonSidecar::start(&token, &creds.gemini_api_key) {
                     Ok(sidecar) => {
                         let url = sidecar.base_url();
                         let port = sidecar.port();
+                        // The env var only seeds the Gemini key — push the full
+                        // LLM config (provider toggle + every key) now that the
+                        // sidecar answers. Best-effort: a failure just means the
+                        // extension endpoints run on the env-seeded default
+                        // until the user next saves Settings.
+                        let _ = backend_client::seed_config(&url, &token, &creds.llm_json());
                         {
                             let mut inner = state.inner.lock().unwrap();
                             inner.base_url = Some(url.clone());

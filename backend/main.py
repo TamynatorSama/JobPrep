@@ -19,16 +19,8 @@ from routes.inbox import router as inbox_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Warm the Playwright browser in the background so /health responds immediately.
-    # The Rust sidecar polls /health with a 30-second timeout; blocking here would
-    # cause that timeout to fire before the app is reachable.
-    async def _warm():
-        try:
-            from agents.company_research.browser_manager import get_browser
-            await get_browser()
-        except Exception:
-            pass
-
+    # Company research is now the in-process `research_scraper` engine (HTTP/JSON,
+    # no browser), so there's nothing to pre-warm for it.
     async def _warm_voice():
         # Load the TTS model + reference clip off the event loop so the first
         # interview question doesn't pay the cold start. Heavy (torch + model
@@ -39,15 +31,8 @@ async def lifespan(_app: FastAPI):
         except Exception:
             pass
 
-    asyncio.create_task(_warm())
     asyncio.create_task(_warm_voice())
     yield
-
-    try:
-        from agents.company_research.browser_manager import shutdown
-        await shutdown()
-    except Exception:
-        pass
 
 
 app = FastAPI(title="InterPrep Backend", version="0.2.0", lifespan=lifespan)

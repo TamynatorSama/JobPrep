@@ -3,12 +3,19 @@ uvicorn[standard]>=0.32.0
 sse-starlette>=2.1.0
 langchain-core>=0.3.0
 langchain-google-genai>=2.0.0
-langgraph>=0.2.0
+# Multi-LLM support — the Settings provider toggle picks one of these at runtime.
+langchain-openai
+langchain-anthropic
+langgraph>=1.0
 python-dotenv>=1.0.0
-playwright>=1.49.0
 python-docx>=1.1.2
 reportlab>=4.0.0          # PDF resume export for the browser extension
-# After pip install, run: playwright install chromium
+
+# Company research engine (embedded, no browser). Not on PyPI — install from the
+# bundled source so it ships with the app:
+#   pip install ../research_scraper
+# It pulls curl_cffi / diskcache / ddgs and exposes `research_scraper.research_events`.
+# Optional extras: pip install "../research_scraper[vectors]"  (chromadb reuse)
 
 # Voice (live mock interview) is optional + heavy (torch + models). It lives in
 # requirements-voice.txt — install with:  .\setup.ps1 -Voice

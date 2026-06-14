@@ -4,6 +4,7 @@ import json
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
+import llm_provider as llm_factory
 from models import ResearchRequest
 from agents.workflow import build_research_workflow
 from agents.state import ResearchState
@@ -20,11 +21,9 @@ STAGE_LABELS = {
 @router.post("/stream")
 async def research_stream(req: ResearchRequest):
     async def generate():
-        if not req.api_key:
-            yield {"data": json.dumps({
-                "type": "error",
-                "content": "No Gemini API key set. Open **Settings** and paste your key.",
-            })}
+        key_err = llm_factory.missing_key_error(req.llm)
+        if key_err:
+            yield {"data": json.dumps({"type": "error", "content": key_err})}
             return
 
         if len(req.job_description.strip()) < 30:
@@ -35,7 +34,7 @@ async def research_stream(req: ResearchRequest):
             return
 
         try:
-            workflow = build_research_workflow(req.api_key)
+            workflow = build_research_workflow(req.llm)
 
             initial_state: ResearchState = {
                 "job_description": req.job_description,
@@ -59,8 +58,9 @@ async def research_stream(req: ResearchRequest):
 
                 elif event_type == "on_chat_model_stream":
                     chunk = event["data"].get("chunk")
-                    if chunk and hasattr(chunk, "content") and chunk.content:
-                        yield {"data": json.dumps({"type": "token", "content": chunk.content})}
+                    text = llm_factory.content_text(chunk) if chunk is not None else ""
+                    if text:
+                        yield {"data": json.dumps({"type": "token", "content": text})}
                         await asyncio.sleep(0)
 
             yield {"data": json.dumps({"type": "done"})}

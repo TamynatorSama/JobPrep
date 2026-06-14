@@ -4,12 +4,14 @@ the company-research dossier, and prior chat threads for the same job.
 Design constraints (see CLAUDE.md):
   * The corpus per job is tiny (one resume, ~one research doc, a handful of
     chats), so a full vector DB (FAISS/Chroma) is overkill. We embed chunks
-    with Gemini's `text-embedding-004` (same API key the chat already uses)
-    and rank with plain-Python cosine similarity. No numpy / faiss dependency.
+    with whichever configured provider has an embeddings API (Gemini or OpenAI
+    — see llm_provider.make_embeddings) and rank with plain-Python cosine
+    similarity. No numpy / faiss dependency.
   * Retrieval is stateless from the frontend's point of view: the client
     sends the job's documents with every chat request. To avoid re-embedding
     unchanged text on each message, chunk embeddings are cached on disk,
-    keyed by a content hash — so only new/edited chunks cost an embed call.
+    keyed by embed-model namespace + content hash — so only new/edited chunks
+    cost an embed call, and vectors from different models never mix.
   * RAG is strictly best-effort. Any failure here must degrade to "no
     retrieved context", never break the chat stream. Callers wrap in try.
 """
@@ -25,9 +27,8 @@ import threading
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
-EMBED_MODEL = "models/text-embedding-004"
+import llm_provider as llm_factory
+from models import LLMConfig
 
 # Chunking: pack paragraph-ish spans into windows of roughly this many chars.
 # Big enough to keep a resume bullet or a research paragraph intact; small
@@ -110,16 +111,21 @@ def _chunk(text: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 # Embedding (cached) + cosine
 # --------------------------------------------------------------------------- #
-def _embed_cached(emb: GoogleGenerativeAIEmbeddings, texts: Sequence[str]) -> List[List[float]]:
+def _embed_cached(emb, namespace: str, texts: Sequence[str]) -> List[List[float]]:
+    """Embed `texts`, caching per (embed-model namespace, content hash) so a
+    provider switch never reads another model's vectors."""
+    def key(t: str) -> str:
+        return _hash(f"{namespace}::{t}")
+
     with _cache_lock:
         cache = _load_cache()
-        missing = sorted({t for t in texts if _hash(t) not in cache})
+        missing = sorted({t for t in texts if key(t) not in cache})
         if missing:
             vectors = emb.embed_documents(list(missing))
             for t, v in zip(missing, vectors):
-                cache[_hash(t)] = v
+                cache[key(t)] = v
             _save_cache(cache)
-        return [cache[_hash(t)] for t in texts]
+        return [cache[key(t)] for t in texts]
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -137,7 +143,7 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
 def build_context(
     query: str,
     documents: Sequence,  # objects with .source and .text (models.RagDoc)
-    api_key: str,
+    cfg: LLMConfig,
     k: int = DEFAULT_K,
     max_chars: int = DEFAULT_MAX_CHARS,
 ) -> str:
@@ -147,7 +153,7 @@ def build_context(
     Synchronous and network-bound (embedding calls) — call via
     `asyncio.to_thread(...)` from async handlers.
     """
-    if not query or not query.strip() or not documents or not api_key:
+    if not query or not query.strip() or not documents:
         return ""
 
     # (source, chunk_text) for every chunk across all docs.
@@ -158,8 +164,10 @@ def build_context(
     if not chunks:
         return ""
 
-    emb = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=api_key)
-    vecs = _embed_cached(emb, [c[1] for c in chunks])
+    emb, namespace = llm_factory.make_embeddings(cfg)
+    if emb is None:
+        return ""  # no embeddings-capable provider configured — skip RAG
+    vecs = _embed_cached(emb, namespace, [c[1] for c in chunks])
     qv = emb.embed_query(query)
 
     scored = sorted(

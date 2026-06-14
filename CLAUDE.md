@@ -48,21 +48,23 @@ All backend access goes through `invoke(...)` and `listen(...)` from `@tauri-app
 
 - **`sidecar.rs`** — spawns the Python FastAPI process (`uvicorn main:app`). Discovery order: `INTERPREP_BACKEND_DIR` env → walk up to 6 levels from `current_exe()` → walk up to 6 levels from `current_dir()` looking for `backend/main.py`. Python order: `backend/.venv/Scripts/python.exe` → bundled `python/python.exe` → `py -3.12` / `py -3.11` / `python3.x`. Polls `/health` for up to 30s; on `ExitRequested` runs `taskkill /T /F /PID <pid>` plus `Child::kill` to wipe the whole tree (uvicorn worker + Playwright `chrome.exe` + renderer subprocesses).
 - **`backend_client.rs`** — `reqwest::blocking` POSTs to `/{chat|research|company-research|application}` endpoints and forwards each SSE `data:` line to the frontend as a window event. SSE event types map to Tauri events: `token`→`chat:token`, `stage`→`chat:log`, `scorecard`→`chat:scorecard`, `resume_docx`→`chat:resume_docx`, `tailored_resume`→`chat:tailored_resume`, `done`→`chat:done`, `error`→`chat:error`. The frontend uses the same event channel for every workflow — there's no per-stream namespacing, so only one stream should run at a time.
-- **`credentials.rs`** — Windows Credential Manager (`keyring` crate, service `"InterPrep"`). One entry per field. Empty value = delete entry.
+- **`credentials.rs`** — Windows Credential Manager (`keyring` crate, service `"InterPrep"`). One entry per field. Empty value = delete entry. Fields: `llm_provider` (Settings toggle: gemini | openai | anthropic) + per-provider API keys. `Credentials::llm_json()` builds the snake_case `llm` payload attached to every backend request (mirrors Python's `LLMConfig`). Legacy Glassdoor/Indeed + retired Groq/Ollama entries are deleted on save.
 - **`jobs_store.rs`** / **`resume_store.rs`** — JSON files under `%LOCALAPPDATA%\InterPrep\` (`jobs.json`, `resumes.json`). Atomic write via temp-file + rename so a mid-write crash never corrupts the file.
 - **`types.rs`** — `Job` / `ChatThread` / `ChatMsg` / `StageNote`. `serde(rename_all = "camelCase")` on `Job` for JS interop; IDs are `String` because the frontend mints them with `Date.now()`.
 - **`recorder.rs`** — unchanged WASAPI dual-stream backend (system audio via render-loopback + mic via capture, both written as 32-bit float WAV via `hound`). Each worker initializes COM (MTA) on its own thread via `ComGuard`; an `Arc<AtomicBool>` stop flag is shared so one worker's error trips the other. `save_resume_docx` decodes the base64 `.docx` from `chat:resume_docx` into `%APPDATA%\InterPrep\applications\<job_id>\resume.docx`.
 
-### Python sidecar — `backend/` (FastAPI + LangGraph + Playwright)
+### Python sidecar — `backend/` (FastAPI + LangGraph)
 
-`main.py` mounts four routers under `/chat`, `/research`, `/company-research`, `/application`. The lifespan handler kicks `agents.company_research.browser_manager.get_browser()` as a background task so `/health` answers fast (the Rust side gives up after 30s). Models in `models.py` (Pydantic).
+`main.py` mounts routers under `/chat`, `/research`, `/company-research`, `/application`, `/voice`, plus the token-guarded browser-extension bridge (`/config`, `/store`, `/autofill`, `/inbox`). Models in `models.py` (Pydantic).
+
+**Multi-LLM:** every request carries an `llm: LLMConfig` payload (provider toggle + per-provider keys, built by Rust from Credential Manager). `backend/llm_provider.py` is the factory all routes go through — `make_chat_model` (lazy-imports the LangChain partner package per provider), `candidate_models(cfg, tier)` ("fast"/"smart" tiers with preview→stable fallback per provider), `generate_json`/`generate_raw` (one-shot + lenient parse), `content_text` (flattens block-list content from Anthropic), `make_embeddings` (Gemini/OpenAI, with fallback — Anthropic has no embeddings API). **The module is named `llm_provider`, not `llm`, because the embedded `research_scraper` package ships its own top-level `llm` package — naming it `llm` shadows the engine's import and breaks company research.** Extension-bridge routes read the config from `runtime_config` (seeded via `POST /config/seed` on startup + Settings save).
 
 Routes:
 
-- **`routes/chat.py`** — coach mode (`gemini-2.5-flash`) and live `interviewer` mode (`gemini-2.5-pro` for persona consistency). Streams via `ChatGoogleGenerativeAI(streaming=True).astream(...)`.
+- **`routes/chat.py`** — coach mode (fast tier) and live `interviewer` mode (smart tier for persona consistency). Streams via the factory model's `.astream(...)`; model fallback only happens before the first token.
 - **`routes/research.py`** — JD-only role-fit analysis. LangGraph workflow defined in `agents/workflow.py` with nodes `extract → questions → tips`. Stage banners emitted on `on_chain_start`; tokens forwarded from `on_chat_model_stream`.
-- **`routes/company_research.py` + `agents/company_research/`** — supervisor/agent graph. `orchestrator.py` builds `supervisor → (glassdoor | indeed | google | comparably | levels | repvue)* → compose → END`. The supervisor LLM picks the next source given which are completed; site agents drive Playwright via `LLMBrowserAgent` (Glassdoor/Indeed need user credentials to bypass paywalls). `compose` is the only streaming node. The route maps LangGraph node names to user-facing stage banners via `_STAGE_BANNERS`.
-- **`routes/application.py`** — `gemini-2.5-pro` resume tailor: picks the closest master resume, builds an ATS-tailored `.docx` (via `python-docx`), streams the cover letter as tokens, and emits a scorecard JSON event. Also serves `/application/knockout-screen` for recruiter-style screen simulation.
+- **`routes/company_research.py`** — backed by the embedded `research_scraper` engine (editable-installed from `D:\code\ML\research_scraper`; LangGraph plan → search → scrape → reflect → peer → audit → synthesize, HTTP/JSON scraping — no browser, no logins). The engine's LLM router speaks the OpenAI-compatible wire format with a built-in fallback chain; the route maps the selected provider (gemini | openai | anthropic) onto the custom lane via the engine's `runtime.overrides` contextvar (Anthropic rides its OpenAI-compat endpoint `https://api.anthropic.com/v1`) and passes the spare gemini key as a fallback lane. The Gemini key also powers the Google Search grounding source regardless of provider.
+- **`routes/application.py`** — smart-tier resume tailor: aggregates evidence across master resumes, builds an ATS-tailored `.docx` (via `python-docx`), streams the cover letter as tokens, and emits a scorecard JSON event. Also serves `/application/knockout-screen` for recruiter-style screen simulation.
 
 ### Persistence layout
 
@@ -70,7 +72,7 @@ Routes:
 - `%LOCALAPPDATA%\InterPrep\resumes.json` — master resume library
 - `%LOCALAPPDATA%\InterPrep\sidecar.log` — uvicorn stdout/stderr (single source of truth for sidecar boot failures)
 - `%APPDATA%\InterPrep\applications\<job_id>\resume.docx` — generated tailored resumes
-- Windows Credential Manager under service `"InterPrep"` — Gemini API key, Glassdoor/Indeed logins
+- Windows Credential Manager under service `"InterPrep"` — LLM provider toggle + Gemini/OpenAI/Anthropic API keys
 
 ## Things that will trip you up
 

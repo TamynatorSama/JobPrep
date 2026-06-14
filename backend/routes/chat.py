@@ -3,10 +3,11 @@ import json
 
 from fastapi import APIRouter
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 from sse_starlette.sse import EventSourceResponse
 
-from models import ChatRequest
+import chat_context
+import llm_provider as llm_factory
+from models import ChatRequest, RagDoc
 
 router = APIRouter()
 
@@ -143,11 +144,9 @@ first question.
 @router.post("/stream")
 async def chat_stream(req: ChatRequest):
     async def generate():
-        if not req.api_key:
-            yield {"data": json.dumps({
-                "type": "error",
-                "content": "No Gemini API key set. Open **Settings** and paste your key.",
-            })}
+        key_err = llm_factory.missing_key_error(req.llm)
+        if key_err:
+            yield {"data": json.dumps({"type": "error", "content": key_err})}
             return
 
         try:
@@ -156,10 +155,28 @@ async def chat_stream(req: ChatRequest):
             if req.job_context:
                 system_content += f"\n\n**Current Job Context:**\n{req.job_context}"
 
+            # ── Context management ───────────────────────────────────────────
+            # The frontend resends the whole thread every turn. Keep only the
+            # most recent turns verbatim; roll older turns into (a) a short
+            # running summary in the system prompt and (b) the RAG corpus, so a
+            # long thread stays bounded without losing earlier context. Both are
+            # best-effort and never block the stream.
+            older, recent = chat_context.split_history(req.history)
+            docs = list(req.documents)
+            if older:
+                docs.append(RagDoc(
+                    source="earlier in this conversation",
+                    text=chat_context.render_transcript(older, req.mode),
+                ))
+                summary = await chat_context.summarize_older(req.llm, older, req.mode)
+                if summary:
+                    system_content += f"\n\n**Summary of earlier conversation:**\n{summary}"
+
             # RAG: pull the most relevant chunks from this job's corpus (resume,
-            # company research, prior chats) and prepend them. Best-effort —
-            # any failure degrades to no retrieved context, never breaks chat.
-            if req.documents:
+            # company research, prior chats, + older turns of THIS chat) and
+            # prepend them. Best-effort — any failure degrades to no retrieved
+            # context, never breaks chat.
+            if docs:
                 yield {"data": json.dumps({
                     "type": "stage",
                     "content": "🔎 Retrieving context from resume, research & prior chats…",
@@ -167,7 +184,7 @@ async def chat_stream(req: ChatRequest):
                 try:
                     from rag import build_context
                     retrieved = await asyncio.to_thread(
-                        build_context, req.message, req.documents, req.api_key,
+                        build_context, req.message, docs, req.llm,
                     )
                     if retrieved:
                         system_content += f"\n\n{retrieved}"
@@ -175,35 +192,28 @@ async def chat_stream(req: ChatRequest):
                     pass
 
             messages = [SystemMessage(content=system_content)]
-            for turn in req.history:
+            for turn in recent:
                 if turn.role == "user":
                     messages.append(HumanMessage(content=turn.content))
                 else:
                     messages.append(AIMessage(content=turn.content))
             messages.append(HumanMessage(content=req.message))
 
-            # Mock interview wants the strongest persona consistency, so try a
-            # newer Pro preview first and fall back to stable; coach mode keeps
-            # flash for cost + latency. Falling back only happens BEFORE the
-            # first token — once we've streamed output we can't switch models.
-            candidate_models = (
-                ["gemini-3-pro-preview", "gemini-2.5-pro"]
-                if req.mode == "interviewer"
-                else ["gemini-2.5-flash"]
-            )
+            # Mock interview wants the strongest persona consistency, so use
+            # the provider's "smart" tier; coach mode keeps the fast tier for
+            # cost + latency. Falling back only happens BEFORE the first token
+            # — once we've streamed output we can't switch models.
+            tier = "smart" if req.mode == "interviewer" else "fast"
             last_err: Exception | None = None
-            for model_name in candidate_models:
+            for model_name in llm_factory.candidate_models(req.llm, tier):
                 started = False
                 try:
-                    llm = ChatGoogleGenerativeAI(
-                        model=model_name,
-                        google_api_key=req.api_key,
-                        streaming=True,
-                    )
-                    async for chunk in llm.astream(messages):
-                        if chunk.content:
+                    model = llm_factory.make_chat_model(req.llm, model_name)
+                    async for chunk in model.astream(messages):
+                        text = llm_factory.content_text(chunk)
+                        if text:
                             started = True
-                            yield {"data": json.dumps({"type": "token", "content": chunk.content})}
+                            yield {"data": json.dumps({"type": "token", "content": text})}
                             await asyncio.sleep(0)
                     yield {"data": json.dumps({"type": "done"})}
                     return
