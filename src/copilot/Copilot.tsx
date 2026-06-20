@@ -21,7 +21,7 @@ import {
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 // ── Theme — InterPrep's dark Framer tokens ──────────────────────────────────
@@ -58,6 +58,20 @@ const llmPayload = (c: Creds) => ({
 });
 const newStreamId = () =>
   `cop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+
+// ── Cheatsheet (mirrored from the active job via the context bridge) ─────────
+interface CheatStory { title: string; tag?: string; metric?: string; beats?: string[]; }
+interface CheatFact { k: string; v: string; }
+interface CheatQuestion { q: string; why?: string; }
+interface Cheatsheet {
+  summary?: string;
+  stories?: CheatStory[];
+  facts?: CheatFact[];
+  questions?: CheatQuestion[];
+  markdown?: string;
+  updatedAt?: number;
+}
+interface CopilotCtx { label: string; context: string; cheatsheet: Cheatsheet | null; }
 
 // ── Icons (ported from the design) ──────────────────────────────────────────
 type IconName =
@@ -149,18 +163,26 @@ const StealthPill = ({ status, compact }: { status: CloakStatus; compact?: boole
 // ── Shell: drag bar ─────────────────────────────────────────────────────────
 const ctrlMini: CSSProperties = { width: 22, height: 22, borderRadius: 6, border: "none", background: "none", display: "flex", alignItems: "center", justifyContent: "center", ...press };
 
-function DragBar({ state, cloak, onMin, onClose }: { state?: string; cloak: CloakStatus; onMin: () => void; onClose: () => void }) {
+function DragBar({ state, job, cloak, onMin, onClose }: { state?: string; job?: string; cloak: CloakStatus; onMin: () => void; onClose: () => void }) {
+  // The whole bar is a drag handle. Children sit on top of the parent, and a
+  // child is only draggable if it ALSO carries the attribute — so tag every
+  // non-interactive child (the buttons + stealth pill stay clickable).
   return (
     <div data-tauri-drag-region style={{ height: 36, flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "0 8px 0 11px", borderBottom: `1px solid ${T.glassEdge}`, cursor: "default" }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 2.5, flexShrink: 0, opacity: 0.4 }}>
-        {[0, 1].map((r) => <div key={r} style={{ display: "flex", gap: 2.5 }}>{[0, 1, 2].map((c) => <span key={c} style={{ width: 2, height: 2, borderRadius: "50%", background: T.text }} />)}</div>)}
+      <div data-tauri-drag-region style={{ display: "flex", flexDirection: "column", gap: 2.5, flexShrink: 0, opacity: 0.4 }}>
+        {[0, 1].map((r) => <div key={r} data-tauri-drag-region style={{ display: "flex", gap: 2.5 }}>{[0, 1, 2].map((c) => <span key={c} data-tauri-drag-region style={{ width: 2, height: 2, borderRadius: "50%", background: T.text }} />)}</div>)}
       </div>
-      <div style={{ width: 17, height: 17, borderRadius: 5, background: T.gradientViolet, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: "0 1px 6px rgba(124,58,237,0.5)" }}>
+      <div data-tauri-drag-region style={{ width: 17, height: 17, borderRadius: 5, background: T.gradientViolet, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: "0 1px 6px rgba(124,58,237,0.5)" }}>
         <Icon name="spark" size={9.5} color="#fff" sw={2.2} />
       </div>
-      <span style={{ fontSize: 11.5, fontWeight: 600, color: T.text, letterSpacing: "-0.2px", fontFamily: T.fontDisplay }}>Copilot</span>
-      {state && <span style={{ fontSize: 11, color: T.textTertiary }}>· {state}</span>}
-      <div style={{ flex: 1 }} />
+      <span data-tauri-drag-region style={{ fontSize: 11.5, fontWeight: 600, color: T.text, letterSpacing: "-0.2px", fontFamily: T.fontDisplay, flexShrink: 0 }}>Copilot</span>
+      {/* Active job grounding takes priority over the view-state label — it tells
+          the user which research the answers are drawn from. Ellipsizes so it
+          never crowds the stealth pill / window controls. */}
+      {job
+        ? <span data-tauri-drag-region title={`Grounded on ${job}`} style={{ fontSize: 11, color: T.textSecondary, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>· {job}</span>
+        : state && <span data-tauri-drag-region style={{ fontSize: 11, color: T.textTertiary, flexShrink: 0 }}>· {state}</span>}
+      <div data-tauri-drag-region style={{ flex: 1, minWidth: 8 }} />
       <StealthPill status={cloak} compact />
       <div style={{ display: "flex", alignItems: "center", gap: 1, flexShrink: 0 }}>
         <button onClick={onMin} style={ctrlMini} title="Minimize"><Icon name="minus" size={13} color={T.textTertiary} /></button>
@@ -197,7 +219,7 @@ function NavBar({ view, setView, recording, onToggleRec, onCapture, time }: {
       <button onClick={onCapture} title="Capture screen — send a screenshot to the AI" style={{ height: 30, display: "flex", alignItems: "center", gap: 5, padding: "0 10px", borderRadius: 100, border: `0.5px solid ${T.border}`, background: "rgba(255,255,255,0.05)", color: T.textSecondary, fontSize: 11, fontWeight: 600, flexShrink: 0, fontFamily: T.fontBody, ...press }}>
         <Icon name="camera" size={13} color={T.textSecondary} />Capture
       </button>
-      <button onClick={onToggleRec} title="Capture audio (mic)" style={{ height: 30, display: "flex", alignItems: "center", gap: 6, padding: "0 11px", borderRadius: 100, border: `0.5px solid ${recording ? "rgba(239,68,68,0.45)" : T.border}`, background: recording ? "rgba(239,68,68,0.16)" : "rgba(255,255,255,0.05)", color: recording ? "#ff6b6b" : T.text, fontSize: 11, fontWeight: 600, flexShrink: 0, fontFamily: T.fontBody, ...press }}>
+      <button onClick={onToggleRec} title="Listen to the call (system audio) — auto-answers each question on silence" style={{ height: 30, display: "flex", alignItems: "center", gap: 6, padding: "0 11px", borderRadius: 100, border: `0.5px solid ${recording ? "rgba(239,68,68,0.45)" : T.border}`, background: recording ? "rgba(239,68,68,0.16)" : "rgba(255,255,255,0.05)", color: recording ? "#ff6b6b" : T.text, fontSize: 11, fontWeight: 600, flexShrink: 0, fontFamily: T.fontBody, ...press }}>
         {recording
           ? <><span style={{ width: 9, height: 9, borderRadius: 2, background: "#ff5b5b" }} /><span style={{ fontVariantNumeric: "tabular-nums" }}>{time}</span></>
           : <><span style={{ width: 8, height: 8, borderRadius: "50%", background: T.red }} />Rec audio</>}
@@ -241,7 +263,7 @@ function QuickAsk({ placeholder, value, onChange, onSend, busy, listening, onMic
 
 // ── View: live transcript (real captured lines + listening state) ───────────
 function ListenBody({ recording, time, lines }: { recording: boolean; time: string; lines: { speaker: string; text: string; last: boolean }[] }) {
-  const show = lines.length ? lines : [{ speaker: "—", text: "Tap Rec audio (or the mic) and ask your question out loud — I'll transcribe it and draft an answer.", last: true }];
+  const show = lines.length ? lines : [{ speaker: "—", text: "Tap Rec audio to listen in on the call — I'll transcribe each interviewer question and draft an answer when they finish. (Or use the mic to ask your own.)", last: true }];
   return (
     <div style={{ display: "flex", flexDirection: "column" }}>
       <div style={{ flexShrink: 0, padding: "11px 13px", display: "flex", alignItems: "center", gap: 11, borderBottom: `1px solid ${T.glassEdge}` }}>
@@ -258,7 +280,7 @@ function ListenBody({ recording, time, lines }: { recording: boolean; time: stri
         <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 11 }}>
           <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary }}>Live transcript</span>
           <div style={{ flex: 1, height: 1, background: T.border }} />
-          <span style={pill("rgba(255,255,255,0.05)", T.textSecondary)}>Mic audio</span>
+          <span style={pill("rgba(255,255,255,0.05)", T.textSecondary)}>System audio</span>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {show.map((l, i) => (
@@ -276,8 +298,8 @@ function ListenBody({ recording, time, lines }: { recording: boolean; time: stri
 }
 
 // ── View: suggested answer (real streamed answer) ───────────────────────────
-function AnswerBody({ question, answer, answering, onRephrase, onDeeper, onCopy }: {
-  question: string; answer: string; answering: boolean; onRephrase: () => void; onDeeper: () => void; onCopy: () => void;
+function AnswerBody({ question, answer, answering, jobLabel, onRephrase, onDeeper, onCopy }: {
+  question: string; answer: string; answering: boolean; jobLabel: string; onRephrase: () => void; onDeeper: () => void; onCopy: () => void;
 }) {
   if (!question && !answer) {
     return (
@@ -287,6 +309,9 @@ function AnswerBody({ question, answer, answering, onRephrase, onDeeper, onCopy 
         </div>
         <p style={{ fontSize: 13, fontWeight: 600, color: T.text, fontFamily: T.fontDisplay }}>Suggested answers land here</p>
         <p style={{ fontSize: 11.5, lineHeight: 1.5, color: T.textTertiary, maxWidth: 240 }}>Type a question below, or hit <b style={{ color: T.textSecondary }}>Rec audio</b> to ask one out loud. I'll draft a strong spoken answer.</p>
+        {jobLabel
+          ? <span style={pill(T.violetSoft, "#c084fc")}><Icon name="brief" size={10} color="#c084fc" sw={2} />Grounded on {jobLabel}</span>
+          : <span style={pill("rgba(255,255,255,0.05)", T.textTertiary)}>No active job — open one in the app to ground answers</span>}
       </div>
     );
   }
@@ -327,68 +352,166 @@ function AnswerBody({ question, answer, answering, onRephrase, onDeeper, onCopy 
   );
 }
 
-// ── View: cheatsheet (design sample — static reference) ─────────────────────
-function CheatBody() {
-  const stories = [
-    { t: "Event pipeline redesign", tag: "Ownership", metric: "2% → 0 drop · 40k/s", open: true, beats: ["Append-only buffer + idempotency keys", "Owned design doc, rollout & runbook", "Zero data loss at peak"] },
-    { t: "Production latency spike", tag: "Debugging", metric: "p99 −38%", open: false, beats: [] as string[] },
-    { t: "Disagreement → flagged patch", tag: "Behavioral", metric: "Shipped behind flag", open: false, beats: [] as string[] },
-  ];
-  const facts = [
-    { k: "Why this company", v: "Tie your motivation to the product's real moat." },
-    { k: "My numbers", v: "6 yrs backend · 40k events/sec · 99.99% uptime" },
-  ];
+// ── View: cheatsheet (live — mirrored from the active job, LLM-maintained) ───
+type CheatSection = "stories" | "facts" | "questions";
+
+function CheatBody({ cheat, busy, jobLabel, onRefresh }: {
+  cheat: Cheatsheet | null; busy: boolean; jobLabel: string; onRefresh: () => void;
+}) {
+  const [section, setSection] = useState<CheatSection>("stories");
+  const [query, setQuery] = useState("");
+  const [openStory, setOpenStory] = useState(0);
+
+  const stories = cheat?.stories ?? [];
+  const facts = cheat?.facts ?? [];
+  const questions = cheat?.questions ?? [];
+  const q = query.trim().toLowerCase();
+  const hit = (...parts: (string | undefined)[]) => !q || parts.some((p) => (p ?? "").toLowerCase().includes(q));
+  const fStories = stories.filter((s) => hit(s.title, s.metric, s.tag, ...(s.beats ?? [])));
+  const fFacts = facts.filter((f) => hit(f.k, f.v));
+  const fQuestions = questions.filter((x) => hit(x.q, x.why));
+
+  const isEmpty = !cheat || (stories.length === 0 && facts.length === 0 && questions.length === 0);
+
+  // Refresh button — shared by every state.
+  const refreshBtn = (
+    <button onClick={onRefresh} disabled={busy} title="Rebuild from your conversations, resume & company research"
+      style={{ width: 30, height: 30, borderRadius: 9, border: `0.5px solid ${T.border}`, background: "rgba(255,255,255,0.05)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: busy ? 0.5 : 1, ...press }}>
+      <Icon name="refresh" size={14} color={busy ? T.textTertiary : T.textSecondary} sw={busy ? 2 : 1.8} />
+    </button>
+  );
+
+  if (isEmpty) {
+    return (
+      <div style={{ padding: "26px 18px", display: "flex", flexDirection: "column", alignItems: "center", gap: 12, textAlign: "center" }}>
+        <div style={{ width: 44, height: 44, borderRadius: 13, background: T.violetSoft, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Icon name={busy ? "refresh" : "brief"} size={22} color={T.violet} sw={1.9} />
+        </div>
+        <p style={{ fontSize: 13, fontWeight: 600, color: T.text, fontFamily: T.fontDisplay }}>{busy ? "Building your cheatsheet…" : "No cheatsheet yet"}</p>
+        <p style={{ fontSize: 11.5, lineHeight: 1.5, color: T.textTertiary, maxWidth: 250 }}>
+          {busy
+            ? "Mining your STAR stories, key facts, and questions to ask from this job's conversations, resume, and company research."
+            : jobLabel
+              ? "Build one from this job's conversations, resume, and company research — STAR stories, key facts, and sharp questions to ask."
+              : "Open a job in the app first, then build a cheatsheet grounded on its conversations and research."}
+        </p>
+        {jobLabel && (
+          <button onClick={onRefresh} disabled={busy}
+            style={{ height: 34, padding: "0 16px", borderRadius: 100, border: "none", background: busy ? "rgba(255,255,255,0.1)" : "#fff", color: busy ? T.textSecondary : "#0C0C0C", fontSize: 12, fontWeight: 600, fontFamily: T.fontBody, display: "flex", alignItems: "center", gap: 7, ...press }}>
+            <Icon name="refresh" size={13} color={busy ? T.textSecondary : "#0C0C0C"} sw={2} />{busy ? "Building…" : "Build cheatsheet"}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  const counts: Record<CheatSection, number> = { stories: stories.length, facts: facts.length, questions: questions.length };
+  const SectionPill = ({ id, label }: { id: CheatSection; label: string }) => {
+    const on = section === id;
+    return (
+      <span onClick={() => setSection(id)} style={{ ...pill(on ? "#fff" : "rgba(255,255,255,0.05)", on ? "#0C0C0C" : T.textSecondary, on ? "none" : `0.5px solid ${T.border}`), padding: "5px 11px", fontSize: 11.5, ...press }}>
+        {label} · {counts[id]}
+      </span>
+    );
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column" }}>
       <div style={{ flexShrink: 0, padding: "11px 13px 0" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, background: "rgba(255,255,255,0.04)", border: `0.5px solid ${T.border}`, borderRadius: 11, padding: "7px 11px", marginBottom: 10 }}>
-          <Icon name="search" size={13} color={T.textTertiary} />
-          <span style={{ fontSize: 12, color: T.textTertiary }}>Search stories, facts, metrics…</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+          <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, background: "rgba(255,255,255,0.04)", border: `0.5px solid ${T.border}`, borderRadius: 11, padding: "7px 11px", minWidth: 0 }}>
+            <Icon name="search" size={13} color={T.textTertiary} />
+            <input value={query} onChange={(e) => setQuery(e.target.value)}
+              onMouseDown={() => invoke("copilot_typing", { enabled: true }).catch(() => {})}
+              onFocus={() => invoke("copilot_typing", { enabled: true }).catch(() => {})}
+              onBlur={() => invoke("copilot_typing", { enabled: false }).catch(() => {})}
+              placeholder="Search stories, facts, questions…"
+              style={{ flex: 1, minWidth: 0, background: "transparent", border: "none", outline: "none", color: T.text, fontSize: 12, fontFamily: T.fontBody }} />
+          </div>
+          {refreshBtn}
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          {([["Stories", true], ["Facts", false], ["Questions to ask", false]] as const).map(([l, on]) => (
-            <span key={l} style={{ ...pill(on ? "#fff" : "rgba(255,255,255,0.05)", on ? "#0C0C0C" : T.textSecondary, on ? "none" : `0.5px solid ${T.border}`), padding: "5px 11px", fontSize: 11.5 }}>{l}</span>
-          ))}
+          <SectionPill id="stories" label="Stories" />
+          <SectionPill id="facts" label="Facts" />
+          <SectionPill id="questions" label="Questions" />
         </div>
       </div>
-      <div style={{ padding: "12px 13px 8px", display: "flex", flexDirection: "column", gap: 8 }}>
-        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary, paddingLeft: 2 }}>STAR stories · 3</span>
-        {stories.map((s) => (
-          <div key={s.t} style={{ background: s.open ? "rgba(168,85,247,0.06)" : "rgba(255,255,255,0.03)", border: `0.5px solid ${s.open ? "rgba(168,85,247,0.28)" : T.border}`, borderRadius: 12, padding: "10px 12px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <p style={{ fontSize: 12.5, fontWeight: 600, color: T.text, letterSpacing: "-0.2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.t}</p>
-                <p style={{ fontSize: 10.5, color: T.textTertiary, marginTop: 2 }}>{s.metric}</p>
-              </div>
-              <span style={pill(T.violetSoft, "#c084fc")}>{s.tag}</span>
-              <Icon name={s.open ? "chevUp" : "chevDown"} size={14} color={T.textTertiary} />
-            </div>
-            {s.open && s.beats.length > 0 && (
-              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6, paddingTop: 10, borderTop: `1px solid ${T.glassEdge}` }}>
-                {s.beats.map((b) => (
-                  <div key={b} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                    <span style={{ color: T.violet, fontSize: 12, lineHeight: 1.4, flexShrink: 0 }}>›</span>
-                    <p style={{ fontSize: 11.5, lineHeight: 1.45, color: T.textSecondary }}>{b}</p>
+
+      <div style={{ padding: "12px 13px 10px", display: "flex", flexDirection: "column", gap: 8 }}>
+        {cheat?.summary && section === "stories" && !q && (
+          <div style={{ display: "flex", gap: 9, padding: "9px 12px", borderRadius: 11, background: T.violetSoft, border: `0.5px solid rgba(168,85,247,0.28)` }}>
+            <Icon name="spark" size={13} color={T.violet} sw={2} />
+            <p style={{ fontSize: 11.5, lineHeight: 1.45, color: T.textSecondary }}>{cheat.summary}</p>
+          </div>
+        )}
+
+        {section === "stories" && (fStories.length === 0
+          ? <EmptySection text={q ? "No stories match." : "No stories yet."} />
+          : fStories.map((s, i) => {
+            const open = openStory === i;
+            return (
+              <div key={i} onClick={() => setOpenStory(open ? -1 : i)} style={{ background: open ? "rgba(168,85,247,0.06)" : "rgba(255,255,255,0.03)", border: `0.5px solid ${open ? "rgba(168,85,247,0.28)" : T.border}`, borderRadius: 12, padding: "10px 12px", ...press }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <p style={{ fontSize: 12.5, fontWeight: 600, color: T.text, letterSpacing: "-0.2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.title}</p>
+                    {s.metric && <p style={{ fontSize: 10.5, color: T.textTertiary, marginTop: 2 }}>{s.metric}</p>}
                   </div>
-                ))}
+                  {s.tag && <span style={pill(T.violetSoft, "#c084fc")}>{s.tag}</span>}
+                  <Icon name={open ? "chevUp" : "chevDown"} size={14} color={T.textTertiary} />
+                </div>
+                {open && (s.beats?.length ?? 0) > 0 && (
+                  <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6, paddingTop: 10, borderTop: `1px solid ${T.glassEdge}` }}>
+                    {s.beats!.map((b, k) => (
+                      <div key={k} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                        <span style={{ color: T.violet, fontSize: 12, lineHeight: 1.4, flexShrink: 0 }}>›</span>
+                        <p style={{ fontSize: 11.5, lineHeight: 1.45, color: T.textSecondary }}>{b}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-            )}
-          </div>
-        ))}
-        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary, paddingLeft: 2, marginTop: 4 }}>Key facts</span>
-        {facts.map((f) => (
-          <div key={f.k} style={{ display: "flex", gap: 10, padding: "9px 12px", borderRadius: 11, background: "rgba(255,255,255,0.03)", border: `0.5px solid ${T.border}` }}>
-            <div style={{ width: 3, borderRadius: 3, background: T.accent, flexShrink: 0 }} />
-            <div>
-              <p style={{ fontSize: 11, fontWeight: 700, color: T.text, marginBottom: 2 }}>{f.k}</p>
-              <p style={{ fontSize: 11.5, lineHeight: 1.45, color: T.textSecondary }}>{f.v}</p>
+            );
+          }))}
+
+        {section === "facts" && (fFacts.length === 0
+          ? <EmptySection text={q ? "No facts match." : "No facts yet."} />
+          : fFacts.map((f, i) => (
+            <div key={i} style={{ display: "flex", gap: 10, padding: "9px 12px", borderRadius: 11, background: "rgba(255,255,255,0.03)", border: `0.5px solid ${T.border}` }}>
+              <div style={{ width: 3, borderRadius: 3, background: T.accent, flexShrink: 0 }} />
+              <div>
+                {f.k && <p style={{ fontSize: 11, fontWeight: 700, color: T.text, marginBottom: 2 }}>{f.k}</p>}
+                <p style={{ fontSize: 11.5, lineHeight: 1.45, color: T.textSecondary }}>{f.v}</p>
+              </div>
             </div>
-          </div>
-        ))}
+          )))}
+
+        {section === "questions" && (fQuestions.length === 0
+          ? <EmptySection text={q ? "No questions match." : "No questions yet."} />
+          : fQuestions.map((x, i) => (
+            <div key={i} style={{ padding: "10px 12px", borderRadius: 12, background: "rgba(255,255,255,0.03)", border: `0.5px solid ${T.border}` }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <Icon name="chevRight" size={13} color={T.accent} sw={2} />
+                <p style={{ fontSize: 12.5, fontWeight: 600, color: T.text, lineHeight: 1.4, letterSpacing: "-0.15px" }}>{x.q}</p>
+              </div>
+              {x.why && <p style={{ fontSize: 10.5, lineHeight: 1.45, color: T.textTertiary, marginTop: 6, paddingLeft: 21 }}>{x.why}</p>}
+            </div>
+          )))}
+
+        {cheat?.updatedAt && (
+          <p style={{ fontSize: 9.5, color: T.textTertiary, textAlign: "center", marginTop: 4 }}>
+            Updated {new Date(cheat.updatedAt).toLocaleString()}
+          </p>
+        )}
       </div>
     </div>
   );
 }
+
+const EmptySection = ({ text }: { text: string }) => (
+  <div style={{ padding: "18px 12px", textAlign: "center" }}>
+    <p style={{ fontSize: 11.5, color: T.textTertiary }}>{text}</p>
+  </div>
+);
 
 // ── View: settings (privacy / stealth) ──────────────────────────────────────
 const SToggle = ({ on, c = T.green }: { on: boolean; c?: string }) => (
@@ -414,11 +537,25 @@ const STEALTH_CARD: Record<string, { c: string; title: string; sub: string }> = 
   none: { c: T.red, title: "Stealth is OFF", sub: "This window WILL appear in screen-share & recordings. Display-affinity cloak failed." },
   unknown: { c: T.textTertiary, title: "Checking stealth…", sub: "Reading capture-protection status from the OS." },
 };
-function SettingsBody({ cloak }: { cloak: CloakStatus }) {
+function SettingsBody({ cloak, opacity, onOpacity }: { cloak: CloakStatus; opacity: number; onOpacity: (v: number) => void }) {
   const card = STEALTH_CARD[cloak.mode] ?? STEALTH_CARD.unknown;
   const hidden = cloak.mode === "excluded" || cloak.mode === "monitor";
   return (
     <div style={{ padding: "13px 14px" }}>
+      <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary, paddingLeft: 2 }}>Appearance</span>
+      <div style={{ marginTop: 6, marginBottom: 14, padding: "11px 12px", borderRadius: 12, background: "rgba(255,255,255,0.03)", border: `0.5px solid ${T.border}` }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 9 }}>
+          <span style={{ fontSize: 12.5, fontWeight: 600, color: T.text, letterSpacing: "-0.15px" }}>Window opacity</span>
+          <span style={{ fontSize: 11, color: T.textSecondary, fontVariantNumeric: "tabular-nums" }}>{Math.round(opacity * 100)}%</span>
+        </div>
+        {/* Mouse-driven — works on the no-activate overlay without taking focus. */}
+        <input
+          type="range" min={30} max={100} step={5} value={Math.round(opacity * 100)}
+          onChange={(e) => onOpacity(parseInt(e.target.value, 10) / 100)}
+          style={{ width: "100%", accentColor: T.accent, cursor: "default" }}
+        />
+        <p style={{ fontSize: 10.5, color: T.textTertiary, lineHeight: 1.45, marginTop: 7 }}>See-through HUD so you can read the call behind it. The stealth cloak still hides it from screen-share.</p>
+      </div>
       <div style={{ background: `linear-gradient(135deg, ${card.c}1a, ${card.c}05)`, border: `0.5px solid ${card.c}4d`, borderRadius: 14, padding: "13px 14px", display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
         <div style={{ width: 38, height: 38, borderRadius: 11, flexShrink: 0, background: `${card.c}24`, display: "flex", alignItems: "center", justifyContent: "center" }}>
           <Icon name={cloak.mode === "none" ? "eye" : "eyeOff"} size={19} color={card.c} sw={1.9} />
@@ -470,8 +607,23 @@ export default function Copilot() {
   const [answering, setAnswering] = useState(false);
   const [lines, setLines] = useState<{ speaker: string; text: string; last: boolean }[]>([]);
   const [cloak, setCloak] = useState<CloakStatus>({ mode: "unknown", remote: false });
+  const [jobLabel, setJobLabel] = useState("");
+  const [cheat, setCheat] = useState<Cheatsheet | null>(null);
+  const [cheatBusy, setCheatBusy] = useState(false);
+  const [opacity, setOpacity] = useState<number>(() => {
+    const v = parseFloat(localStorage.getItem("co-opacity") ?? "1");
+    return v >= 0.3 && v <= 1 ? v : 1;
+  });
 
   const credsRef = useRef<Creds>({ llmProvider: "gemini" });
+  // The active job's research context, mirrored from the main window via Rust.
+  // Refreshed right before each stream so the answer is grounded on the job the
+  // user has selected *now* — works whether the overlay was opened by button or
+  // the global hotkey, since the freshest copy always lives in Rust.
+  const jobContextRef = useRef<string>("");
+  // Latest grounding label, so the one-shot cheatsheet:updated listener can
+  // confirm an incoming update is for the job currently shown.
+  const jobLabelRef = useRef<string>("");
   const activeStream = useRef<string | null>(null);
   const recordingRef = useRef(false);
   const lastQARef = useRef<{ q: string; a: string }>({ q: "", a: "" });
@@ -499,6 +651,65 @@ export default function Copilot() {
     invoke<Creds>("load_credentials").then((c) => { credsRef.current = c; }).catch(() => {});
   }, []);
 
+  // Pull the active job's research context + cheatsheet from Rust and fan it out
+  // to the grounding label, the stream context ref, and the Cheatsheet tab.
+  const refreshContext = async () => {
+    try {
+      const c = await invoke<CopilotCtx>("get_copilot_context");
+      jobContextRef.current = c.context;
+      jobLabelRef.current = c.label;
+      setJobLabel(c.label);
+      setCheat(c.cheatsheet ?? null);
+      return c;
+    } catch { return null; }
+  };
+
+  // Pull once on open so the grounding label + cheatsheet show immediately. It's
+  // re-pulled before each stream too (runStream), covering a reused overlay
+  // window where the user switched jobs while it stayed open.
+  useEffect(() => { void refreshContext(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  // The main window finished (re)building a job's cheatsheet → apply it if it's
+  // for the job we're showing, and clear the building state. The fresh sheet
+  // rides in the payload (Rust mirror may not have committed yet).
+  useEffect(() => {
+    const unsubs: UnlistenFn[] = [];
+    let alive = true;
+    listen<{ label?: string; cheatsheet?: Cheatsheet; error?: string }>("cheatsheet:updated", (e) => {
+      const p = e.payload;
+      // Ignore updates for a different job than the one currently grounded.
+      if (p.label && jobLabelRef.current && p.label !== jobLabelRef.current) return;
+      setCheatBusy(false);
+      if (p.cheatsheet) setCheat(p.cheatsheet);
+    }).then((u) => { if (alive) unsubs.push(u); else u(); });
+    return () => { alive = false; unsubs.forEach((u) => u()); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Re-apply a saved (non-default) opacity once the overlay is past its first
+  // paint. Deferred beyond harden_new's 1200ms so flipping WS_EX_LAYERED can't
+  // race the initial composition and blank the page.
+  useEffect(() => {
+    if (opacity >= 1) return;
+    const t = setTimeout(() => invoke("copilot_set_opacity", { opacity }).catch(() => {}), 1400);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const applyOpacity = (v: number) => {
+    setOpacity(v);
+    localStorage.setItem("co-opacity", String(v));
+    invoke("copilot_set_opacity", { opacity: v }).catch(() => {});
+  };
+
+  // Ask the main window to rebuild this job's cheatsheet (it owns the full
+  // conversation corpus). It targets whatever job is selected there.
+  const refreshCheatsheet = () => {
+    if (cheatBusy) return;
+    setCheatBusy(true);
+    emit("cheatsheet:refresh", {}).catch(() => setCheatBusy(false));
+  };
+
   // Poll the real OS-level cloak status so the badge never lies. Check on mount,
   // again shortly after (the window's affinity is applied right at creation),
   // and on a slow interval (catches RDP connect/disconnect mid-session).
@@ -519,7 +730,21 @@ export default function Copilot() {
 
   const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
-  const startListen = () => { invoke("voice_listen").catch(() => setListening(false)); };
+  // Which source the current capture is from, so the transcript line is labelled
+  // correctly: "system" = the interviewer's voice off the loopback (Rec button),
+  // "mic" = the user speaking their own question (QuickAsk mic button).
+  const listenSourceRef = useRef<"mic" | "system">("mic");
+  // Mic one-shot — capture the user's own spoken question.
+  const startListen = () => {
+    listenSourceRef.current = "mic";
+    invoke("voice_listen").catch(() => setListening(false));
+  };
+  // System-audio loop — capture the interviewer's question off the loopback. The
+  // listen→transcribe→answer cycle re-arms this on every turn while Rec is on.
+  const startSystemListen = () => {
+    listenSourceRef.current = "system";
+    invoke("voice_listen_system").catch(() => setListening(false));
+  };
 
   // chat:* + voice:* listeners (StrictMode-safe).
   useEffect(() => {
@@ -537,39 +762,44 @@ export default function Copilot() {
       if (p.streamId !== activeStream.current) return;
       activeStream.current = null;
       setAnswering(false);
-      if (recordingRef.current) startListen(); // keep the loop going
+      if (recordingRef.current) startSystemListen(); // re-arm for the next question
     });
     reg<{ streamId: string; content: string }>("chat:error", (p) => {
       if (p.streamId !== activeStream.current) return;
       activeStream.current = null;
       setAnswering(false);
       setAnswer((a) => a || `Error: ${p.content}`);
-      if (recordingRef.current) startListen();
+      if (recordingRef.current) startSystemListen();
     });
 
     reg<unknown>("voice:listening", () => setListening(true));
     reg<string>("voice:transcript", (text) => {
       setListening(false);
       const t = (text || "").trim();
-      if (!t) { if (recordingRef.current) startListen(); return; }
-      setLines((ls) => [...ls.map((l) => ({ ...l, last: false })), { speaker: "You", text: t, last: true }]);
+      if (!t) { if (recordingRef.current) startSystemListen(); return; }
+      const speaker = listenSourceRef.current === "system" ? "Interviewer" : "You";
+      setLines((ls) => [...ls.map((l) => ({ ...l, last: false })), { speaker, text: t, last: true }]);
       ask(t);
     });
-    reg<unknown>("voice:error", () => { setListening(false); if (recordingRef.current) startListen(); });
+    reg<unknown>("voice:error", () => { setListening(false); if (recordingRef.current) startSystemListen(); });
 
     return () => { alive = false; unsubs.forEach((u) => u()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const runStream = (message: string, history: [string, string][]) => {
+  const runStream = async (message: string, history: [string, string][]) => {
     if (activeStream.current) return;
     const sid = newStreamId();
     activeStream.current = sid;
     setAnswer("");
     setAnswering(true);
     setView("answer");
+    // Grab the freshest active-job context right before streaming so the answer
+    // is grounded on the job the user is on now (it may have changed since open).
+    await refreshContext();
+    if (activeStream.current !== sid) return; // superseded/cancelled while awaiting
     invoke("start_chat_stream", {
-      message, jobContext: "", history, mode: "coach",
+      message, jobContext: jobContextRef.current, history, mode: "coach",
       llm: llmPayload(credsRef.current), documents: [], streamId: sid,
     }).catch((e) => {
       if (activeStream.current === sid) { activeStream.current = null; setAnswering(false); setAnswer(`Error: ${String(e)}`); }
@@ -599,7 +829,10 @@ export default function Copilot() {
     const next = !recording;
     setRecording(next);
     recordingRef.current = next;
-    if (next) { setElapsed(0); setView("live"); startListen(); }
+    // Rec captures SYSTEM audio (the interviewer's voice via the meeting app),
+    // endpoints on silence, transcribes the question, and drafts an answer —
+    // then re-arms for the next question (see the chat:done handler).
+    if (next) { setElapsed(0); setView("live"); startSystemListen(); }
     else { invoke("voice_stop_listening").catch(() => {}); setListening(false); }
   };
 
@@ -618,13 +851,13 @@ export default function Copilot() {
     <div style={{ height: "100vh", width: "100vw", background: T.glass, color: T.text, fontFamily: T.fontBody, display: "flex", flexDirection: "column", overflow: "hidden", borderLeft: `2px solid ${T.accent}`, boxSizing: "border-box", position: "relative" }}>
       <div id="co-flash" style={{ position: "absolute", inset: 0, background: "#fff", opacity: 0, zIndex: 60, pointerEvents: "none" }} />
       <style>{`@keyframes co-flash{0%{opacity:0}12%{opacity:0.9}100%{opacity:0}}`}</style>
-      <DragBar state={STATE_LABEL[view]} cloak={cloak} onMin={() => win.minimize().catch(() => {})} onClose={() => win.close().catch(() => {})} />
+      <DragBar state={STATE_LABEL[view]} job={jobLabel} cloak={cloak} onMin={() => win.minimize().catch(() => {})} onClose={() => win.close().catch(() => {})} />
       <NavBar view={view} setView={setView} recording={recording} onToggleRec={toggleRec} onCapture={capture} time={fmt(elapsed)} />
       <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
         {view === "live" && <ListenBody recording={recording} time={fmt(elapsed)} lines={lines} />}
-        {view === "answer" && <AnswerBody question={question} answer={answer} answering={answering} onRephrase={() => followUp("Rephrase that answer more concisely.")} onDeeper={() => followUp("Go deeper — expand that answer with a specific example and metrics.")} onCopy={() => navigator.clipboard.writeText(answer).catch(() => {})} />}
-        {view === "cheat" && <CheatBody />}
-        {view === "settings" && <SettingsBody cloak={cloak} />}
+        {view === "answer" && <AnswerBody question={question} answer={answer} answering={answering} jobLabel={jobLabel} onRephrase={() => followUp("Rephrase that answer more concisely.")} onDeeper={() => followUp("Go deeper — expand that answer with a specific example and metrics.")} onCopy={() => navigator.clipboard.writeText(answer).catch(() => {})} />}
+        {view === "cheat" && <CheatBody cheat={cheat} busy={cheatBusy} jobLabel={jobLabel} onRefresh={refreshCheatsheet} />}
+        {view === "settings" && <SettingsBody cloak={cloak} opacity={opacity} onOpacity={applyOpacity} />}
       </div>
       {view !== "settings" && (
         <QuickAsk placeholder={placeholder} value={input} onChange={setInput} onSend={submit} busy={answering} listening={listening} onMic={micOnce} />

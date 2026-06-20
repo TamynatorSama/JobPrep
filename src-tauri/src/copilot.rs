@@ -11,22 +11,75 @@
 //! and we re-apply it on every `open` so a hide/show cycle can't silently
 //! re-expose the window.
 
-use tauri::{AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg(windows)]
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{COLORREF, HWND};
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowDisplayAffinity, GetWindowLongPtrW, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SET_WINDOW_POS_FLAGS, SM_REMOTESESSION,
-    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR,
-    WDA_NONE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetSystemMetrics, GetWindowDisplayAffinity, GetWindowLongPtrW, SetLayeredWindowAttributes,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, LWA_ALPHA,
+    SET_WINDOW_POS_FLAGS, SM_REMOTESESSION, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WDA_NONE, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
 
 pub const COPILOT_LABEL: &str = "copilot";
 
 const COPILOT_W: f64 = 384.0;
 const COPILOT_H: f64 = 640.0;
+
+// ─── Active-job context bridge ──────────────────────────────────────────────
+//
+// The copilot overlay is a SEPARATE window with its own React tree — it shares
+// no state with the main app. So when the user opens the overlay (button or the
+// global hotkey, which fires entirely in Rust), it has no idea which job is
+// active. The main window mirrors the selected job's research dossier into this
+// shared state on every selection/research change; the overlay reads the latest
+// snapshot right before each chat stream and passes it as `job_context`. Because
+// Rust always holds the freshest copy, both open paths (button + hotkey) ground
+// the copilot on the same job the user is looking at.
+
+/// The active job's context for the copilot overlay. `label` is a short
+/// "Role · Company" line for the UI; `context` is the system-prompt block
+/// (company/role/JD + company-research dossier + resume); `cheatsheet` is the
+/// structured interview cheatsheet (stories/facts/questions) the Cheatsheet tab
+/// renders, opaque here (`null` when the job has none yet).
+#[derive(Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotContext {
+    pub label: String,
+    pub context: String,
+    pub cheatsheet: serde_json::Value,
+}
+
+#[derive(Default)]
+pub struct CopilotContextState {
+    inner: std::sync::Mutex<CopilotContext>,
+}
+
+/// Mirror the active job's research context + cheatsheet from the main window.
+/// Called whenever the selected job (or its research / resume / cheatsheet)
+/// changes.
+#[tauri::command]
+pub fn set_copilot_context(
+    state: State<CopilotContextState>,
+    label: String,
+    context: String,
+    cheatsheet: Option<serde_json::Value>,
+) {
+    let mut g = state.inner.lock().unwrap();
+    g.label = label;
+    g.context = context;
+    g.cheatsheet = cheatsheet.unwrap_or(serde_json::Value::Null);
+}
+
+/// Read the latest active-job context. Called by the overlay right before each
+/// chat stream so the answer is grounded on whatever job is active *now*.
+#[tauri::command]
+pub fn get_copilot_context(state: State<CopilotContextState>) -> CopilotContext {
+    state.inner.lock().unwrap().clone()
+}
 
 /// What level of capture-hiding actually took effect on the overlay.
 /// `excluded` — `WDA_EXCLUDEFROMCAPTURE` confirmed live (window absent from
@@ -61,19 +114,16 @@ fn apply_cloak(hwnd: HWND) -> &'static str {
     "none"
 }
 
-/// Apply the overlay's extended-window-style hardening:
-///   • `WS_EX_TOOLWINDOW` (− `WS_EX_APPWINDOW`) — drops it from Alt+Tab and Task
-///     View. `skip_taskbar` only removes the taskbar button, not the switcher.
-///   • `WS_EX_NOACTIVATE` — clicking or showing the overlay does NOT steal focus
-///     from whatever's in front (e.g. a browser meeting). Critical: a focus
-///     change is a visible tell to the call / proctoring. Toggled off briefly by
-///     `copilot_typing` when the user deliberately types.
+/// Drop the overlay from Alt+Tab and Task View via `WS_EX_TOOLWINDOW`
+/// (− `WS_EX_APPWINDOW`). `skip_taskbar` only kills the taskbar button, not the
+/// switcher. NOTE: `WS_EX_NOACTIVATE` is applied separately and *deferred* (see
+/// `harden`) — setting it before WebView2's first composition leaves the page
+/// blank, so it must wait until after the first paint.
 #[cfg(windows)]
 fn set_overlay_styles(hwnd: HWND) {
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let new = (ex | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize)
-            & !(WS_EX_APPWINDOW.0 as isize);
+        let new = (ex | WS_EX_TOOLWINDOW.0 as isize) & !(WS_EX_APPWINDOW.0 as isize);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new);
         // FRAMECHANGED so the switcher re-reads the style immediately.
         let _ = SetWindowPos(
@@ -97,15 +147,85 @@ fn set_noactivate(hwnd: HWND, on: bool) {
     }
 }
 
-/// Apply every Windows-side hardening to the overlay and return the cloak mode.
+/// Set the overlay's whole-window opacity via a layered window (OS compositor),
+/// which is independent of WebView2's own compositing — so we get real
+/// see-through without the blank-page failure that true window transparency
+/// causes on Windows. `alpha` is 0..=255. At full opacity we REMOVE
+/// `WS_EX_LAYERED` so the default render path (and stealth cloak) are untouched;
+/// only a dialed-down overlay takes the layered path.
 #[cfg(windows)]
-fn harden(window: &tauri::WebviewWindow) -> &'static str {
-    let Ok(raw) = window.hwnd() else { return "none" };
+fn set_overlay_opacity(hwnd: HWND, alpha: u8) {
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered = WS_EX_LAYERED.0 as isize;
+        if alpha >= 255 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !layered);
+        } else {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | layered);
+            // crkey unused (LWA_ALPHA only) → COLORREF(0).
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+        }
+    }
+}
+
+/// Set overlay opacity from the frontend (0.0..1.0). Clamped so the window can't
+/// be made invisible/unclickable. No-op if the overlay isn't open.
+#[tauri::command]
+pub fn copilot_set_opacity(app: AppHandle, opacity: f64) {
+    #[cfg(windows)]
+    if let Some(win) = app.get_webview_window(COPILOT_LABEL) {
+        if let Ok(raw) = win.hwnd() {
+            let alpha = (opacity.clamp(0.30, 1.0) * 255.0).round() as u8;
+            set_overlay_opacity(HWND(raw.0 as _), alpha);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, opacity);
+    }
+}
+
+/// First-time hardening for a freshly built overlay. `WS_EX_TOOLWINDOW` is safe
+/// to apply at creation, but BOTH `WS_EX_NOACTIVATE` *and* the capture cloak
+/// (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`) blank the page when set
+/// before WebView2's first composition — each one switches the window onto a
+/// different activation/compositing path and the initial paint never fires. So
+/// both are deferred to a spawned thread that waits out the first paint. The
+/// overlay is briefly activatable AND capturable (~1.2s right at open); that's
+/// the price of a reliable first paint. The raw HWND pointer is `Send` as isize.
+#[cfg(windows)]
+fn harden_new(window: &tauri::WebviewWindow) {
+    let Ok(raw) = window.hwnd() else { return };
     // Reconstruct HWND from the raw handle so this compiles regardless of which
     // `windows` crate version Tauri itself pins — `.0` is just the pointer.
     let hwnd = HWND(raw.0 as _);
     set_overlay_styles(hwnd);
-    apply_cloak(hwnd)
+    let ptr = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let h = HWND(ptr as _);
+        let mode = apply_cloak(h);
+        set_noactivate(h, true);
+        if mode != "excluded" {
+            eprintln!("[copilot] cloak degraded: mode={mode}");
+        }
+    });
+}
+
+/// Re-cloak an EXISTING overlay on re-show. It has already completed its first
+/// paint, so the cloak and no-activate can be re-applied immediately — no blank,
+/// no exposure gap. Re-applying guards against a hide/show cycle silently
+/// clearing the display affinity.
+#[cfg(windows)]
+fn recloak_now(window: &tauri::WebviewWindow) {
+    let Ok(raw) = window.hwnd() else { return };
+    let hwnd = HWND(raw.0 as _);
+    set_overlay_styles(hwnd);
+    let mode = apply_cloak(hwnd);
+    set_noactivate(hwnd, true);
+    if mode != "excluded" {
+        eprintln!("[copilot] cloak degraded: mode={mode}");
+    }
 }
 
 /// Briefly let the overlay accept keyboard focus so the user can type, then
@@ -151,16 +271,10 @@ fn cloak_report(app: &AppHandle) -> (&'static str, bool) {
     (mode, remote)
 }
 
-#[cfg(windows)]
-fn harden_window(window: &tauri::WebviewWindow) {
-    let mode = harden(window);
-    if mode != "excluded" {
-        eprintln!("[copilot] cloak degraded: mode={mode}");
-    }
-}
-
 #[cfg(not(windows))]
-fn harden_window(_window: &tauri::WebviewWindow) {}
+fn harden_new(_window: &tauri::WebviewWindow) {}
+#[cfg(not(windows))]
+fn recloak_now(_window: &tauri::WebviewWindow) {}
 
 /// Capture-hiding status for the Settings badge. `mode`: excluded | monitor |
 /// none | closed. `remote`: true under RDP (stealth may not hold).
@@ -209,11 +323,18 @@ fn build_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     // for a programmatically-created window and renders a blank white page.
     // Mirroring the main window's URL works in both dev and the bundled app.
     let main = app.get_webview_window("main");
-    let url = main
-        .as_ref()
-        .and_then(|w| w.url().ok())
+    let main_url = main.as_ref().and_then(|w| w.url().ok());
+    let url = main_url
+        .clone()
         .map(WebviewUrl::External)
         .unwrap_or_else(|| WebviewUrl::App("index.html".into()));
+    eprintln!(
+        "[copilot] build_window: main_found={} mirror_url={:?} on_main_thread={}",
+        main.is_some(),
+        main_url.as_ref().map(|u| u.as_str()),
+        // crude: window creation must happen on the UI thread on Windows
+        std::thread::current().name().unwrap_or("<unnamed>").to_string(),
+    );
 
     let win = WebviewWindowBuilder::new(app, COPILOT_LABEL, url)
         .title("Audio Service")
@@ -229,30 +350,39 @@ fn build_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
         .skip_taskbar(true)
         .resizable(true)
         .shadow(true)
-        // Do NOT grab focus on open — surfacing the overlay must not pull focus
-        // off the meeting window. WS_EX_NOACTIVATE (set in set_overlay_styles)
-        // keeps clicks from stealing focus too.
-        .focused(false)
+        // MUST be focused(true): WebView2 won't kick its first paint on a window
+        // created unfocused (→ blank page). We immediately hand focus back to the
+        // prior foreground window (below) so opening still doesn't steal focus.
+        .focused(true)
         .build()
         .map_err(|e| format!("build copilot window failed: {e}"))?;
+    eprintln!("[copilot] build_window: window built, hwnd_ok={}", win.hwnd().is_ok());
 
     position_overlay(&win, main.as_ref());
-    // Apply capture-cloak + Alt+Tab hiding. Best-effort: a degraded cloak (e.g.
-    // pre-2004 Windows falls back to black-box) shouldn't stop the overlay from
-    // opening — the real state is reported to the UI via copilot_cloak_status.
-    harden_window(&win);
+    // Alt+Tab hiding now; capture-cloak + no-activate deferred until after the
+    // first paint (see harden_new — applying them at creation blanks the page).
+    // Best-effort: a degraded cloak (e.g. pre-2004 Windows falls back to
+    // black-box) shouldn't stop the overlay from opening — the real state is
+    // reported to the UI via copilot_cloak_status.
+    harden_new(&win);
     Ok(win)
 }
 
 /// Open the overlay (or re-show + re-cloak it if it already exists). Re-cloaking
 /// on every open guards against the documented hide/show clearing the affinity.
+///
+/// MUST be `async`: a sync `#[tauri::command]` runs on the main (event-loop)
+/// thread, and `WebviewWindowBuilder::build()` on Windows needs that loop to keep
+/// pumping while the WebView2 controller initializes. Blocking the loop inside the
+/// command deadlocks build() → white, frozen window. Async commands run off the
+/// main thread, so the loop stays free to pump and the build completes.
 #[tauri::command]
-pub fn open_copilot(app: AppHandle) -> Result<(), String> {
+pub async fn open_copilot(app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(COPILOT_LABEL) {
         let _ = win.show();
         // Intentionally no set_focus — surfacing must not steal focus from the
-        // meeting window. re-harden re-applies cloak + no-activate after show.
-        harden_window(&win);
+        // meeting window. Existing window already painted, so re-cloak now.
+        recloak_now(&win);
         return Ok(());
     }
     build_window(&app).map(|_| ())
@@ -268,18 +398,29 @@ pub fn close_copilot(app: AppHandle) -> Result<(), String> {
 }
 
 /// Toggle the overlay — used by the global hotkey and the Copilot toggle
-/// command. Returns the new visibility state (`true` = now open).
+/// command. Returns the new visibility state (`true` = now shown). Hides rather
+/// than closes an existing window so its position, opacity, and React state
+/// survive a hide/show cycle (the user can drag it once and it stays put). The
+/// `close_copilot` command (X button) is the only path that destroys it.
 pub fn toggle(app: &AppHandle) -> Result<bool, String> {
     if let Some(win) = app.get_webview_window(COPILOT_LABEL) {
-        win.close().map_err(|e| e.to_string())?;
-        Ok(false)
+        if win.is_visible().unwrap_or(true) {
+            win.hide().map_err(|e| e.to_string())?;
+            Ok(false)
+        } else {
+            win.show().map_err(|e| e.to_string())?;
+            recloak_now(&win); // re-apply cloak/no-activate after a hide/show
+            Ok(true)
+        }
     } else {
         build_window(app)?;
         Ok(true)
     }
 }
 
+/// Async for the same reason as `open_copilot`: building the overlay window must
+/// not run on the blocked main event-loop thread (deadlocks build() on Windows).
 #[tauri::command]
-pub fn toggle_copilot(app: AppHandle) -> Result<bool, String> {
+pub async fn toggle_copilot(app: AppHandle) -> Result<bool, String> {
     toggle(&app)
 }

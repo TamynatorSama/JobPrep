@@ -65,6 +65,7 @@ Routes:
 - **`routes/research.py`** — JD-only role-fit analysis. LangGraph workflow defined in `agents/workflow.py` with nodes `extract → questions → tips`. Stage banners emitted on `on_chain_start`; tokens forwarded from `on_chat_model_stream`.
 - **`routes/company_research.py`** — backed by the embedded `research_scraper` engine (editable-installed from `D:\code\ML\research_scraper`; LangGraph plan → search → scrape → reflect → peer → audit → synthesize, HTTP/JSON scraping — no browser, no logins). The engine's LLM router speaks the OpenAI-compatible wire format with a built-in fallback chain; the route maps the selected provider (gemini | openai | anthropic) onto the custom lane via the engine's `runtime.overrides` contextvar (Anthropic rides its OpenAI-compat endpoint `https://api.anthropic.com/v1`) and passes the spare gemini key as a fallback lane. The Gemini key also powers the Google Search grounding source regardless of provider.
 - **`routes/application.py`** — smart-tier resume tailor: aggregates evidence across master resumes, builds an ATS-tailored `.docx` (via `python-docx`), streams the cover letter as tokens, and emits a scorecard JSON event. Also serves `/application/knockout-screen` for recruiter-style screen simulation.
+- **`routes/cheatsheet.py`** — `POST /cheatsheet/build` (non-streaming JSON, smart tier). Aggregates a job's JD + resume + company-research dossier + conversation transcripts into a structured cheatsheet (`stories`/`facts`/`questions` via `generate_json`) and assembles the persisted markdown deterministically from those fields. Drives the copilot's Cheatsheet tab; rebuilt on a manual refresh and automatically after a mock interview. The live cheatsheet rides to the overlay through the copilot context bridge (`set_copilot_context` carries it alongside the job context).
 
 ### Persistence layout
 
@@ -72,6 +73,7 @@ Routes:
 - `%LOCALAPPDATA%\InterPrep\resumes.json` — master resume library
 - `%LOCALAPPDATA%\InterPrep\sidecar.log` — uvicorn stdout/stderr (single source of truth for sidecar boot failures)
 - `%APPDATA%\InterPrep\applications\<job_id>\resume.docx` — generated tailored resumes
+- `%APPDATA%\InterPrep\applications\<job_id>\cheatsheet.md` — the job's living interview cheatsheet (also stored structured on the Job in `jobs.json`)
 - Windows Credential Manager under service `"InterPrep"` — LLM provider toggle + Gemini/OpenAI/Anthropic API keys
 
 ## Things that will trip you up

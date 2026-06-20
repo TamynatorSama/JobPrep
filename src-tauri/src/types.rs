@@ -111,4 +111,9 @@ pub struct Job {
     /// Outcome of the most recent completed mock interview (opaque to Rust).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_interview: Option<serde_json::Value>,
+    /// Living interview cheatsheet (summary + STAR stories + facts + questions +
+    /// maintained markdown). Built/refreshed from the job's conversations,
+    /// resume, and company research. Opaque to Rust; the frontend owns the shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cheatsheet: Option<serde_json::Value>,
 }

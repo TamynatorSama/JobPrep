@@ -82,6 +82,26 @@ class ApplicationRequest(BaseModel):
     llm: LLMConfig = LLMConfig()
 
 
+class CheatsheetRequest(BaseModel):
+    """Build / refresh a job's interview cheatsheet.
+
+    Aggregates everything known about a job — JD, the candidate's resume, the
+    company-research dossier, and prior conversations (coach chats + mock
+    interviews) — into a structured cheatsheet (STAR stories, key facts,
+    questions to ask) plus a maintained markdown doc. `previous_markdown` lets
+    the LLM refine the existing sheet instead of regenerating from scratch.
+    """
+    company: str
+    role: str
+    location: Optional[str] = ""
+    job_description: Optional[str] = ""
+    resume: Optional[str] = ""            # tailored or master resume text
+    company_research: Optional[str] = ""  # research dossier text
+    documents: List[RagDoc] = []          # conversation transcripts (chats / interviews)
+    previous_markdown: Optional[str] = "" # existing cheatsheet to refine, if any
+    llm: LLMConfig = LLMConfig()
+
+
 class KnockoutRequest(BaseModel):
     """Simulate a recruiter's phone-screen / knockout interview.
 

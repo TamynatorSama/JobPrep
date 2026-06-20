@@ -16,7 +16,7 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 // pdf.js needs a worker. Vite emits the worker script as a separate URL asset
@@ -258,6 +258,23 @@ interface Job {
   scorecard?: Scorecard;
   /** Outcome of the most recent completed mock interview. */
   lastInterview?: { outcome: string; date: string; chatId: string };
+  /** Living interview cheatsheet, built from this job's conversations, resume,
+   *  and company research. Drives the copilot's Cheatsheet tab. */
+  cheatsheet?: Cheatsheet;
+}
+
+interface CheatStory { title: string; tag?: string; metric?: string; beats?: string[]; }
+interface CheatFact { k: string; v: string; }
+interface CheatQuestion { q: string; why?: string; }
+interface Cheatsheet {
+  summary?: string;
+  stories?: CheatStory[];
+  facts?: CheatFact[];
+  questions?: CheatQuestion[];
+  /** The maintained markdown doc (also written to disk as cheatsheet.md). */
+  markdown?: string;
+  /** Epoch-ms of the last build. */
+  updatedAt?: number;
 }
 
 type Screen = "chat" | "timeline";
@@ -3279,6 +3296,14 @@ const App = () => {
   /// Latest `startApplicationPrep` closure, so the inbox poller can launch the
   /// full Prep → Research chain with fresh `resumes`.
   const startApplicationPrepRef = useRef<((job: Job) => void) | null>(null);
+  /// Latest `generateCheatsheet` closure, so the `chat:done` listener can
+  /// auto-refresh the cheatsheet after a mock interview without re-registering.
+  const generateCheatsheetRef = useRef<((jobId: string) => void) | null>(null);
+  /// Single-flight guard for cheatsheet builds (state updates lag a tick).
+  const cheatBusyRef = useRef<Record<string, boolean>>({});
+  /// Latest selected job id, so cross-window events (copilot cheatsheet refresh)
+  /// can target the job the user is currently on.
+  const selectedJobIdRef = useRef<string | null>(null);
   /// Guards the job-capture poller so two ticks can't process the same item.
   const captureBusyRef = useRef(false);
   /// Backend-assigned ids of captures we've already turned into a job this
@@ -3587,6 +3612,8 @@ const App = () => {
           setJobs((prev) => prev.map((j) =>
             j.id !== job.id ? j : { ...j, lastInterview: { outcome, date, chatId: thread.id } },
           ));
+          // Fold how the candidate actually answered into the living cheatsheet.
+          generateCheatsheetRef.current?.(job.id);
           return; // interview over — don't speak/listen further
         }
         // Voice mode: flush the trailing partial sentence, then end the
@@ -3677,6 +3704,20 @@ const App = () => {
   // Keep refs in sync so the one-shot SSE listeners read latest state.
   useEffect(() => { credentialsRef.current = credentials; }, [credentials]);
   useEffect(() => { jobsRef.current        = jobs; },        [jobs]);
+  useEffect(() => { selectedJobIdRef.current = selectedJobId; }, [selectedJobId]);
+
+  // Copilot overlay asked to (re)build the active job's cheatsheet (its tab has a
+  // refresh button). The overlay doesn't know job ids — it's grounded on the
+  // selected job — so target whatever is selected here.
+  useEffect(() => {
+    let un: UnlistenFn | undefined;
+    let alive = true;
+    listen("cheatsheet:refresh", () => {
+      const id = selectedJobIdRef.current;
+      if (id) generateCheatsheetRef.current?.(id);
+    }).then((u) => { if (alive) un = u; else u(); });
+    return () => { alive = false; un?.(); };
+  }, []);
 
   // ── Resume library ─────────────────────────────────────────────────────
   // Load on mount, save on every mutation (cheap; the file is small).
@@ -3729,6 +3770,116 @@ const App = () => {
 
   const selectedJob  = jobs.find((j) => j.id === selectedJobId) ?? null;
   const selectedChat = selectedJob?.chats.find((c) => c.id === selectedChatId) ?? null;
+
+  // Mirror the active job's research dossier into the stealth copilot overlay.
+  // The overlay is a separate window with no access to this state; it reads the
+  // latest snapshot from Rust right before each answer (see copilot.rs). Pushing
+  // on every selection/research change keeps the hotkey-opened overlay grounded
+  // on whatever job the user is looking at, without the overlay knowing anything.
+  useEffect(() => {
+    const job = selectedJob;
+    if (!job) {
+      invoke("set_copilot_context", { label: "", context: "" }).catch(() => {});
+      return;
+    }
+    const research = job.chats.find(
+      (c) => c.id === `c-research-${job.id}` || c.title === "Company Research",
+    );
+    const researchText = research
+      ? research.messages
+          .filter((m) => m.role === "ai" && !m.streaming && m.content.trim().length > 0)
+          .map((m) => m.content)
+          .join("\n\n")
+      : "";
+    const masterResume = resumes.length > 0 ? resumes[resumes.length - 1] : null;
+    const resumeText = (job.tailoredResume?.trim() || masterResume?.text?.trim() || "");
+    const context = [
+      `Company: ${job.company}`,
+      `Role: ${job.role}`,
+      job.location ? `Location: ${job.location}` : "",
+      job.jobDescription ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}` : "",
+      researchText ? `\nCompany Research Dossier:\n${researchText.slice(0, 6000)}` : "",
+      resumeText ? `\nCandidate Resume:\n${resumeText.slice(0, 4000)}` : "",
+    ].filter(Boolean).join("\n");
+    invoke("set_copilot_context", {
+      label: `${job.role} · ${job.company}`,
+      context,
+      cheatsheet: job.cheatsheet ?? null,
+    }).catch(() => {});
+  }, [selectedJob, resumes]);
+
+  // Build/refresh a job's interview cheatsheet from its conversations, resume,
+  // and company research. Manual (button) + auto after a mock interview. The
+  // result is stored on the Job (→ persisted + pushed to the copilot tab) and
+  // written to disk as the job's living cheatsheet.md. Single-flight per job.
+  const generateCheatsheet = (jobId: string) => {
+    const job = jobsRef.current.find((j) => j.id === jobId);
+    if (!job) return;
+    if (cheatBusyRef.current[jobId]) return; // already building — don't double-fire
+    cheatBusyRef.current = { ...cheatBusyRef.current, [jobId]: true };
+
+    const masterResume = resumesRef.current.length > 0 ? resumesRef.current[resumesRef.current.length - 1] : null;
+    const resumeText = (job.tailoredResume?.trim() || masterResume?.text?.trim() || "");
+
+    // Company research dossier (the research thread's AI output).
+    const research = job.chats.find((c) => c.id === `c-research-${job.id}` || c.title === "Company Research");
+    const companyResearch = research
+      ? research.messages.filter((m) => m.role === "ai" && !m.streaming && m.content.trim()).map((m) => m.content).join("\n\n")
+      : "";
+
+    // Conversation transcripts (coach chats + mock interviews) — skip the
+    // research thread (passed separately) and empty/streaming bubbles.
+    const documents: { source: string; text: string }[] = [];
+    for (const c of job.chats) {
+      if (c.id === research?.id) continue;
+      const body = c.messages
+        .filter((m) => !m.streaming && m.content.trim().length > 0 && !m.content.includes(INTERVIEW_DONE_MARKER))
+        .map((m) => `${m.role === "user" ? "Candidate" : "Assistant"}: ${m.content}`)
+        .join("\n\n");
+      if (body) documents.push({ source: `chat: ${c.title}`, text: body });
+    }
+
+    invoke<Cheatsheet & { error?: string }>("generate_cheatsheet", {
+      payload: {
+        company: job.company,
+        role: job.role,
+        location: job.location,
+        job_description: job.jobDescription ?? "",
+        resume: resumeText,
+        company_research: companyResearch,
+        documents,
+        previous_markdown: job.cheatsheet?.markdown ?? "",
+        llm: llmPayload(credentialsRef.current),
+      },
+    })
+      .then((cs) => {
+        const cheatsheet: Cheatsheet = {
+          summary: cs.summary,
+          stories: cs.stories ?? [],
+          facts: cs.facts ?? [],
+          questions: cs.questions ?? [],
+          markdown: cs.markdown ?? "",
+          updatedAt: cs.updatedAt ?? Date.now(),
+        };
+        setJobs((prev) => prev.map((j) => j.id !== jobId ? j : { ...j, cheatsheet }));
+        if (cheatsheet.markdown) {
+          invoke("save_cheatsheet_md", { jobId, markdown: cheatsheet.markdown }).catch(() => {});
+        }
+        // Hand the fresh cheatsheet straight to the overlay (carry it in the
+        // event, not via a Rust re-read — the push effect that mirrors it to Rust
+        // hasn't committed yet). `label` lets the overlay confirm it's still
+        // showing this job before applying.
+        emit("cheatsheet:updated", { jobId, label: `${job.role} · ${job.company}`, cheatsheet }).catch(() => {});
+      })
+      .catch((e) => {
+        console.error("generate_cheatsheet failed:", e);
+        emit("cheatsheet:updated", { jobId, label: `${job.role} · ${job.company}`, error: String(e) }).catch(() => {});
+      })
+      .finally(() => {
+        const n = { ...cheatBusyRef.current }; delete n[jobId]; cheatBusyRef.current = n;
+      });
+  };
+  generateCheatsheetRef.current = generateCheatsheet;
 
   const onSelectJob = (jobId: string) => {
     setSelectedJobId(jobId);

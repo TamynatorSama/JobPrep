@@ -345,6 +345,36 @@ fn start_knockout_screen_stream(
     Ok(())
 }
 
+// ─── Interview cheatsheet ─────────────────────────────────────────────────
+
+/// Build/refresh a job's interview cheatsheet from its aggregated context
+/// (`payload` carries company/role/JD + resume + research dossier +
+/// conversation docs + the previous cheatsheet markdown + the LLM config).
+/// Returns the structured cheatsheet JSON for the frontend to store on the Job.
+#[tauri::command]
+fn generate_cheatsheet(
+    state: State<SidecarState>,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let url = require_url(&state)?;
+    backend_client::build_cheatsheet(&url, payload)
+}
+
+/// Persist the cheatsheet markdown as the job's living `.md` file at
+/// `%APPDATA%/InterPrep/applications/<job_id>/cheatsheet.md`. Returns the path.
+#[tauri::command]
+fn save_cheatsheet_md(job_id: String, markdown: String) -> Result<String, String> {
+    let dir = dirs::data_dir()
+        .ok_or_else(|| "no AppData directory available".to_string())?
+        .join("InterPrep")
+        .join("applications")
+        .join(&job_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let path = dir.join("cheatsheet.md");
+    std::fs::write(&path, markdown.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 // ─── Generated docx persistence ───────────────────────────────────────────
 
 /// Decode the base64 `.docx` bytes emitted by `chat:resume_docx` and write
@@ -797,6 +827,58 @@ fn voice_listen(
     Ok(())
 }
 
+/// Capture one interviewer question off the SYSTEM AUDIO loopback (what's
+/// playing through the speakers — the meeting app), VAD-endpointed with a
+/// noise-floor-adaptive detector biased against false silence. Transcribes it
+/// and emits `voice:transcript` (""=nothing heard). Same event surface as
+/// `voice_listen`, so the copilot's listen loop is source-agnostic. Used by the
+/// copilot Rec button to answer questions as they're asked.
+#[tauri::command]
+fn voice_listen_system(
+    app: AppHandle,
+    sidecar: State<SidecarState>,
+    voice: State<VoiceState>,
+) -> Result<(), String> {
+    let url = require_url(&sidecar)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    *voice.listen_stop.lock().unwrap() = Some(Arc::clone(&stop));
+
+    std::thread::spawn(move || {
+        let _ = app.emit("voice:listening", ());
+        let app_lvl = app.clone();
+        let mut last = Instant::now() - Duration::from_millis(100);
+        let mut on_level = move |rms: f32, zcr: f32| {
+            let now = Instant::now();
+            if now.duration_since(last) >= Duration::from_millis(45) {
+                last = now;
+                let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "listening" }));
+            }
+        };
+        let result = voice_audio::record_question(&stop, &mut on_level);
+        let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "listening" }));
+        match result {
+            Ok(Some(wav)) => {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+                match backend_client::voice_stt(&url, &b64) {
+                    Ok(text) => { let _ = app.emit("voice:transcript", text); }
+                    Err(e) => {
+                        let _ = app.emit("voice:error", e);
+                        let _ = app.emit("voice:transcript", String::new());
+                    }
+                }
+            }
+            Ok(None) => { let _ = app.emit("voice:transcript", String::new()); }
+            Err(e) => {
+                let _ = app.emit("voice:error", format!("system listen failed: {e:#}"));
+                let _ = app.emit("voice:transcript", String::new());
+            }
+        }
+    });
+
+    Ok(())
+}
+
 /// Force-end mic capture early (user pressed stop / disabled voice).
 #[tauri::command]
 fn voice_stop_listening(voice: State<VoiceState>) {
@@ -838,6 +920,7 @@ pub fn run() {
         .manage(SidecarState::default())
         .manage(RecorderState::default())
         .manage(VoiceState::default())
+        .manage(copilot::CopilotContextState::default())
         .setup(|app| {
             // Register Ctrl+\ to toggle the stealth copilot overlay. Best-effort:
             // if another app already owns the chord, log and carry on rather than
@@ -908,6 +991,8 @@ pub fn run() {
             start_company_research_stream,
             start_application_tailor_stream,
             start_knockout_screen_stream,
+            generate_cheatsheet,
+            save_cheatsheet_md,
             save_resume_docx,
             open_path,
             list_audio_devices,
@@ -921,12 +1006,16 @@ pub fn run() {
             voice_warm,
             voice_interrupt,
             voice_listen,
+            voice_listen_system,
             voice_stop_listening,
             copilot::open_copilot,
             copilot::close_copilot,
             copilot::toggle_copilot,
             copilot::copilot_cloak_status,
             copilot::copilot_typing,
+            copilot::copilot_set_opacity,
+            copilot::set_copilot_context,
+            copilot::get_copilot_context,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

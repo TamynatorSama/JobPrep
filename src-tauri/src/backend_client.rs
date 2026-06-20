@@ -281,6 +281,24 @@ pub fn timeline_ack(base_url: &str, token: &str, ids: Vec<String>) -> Result<(),
 
 // ─── Voice (blocking request/response, not SSE) ──────────────────────────────
 
+/// POST /cheatsheet/build — aggregate a job's context into a structured
+/// interview cheatsheet (+ maintained markdown). Non-streaming JSON; the LLM
+/// call can be slow on the smart tier, so allow a generous timeout.
+pub fn build_cheatsheet(base_url: &str, payload: Value) -> Result<Value, String> {
+    let client = reqwest::blocking::Client::new();
+    let resp: Value = client
+        .post(format!("{base_url}/cheatsheet/build"))
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .and_then(|r| r.json::<Value>())
+        .map_err(|e| e.to_string())?;
+    if let Some(err) = resp["error"].as_str() {
+        return Err(err.to_string());
+    }
+    Ok(resp)
+}
+
 /// GET /voice/status — capability + device (cuda/cpu) report.
 pub fn voice_status(base_url: &str) -> Result<Value, String> {
     let client = reqwest::blocking::Client::new();

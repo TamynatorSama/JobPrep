@@ -48,6 +48,27 @@ const NO_SPEECH_TIMEOUT_S: f64 = 10.0; // give up if the user never speaks
 const MAX_ANSWER_S: f64 = 120.0;      // hard cap on a single answer
 const BARGE_SPEECH_MS: f64 = 240.0;   // sustained voice to trigger barge-in
 
+// ── System-audio (interviewer) question capture ────────────────────────────
+// Capturing the *interviewer's* voice off the system loopback is a different
+// problem from the mic: the meeting volume is unknown and varies wildly, so a
+// fixed RMS threshold either misses quiet audio or false-triggers on hum. So we
+// calibrate the noise floor for the first few hundred ms and set the thresholds
+// RELATIVE to it. The whole design is biased AGAINST false silence detection
+// (answering before the question finishes):
+//   * generous trailing-silence window — a mid-question pause won't end the turn
+//   * a minimum total-voiced guard — a click/notification can't be mistaken for
+//     a complete question; if a transient trips onset and then goes silent, we
+//     discard it and keep listening instead of "answering" garbage.
+const Q_CALIBRATION_MS: f64 = 400.0;   // measure ambient noise floor at start
+const Q_ONSET_MULT: f32 = 3.0;         // onset threshold = noise_floor * this
+const Q_CONT_MULT: f32 = 1.8;          // continue threshold = noise_floor * this
+const Q_FLOOR_MIN: f32 = 0.006;        // floor so thresholds don't collapse in dead silence
+const Q_START_SPEECH_MS: f64 = 200.0;  // sustained voice to count as question onset
+const Q_END_SILENCE_MS: f64 = 1500.0;  // sustained trailing silence = question complete
+const Q_MIN_VOICED_MS: f64 = 350.0;    // a "question" must contain at least this much voice
+const Q_NO_SPEECH_TIMEOUT_S: f64 = 30.0; // interviewer may take a while — wait longer than the mic
+const PREROLL_MS: f64 = 300.0;         // audio kept before confirmed onset so we don't clip the start
+
 struct ComGuard;
 impl Drop for ComGuard {
     fn drop(&mut self) {
@@ -322,18 +343,36 @@ pub fn play_pcm_stream(
 
 // ─── Capture core ────────────────────────────────────────────────────────────
 
-/// Open the default mic and feed mono f32 blocks to `cb` until it returns
+/// Which endpoint to capture from. `Mic` = default capture device. `System` =
+/// render-loopback (what's playing through the speakers — i.e. the interviewer's
+/// voice in a meeting app). Loopback opens the default *render* device but
+/// initializes the client in the Capture direction (same trick as recorder.rs).
+#[derive(Clone, Copy, PartialEq)]
+enum CaptureSource {
+    Mic,
+    System,
+}
+
+/// Open the requested endpoint and feed mono f32 blocks to `cb` until it returns
 /// `false`, `stop` trips, or `max_secs` elapses. `cb(samples, sample_rate,
 /// block_ms)`.
-fn capture_run<F>(stop: &Arc<AtomicBool>, max_secs: f64, mut cb: F) -> Result<()>
+fn capture_run<F>(source: CaptureSource, stop: &Arc<AtomicBool>, max_secs: f64, mut cb: F) -> Result<()>
 where
     F: FnMut(&[f32], u32, f64) -> bool,
 {
     let _com = init_mta()?;
     let enumerator = DeviceEnumerator::new().context("failed to create device enumerator")?;
-    let device = enumerator
-        .get_default_device(&Direction::Capture)
-        .context("no default microphone")?;
+    // Loopback grabs the default *render* device but still initializes a Capture
+    // stream below; WASAPI shared-mode loopback then mirrors the playback into
+    // the capture buffer. Mic uses the default capture device directly.
+    let device = match source {
+        CaptureSource::Mic => enumerator
+            .get_default_device(&Direction::Capture)
+            .context("no default microphone")?,
+        CaptureSource::System => enumerator
+            .get_default_device(&Direction::Render)
+            .context("no default output device for loopback")?,
+    };
     let mut client = device.get_iaudioclient().context("failed to create capture client")?;
     let format = client.get_mixformat().context("failed to get mic mix format")?;
     let sample_rate = format.get_samplespersec();
@@ -424,7 +463,7 @@ fn level_of(samples: &[f32]) -> (f32, f32) {
 /// speech for `BARGE_SPEECH_MS`. Stops when `stop` is set.
 pub fn wait_for_speech(stop: &Arc<AtomicBool>, detected: &Arc<AtomicBool>) -> Result<()> {
     let mut voiced_ms = 0.0;
-    capture_run(stop, MAX_ANSWER_S, |mono, _sr, block_ms| {
+    capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, |mono, _sr, block_ms| {
         if rms(mono) >= SPEECH_RMS {
             voiced_ms += block_ms;
             if voiced_ms >= BARGE_SPEECH_MS {
@@ -452,7 +491,7 @@ pub fn record_answer(
     let mut silence_ms = 0.0;
     let mut elapsed_ms = 0.0;
 
-    capture_run(stop, MAX_ANSWER_S, |mono, sample_rate, block_ms| {
+    capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, |mono, sample_rate, block_ms| {
         sr = sample_rate;
         elapsed_ms += block_ms;
         let (level, zcr) = level_of(mono);
@@ -490,6 +529,124 @@ pub fn record_answer(
     })?;
 
     if !speech_started || collected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(encode_wav_mono16(&collected, sr)))
+}
+
+/// Capture one interviewer question off the system loopback with noise-floor-
+/// adaptive VAD endpointing. Returns 16-bit mono WAV bytes, or `None` if nothing
+/// usable was heard before the timeout. Tuned to NOT end on a mid-question pause
+/// and to discard transient blips (see the `Q_*` consts).
+pub fn record_question(
+    stop: &Arc<AtomicBool>,
+    on_level: &mut dyn FnMut(f32, f32),
+) -> Result<Option<Vec<u8>>> {
+    use std::collections::VecDeque;
+
+    let mut collected: Vec<f32> = Vec::new();
+    let mut preroll: VecDeque<f32> = VecDeque::new();
+    let mut preroll_cap = 0usize; // sized once sample rate is known
+    let mut sr = 16000u32;
+
+    // Calibration accumulators.
+    let mut calib_ms = 0.0;
+    let mut calib_sum = 0.0f32;
+    let mut calib_n = 0usize;
+    let mut calibrated = false;
+    let mut onset_th = Q_FLOOR_MIN * Q_ONSET_MULT; // provisional until calibrated
+    let mut cont_th = Q_FLOOR_MIN * Q_CONT_MULT;
+
+    let mut speech_started = false;
+    let mut voiced_ms = 0.0;       // consecutive voiced run while waiting for onset
+    let mut silence_ms = 0.0;      // trailing silence once recording
+    let mut total_voiced_ms = 0.0; // cumulative voice in the captured turn
+    let mut elapsed_ms = 0.0;
+
+    // Keep at most `cap` most-recent samples so a confirmed onset can be
+    // back-filled (we only confirm after Q_START_SPEECH_MS of sustained voice).
+    fn push_preroll(buf: &mut VecDeque<f32>, mono: &[f32], cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        for &s in mono {
+            if buf.len() == cap {
+                buf.pop_front();
+            }
+            buf.push_back(s);
+        }
+    }
+
+    capture_run(CaptureSource::System, stop, MAX_ANSWER_S, |mono, sample_rate, block_ms| {
+        sr = sample_rate;
+        elapsed_ms += block_ms;
+        if preroll_cap == 0 {
+            preroll_cap = (sample_rate as f64 * PREROLL_MS / 1000.0) as usize;
+        }
+        let (level, zcr) = level_of(mono);
+        on_level(level, zcr);
+
+        // Phase 1 — calibrate the ambient noise floor, set relative thresholds.
+        if !calibrated {
+            calib_sum += level;
+            calib_n += 1;
+            calib_ms += block_ms;
+            push_preroll(&mut preroll, mono, preroll_cap);
+            if calib_ms >= Q_CALIBRATION_MS {
+                let floor = if calib_n > 0 { calib_sum / calib_n as f32 } else { 0.0 };
+                onset_th = (floor * Q_ONSET_MULT).max(Q_FLOOR_MIN);
+                cont_th = (floor * Q_CONT_MULT).max(Q_FLOOR_MIN * 0.7);
+                calibrated = true;
+            }
+            return true;
+        }
+
+        // Phase 2 — wait for a sustained onset above the noise floor.
+        if !speech_started {
+            push_preroll(&mut preroll, mono, preroll_cap);
+            if level >= onset_th {
+                voiced_ms += block_ms;
+                if voiced_ms >= Q_START_SPEECH_MS {
+                    speech_started = true;
+                    // Prepend the pre-roll so the start of the question isn't clipped.
+                    collected.extend(preroll.drain(..));
+                    total_voiced_ms = voiced_ms;
+                }
+            } else {
+                voiced_ms = 0.0;
+                if elapsed_ms / 1000.0 > Q_NO_SPEECH_TIMEOUT_S {
+                    return false; // interviewer never spoke in the window
+                }
+            }
+            return true;
+        }
+
+        // Phase 3 — recording the question. Lower CONT threshold + generous
+        // trailing-silence so pauses between sentences don't end the turn.
+        collected.extend_from_slice(mono);
+        if level >= cont_th {
+            silence_ms = 0.0;
+            total_voiced_ms += block_ms;
+        } else {
+            silence_ms += block_ms;
+            if silence_ms >= Q_END_SILENCE_MS {
+                if total_voiced_ms >= Q_MIN_VOICED_MS {
+                    return false; // genuine question, fully ended → transcribe
+                }
+                // False trigger (a click / notification blip): discard and keep
+                // listening rather than answering a non-question.
+                speech_started = false;
+                voiced_ms = 0.0;
+                silence_ms = 0.0;
+                total_voiced_ms = 0.0;
+                collected.clear();
+                preroll.clear();
+            }
+        }
+        true
+    })?;
+
+    if !speech_started || total_voiced_ms < Q_MIN_VOICED_MS || collected.is_empty() {
         return Ok(None);
     }
     Ok(Some(encode_wav_mono16(&collected, sr)))

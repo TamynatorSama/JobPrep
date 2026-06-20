@@ -1,8 +1,8 @@
      Running BeforeDevCommand (`npm run dev`)
      Running DevCommand (`cargo  run --no-default-features --color always --`)
         Info Watching D:\code\ML\open-source\src-tauri for changes...
-[1m[92m   Compiling[0m interprep v0.1.0 (D:\code\ML\open-source\src-tauri)
-[1m[96m    Building[0m [=======================> ] 440/443: interpr…[1m[96m    Building[0m [=======================> ] 441/443: interpr…                                                            [1m[93mwarning[0m[1m[97m: function `voice_tts` is never used[0m
+[1m[92m    Blocking[0m waiting for file lock on artifact directory
+[1m[93mwarning[0m[1m[97m: function `voice_tts` is never used[0m
    [1m[96m--> [0msrc\backend_client.rs:296:8
     [1m[96m|[0m
 [1m[96m296[0m [1m[96m|[0m pub fn voice_tts(base_url: &str, text: &str) -> Result<Vec<u8>, String> {
@@ -70,6 +70,8 @@
 [1m[96m70[0m [1m[96m|[0m pub fn play_wav(
    [1m[96m|[0m        [1m[93m^^^^^^^^[0m
 
-[1m[96m    Building[0m [=======================> ] 441/443: interpr…                                                            [1m[93mwarning[0m: `interprep` (lib) generated 8 warnings
-[1m[96m    Building[0m [=======================> ] 442/443: AudioSe…                                                            [1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`dev` profile [unoptimized + debuginfo]]8;;\ target(s) in 5m 31s
+[1m[93mwarning[0m: `interprep` (lib) generated 8 warnings
+[1m[92m   Compiling[0m interprep v0.1.0 (D:\code\ML\open-source\src-tauri)
+[1m[96m    Building[0m [=======================> ] 442/443: AudioSe…                                                            [1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`dev` profile [unoptimized + debuginfo]]8;;\ target(s) in 5m 03s
 [1m[92m     Running[0m `target\debug\AudioService.exe`
+[copilot] cloak degraded: mode=none
