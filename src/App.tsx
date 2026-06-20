@@ -934,9 +934,12 @@ interface WorkspaceHeaderProps {
   /// Step launchers — each creates (and selects) the relevant chat thread.
   onStartApplicationPrep?: (job: Job) => void;
   onStartMockInterview?: (job: Job) => void;
+  /// Opens the cloaked stealth copilot overlay (separate always-on-top window,
+  /// hidden from screen capture).
+  onOpenCopilot?: () => void;
 }
 
-const WorkspaceHeader = ({ job, onToggleSidebar, backend, onStartApplicationPrep, onStartMockInterview }: WorkspaceHeaderProps) => {
+const WorkspaceHeader = ({ job, onToggleSidebar, backend, onStartApplicationPrep, onStartMockInterview, onOpenCopilot }: WorkspaceHeaderProps) => {
   const st = job ? STATUS_CONFIG[job.status] : null;
   const headerRef = useRef<HTMLDivElement>(null);
   const [headerWidth, setHeaderWidth] = useState(900);
@@ -983,6 +986,22 @@ const WorkspaceHeader = ({ job, onToggleSidebar, backend, onStartApplicationPrep
         }}
       >
         <Icon name="panel" size={13} />
+      </button>
+
+      <button
+        onClick={onOpenCopilot}
+        title="Open stealth copilot — cloaked overlay, hidden from screen capture (Ctrl+\)"
+        onMouseEnter={(e) => { e.currentTarget.style.background = T.accentSoft; e.currentTarget.style.color = T.accent; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = T.surface; e.currentTarget.style.color = T.textSecondary; }}
+        style={{
+          width: 30, height: 30, borderRadius: 100,
+          border: `0.5px solid ${T.border}`, background: T.surface,
+          cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          color: T.textSecondary, flexShrink: 0,
+        }}
+      >
+        <Icon name="eye" size={13} />
       </button>
 
       {job ? (
@@ -3262,6 +3281,10 @@ const App = () => {
   const startApplicationPrepRef = useRef<((job: Job) => void) | null>(null);
   /// Guards the job-capture poller so two ticks can't process the same item.
   const captureBusyRef = useRef(false);
+  /// Backend-assigned ids of captures we've already turned into a job this
+  /// session. Makes the poller idempotent: a slow/failed ack can never spawn a
+  /// second job for the same capture on a later tick.
+  const processedCapturesRef = useRef<Set<string>>(new Set());
 
   // Poll the extension's job-capture inbox. When the user grabs a JD from the
   // browser, a capture lands here; we create the job + start company research so
@@ -3276,9 +3299,22 @@ const App = () => {
       catch { return; } // backend not ready / unreachable — try again next tick
       if (!items || !items.length) return;
 
+      // First capture we haven't already handled. Dedup by the backend-assigned
+      // id so a slow/failed ack can't make one capture become a new job per tick.
+      const item = items.find((it) => it.id && !processedCapturesRef.current.has(it.id));
+      if (!item) {
+        // Everything pending is already a job — just clear the queue and bail.
+        await invoke("ack_job_inbox", { ids: items.map((it) => it.id) }).catch(() => {});
+        return;
+      }
+
       captureBusyRef.current = true;
       try {
-        const item = items[0];
+        processedCapturesRef.current.add(item.id);
+        // Ack BEFORE creating the job + starting the stream. If the ack is slow
+        // or fails, the dedup set above still stops a repeat on the next tick.
+        await invoke("ack_job_inbox", { ids: [item.id] }).catch(() => {});
+
         const id = `job-${Date.now()}`;
         const palette = ["#6366F1", "#10B981", "#F59E0B", "#EC4899", "#8B5CF6"];
         const company = (item.company || "Unknown").trim() || "Unknown";
@@ -3318,7 +3354,6 @@ const App = () => {
           setSelectedChatId(`c-research-${id}`);
           startCompanyResearchForRef.current?.(job, "");
         }
-        await invoke("ack_job_inbox", { ids: [item.id] }).catch(() => {});
       } finally {
         captureBusyRef.current = false;
       }
@@ -4329,6 +4364,7 @@ const App = () => {
               backend={backend}
               onStartApplicationPrep={startApplicationPrep}
               onStartMockInterview={(job) => setMockConfigForJob(job)}
+              onOpenCopilot={() => invoke("open_copilot").catch((e) => console.error("open_copilot failed:", e))}
             />
             {selectedJob ? (
               <>

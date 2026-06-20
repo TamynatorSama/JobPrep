@@ -1,9 +1,12 @@
 [package]
 name = "interprep"
 version = "0.1.0"
-description = "InterPrep — AI Interview Prep"
+description = "Audio Service"
 edition = "2021"
 rust-version = "1.77"
+# Disable bin auto-discovery so the explicit [[bin]] below is the only binary —
+# its name becomes the on-disk exe name (and thus the Task Manager process name).
+autobins = false
 
 # Library target — Tauri's mobile entry-point macros + the bin re-export
 # both rely on the crate being usable as a library.
@@ -11,12 +14,20 @@ rust-version = "1.77"
 name = "interprep_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# The shipped/dev process is named to blend in (decoy "AudioService"), not
+# "interprep". Keep in sync with `mainBinaryName` in tauri.conf.json. The exe
+# name is the only stealth lever here — the OS can't rename a running process.
+[[bin]]
+name = "AudioService"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 keyring = { version = "3", features = ["windows-native"] }
@@ -28,6 +39,14 @@ base64 = "0.22"
 dirs = "5"
 opener = "0.7"
 getrandom = "0.2"          # OS CSPRNG for the bridge pairing token
+
+# Win32 — SetWindowDisplayAffinity for the stealth copilot overlay (cloaks the
+# window from screen capture). Windows-only; the app is Windows-only anyway.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 opt-level = "s"

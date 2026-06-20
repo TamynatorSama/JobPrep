@@ -1,6 +1,7 @@
 //! InterPrep — Tauri runtime entry point.
 
 mod backend_client;
+mod copilot;
 mod credentials;
 mod jobs_store;
 mod recorder;
@@ -816,12 +817,39 @@ fn non_empty(s: String, fallback: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri_plugin_global_shortcut::ShortcutState;
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Global hotkey to toggle the stealth copilot overlay without touching
+        // the mouse. Only one shortcut is registered (below, in `setup`), so the
+        // handler doesn't need to disambiguate which fired.
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        if let Err(e) = copilot::toggle(app) {
+                            eprintln!("[copilot] hotkey toggle failed: {e}");
+                        }
+                    }
+                })
+                .build(),
+        )
         .manage(SidecarState::default())
         .manage(RecorderState::default())
         .manage(VoiceState::default())
         .setup(|app| {
+            // Register Ctrl+\ to toggle the stealth copilot overlay. Best-effort:
+            // if another app already owns the chord, log and carry on rather than
+            // failing app startup.
+            {
+                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+                let sc = Shortcut::new(Some(Modifiers::CONTROL), Code::Backslash);
+                if let Err(e) = app.global_shortcut().register(sc) {
+                    eprintln!("[copilot] global shortcut register failed: {e}");
+                }
+            }
+
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let state = handle.state::<SidecarState>();
@@ -894,6 +922,11 @@ pub fn run() {
             voice_interrupt,
             voice_listen,
             voice_stop_listening,
+            copilot::open_copilot,
+            copilot::close_copilot,
+            copilot::toggle_copilot,
+            copilot::copilot_cloak_status,
+            copilot::copilot_typing,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

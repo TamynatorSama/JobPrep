@@ -64,6 +64,37 @@ function ipScrape() {
   return fields;
 }
 
+// Reveal collapsed repeatable sections (Education, Work Experience, Certifications,
+// References, …) by clicking their "Add" controls, so their fields exist in the DOM
+// before we scrape. Clicks each matching control at most once per pass (re-clicking
+// would stack extra empty rows) and never touches Next/Submit/Remove/file pickers.
+// Async so the caller awaits the new rows rendering. Returns the click count.
+async function ipExpandSections() {
+  const ADD = /(^|\b)(add|insert|\+)(\b|$)/i;
+  const SECTION = /\b(education|school|degree|qualification|academ|experience|employment|work\s*history|position|certification|certificate|licen[sc]e|language|reference|project|award|publication|training|volunteer|membership|another|more|entry)\b/i;
+  const SKIP = /\b(remove|delete|cancel|close|clear|reset|next|back|previous|continue|submit|apply|finish|file|upload|attach|browse|choose\s*file|resume|cv|address)\b/i;
+  const vis = (el) => {
+    if (el.disabled) return false;
+    const st = getComputedStyle(el);
+    if (st.display === "none" || st.visibility === "hidden") return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const txt = (el) => (el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").trim();
+  const cands = [...document.querySelectorAll('button, a[role=button], [role=button], input[type=button]')];
+  let clicked = 0;
+  for (const c of cands) {
+    if (!vis(c)) continue;
+    const t = txt(c);
+    if (!t || t.length > 60) continue;
+    if (SKIP.test(t) || !ADD.test(t) || !SECTION.test(t)) continue;
+    try { c.click(); clicked++; } catch { /* ignore */ }
+    if (clicked >= 12) break; // bound how many rows we add in one pass
+  }
+  if (clicked) await new Promise((r) => setTimeout(r, 450)); // let the new rows render
+  return clicked;
+}
+
 // Fill a frame. items = [{key(localKey), value, type, radioName?}]. Returns count.
 function ipFill(items) {
   const fire = (el) => { el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); };

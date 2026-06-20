@@ -11,7 +11,7 @@ const browser = globalThis.browser || globalThis.chrome;
 // Chrome runs this as a service worker and pulls in the shared page functions
 // here. Firefox runs it as an event page and loads inject.js via manifest
 // background.scripts instead, so importScripts won't exist — skip it there.
-if (typeof importScripts === "function") importScripts("inject.js"); // ipScrape / ipFill / ipAttach / ipFindNav / ipClickNext / ipFingerprint
+if (typeof importScripts === "function") importScripts("inject.js"); // ipScrape / ipExpandSections / ipFill / ipAttach / ipFindNav / ipClickNext / ipFingerprint
 
 const MAX_PAGES = 12;
 const LOWCONF = 0.7;
@@ -177,6 +177,7 @@ async function loop() {
 
     emit({ type: "step", page: ctx.page, steps: await scrapeSteps(ctx.tabId) });
 
+    try { await exec(ctx.tabId, ipExpandSections); } catch { /* reveal collapsed sections — best-effort */ }
     const fields = await scrapeAll(ctx.tabId);
     ctx.fields = fields;
 

@@ -176,12 +176,20 @@ def resumes_text(resume_ids: list[int] | None) -> list[dict]:
 _MEMORY_FILE = "qa_memory.json"
 
 
+_LABEL_FILLER = re.compile(r"\b(required|optional|please)\b")
+
+
 def normalize_label(label: str) -> str:
-    """Canonical key for a question so 'Years of experience*' and
-    'years of experience' hit the same bank entry."""
+    """Canonical key for a question so variants of the SAME field across forms
+    hit one bank entry — that's what stops re-asking something already answered.
+    'Years of experience *', '(Required) Years of Experience', and 'years of
+    experience?' all collapse to 'years of experience'."""
     t = (label or "").strip().lower()
-    t = t.rstrip("*:?").strip()        # drop required-markers / trailing punct
-    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\([^)]*\)", " ", t)        # drop "(required)" / "(optional)" / parentheticals
+    t = re.sub(r"\[[^\]]*\]", " ", t)       # drop "[…]" markers
+    t = _LABEL_FILLER.sub(" ", t)           # drop boilerplate words
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)      # punctuation / *, :, ? → space
+    t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
@@ -191,9 +199,10 @@ def load_memory() -> dict[str, dict]:
 
 
 def remember(label: str, value: str) -> None:
-    """Upsert one answer into the bank, keyed by the normalized label."""
+    """Upsert one answer into the bank, keyed by the normalized label. Empty
+    values are ignored so a blank submission can't clobber a good saved answer."""
     key = normalize_label(label)
-    if not key:
+    if not key or not (value or "").strip():
         return
     mem = load_memory()
     mem[key] = {"label": label, "value": value}

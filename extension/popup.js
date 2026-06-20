@@ -108,6 +108,13 @@ async function execBest(tabId, func, args) {
   catch { return (await browser.scripting.executeScript({ target: { tabId }, ...opts })).map((r) => r && r.result).filter(Boolean); }
 }
 
+// Click "Add education / Add work experience / …" controls across all frames so
+// their collapsed fields exist before we scrape. Best-effort; failures are fine.
+async function expandFrames(tabId) {
+  try { await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: ipExpandSections }); }
+  catch { try { await browser.scripting.executeScript({ target: { tabId }, func: ipExpandSections }); } catch { /* ignore */ } }
+}
+
 async function scrapeAllFrames(tabId) {
   let res;
   try { res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: ipScrape }); }
@@ -213,6 +220,7 @@ async function previewFill() {
   $("autofill-btn").disabled = true; $("autofill-label").textContent = "Autofill";
   $("run-status").textContent = "Scanning page…";
 
+  await expandFrames(tab.id); // reveal collapsed Education / Experience / … sections
   lastFields = await scrapeAllFrames(tab.id);
   if (!lastFields.length) {
     $("run-status").textContent = "No fillable fields found — open the form, then reopen the popup.";
@@ -607,9 +615,13 @@ async function aiExtract() {
   } catch (e) { st.textContent = "AI error: " + e.message; }
 }
 
+let sendingJD = false;
 async function sendJD() {
+  if (sendingJD) return;                       // in-flight — ignore double-clicks
   if (!lastCapture) { $("capture-status").textContent = "Nothing captured yet."; return; }
   const st = $("capture-status");
+  const btn = $("capture-btn");
+  sendingJD = true; btn.disabled = true;
   st.textContent = "Saving…";
   try {
     const r = await api("/inbox/job", {
@@ -626,6 +638,7 @@ async function sendJD() {
     lastCapture = null;
     setTimeout(async () => { await populateJobs(); showView("jobs"); }, 1200);
   } catch (e) { st.textContent = "Save error: " + e.message; }
+  finally { sendingJD = false; btn.disabled = false; }
 }
 
 // ── job picker (hub) ─────────────────────────────────────────────────────────
