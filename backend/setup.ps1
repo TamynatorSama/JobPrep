@@ -44,9 +44,21 @@ Write-Host "==> Installing requirements ..."
 & .\.venv\Scripts\pip install --upgrade pip
 & .\.venv\Scripts\pip install -r requirements.txt
 
-# Install Playwright browser
-Write-Host "==> Installing Playwright Chromium browser ..."
-& .\.venv\Scripts\playwright install chromium
+# Company-research engine (research_scraper). HTTP/JSON scraping — no browser
+# needed (the old Playwright/Chromium step is gone). Not on PyPI: install from
+# a sibling checkout if one exists, else warn — everything except the Company
+# Research tab works without it.
+$engine = @("..\research_scraper", "..\..\research_scraper") |
+    ForEach-Object { Resolve-Path $_ -ErrorAction SilentlyContinue } |
+    Select-Object -First 1
+if ($engine) {
+    Write-Host "==> Installing company-research engine from $engine ..."
+    & .\.venv\Scripts\pip install $engine.Path
+} else {
+    Write-Host "==> research_scraper checkout not found (looked in ..\ and ..\..\)." -ForegroundColor Yellow
+    Write-Host "    Company research will be unavailable; everything else works." -ForegroundColor Yellow
+    Write-Host "    Clone it next to this repo and re-run, or: pip install <path-to-research_scraper>" -ForegroundColor Yellow
+}
 
 # ── Optional voice stack ─────────────────────────────────────────────────────
 if ($Voice) {

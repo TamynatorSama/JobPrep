@@ -9,6 +9,9 @@ backend/.venv/
 backend/__pycache__/
 backend/**/__pycache__/
 backend/**/*.pyc
+# research_scraper's on-disk cache (scraped pages + SQLite db) — machine state,
+# churns on every research run; never belongs in the repo.
+backend/.cache/
 
 # Build / install caches
 .pytest_cache/

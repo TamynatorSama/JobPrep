@@ -105,27 +105,67 @@ def make_chat_model(
     p = provider_of(cfg)
     name = model_name or candidate_models(cfg, tier)[0]
 
+    # LangChain clients default to ~6 retries with exponential backoff, which
+    # turns a dead key / down model into a minute-long stall before our own
+    # candidate-fallback can act. One retry is enough for a transient blip;
+    # anything persistent should fail fast so the next candidate gets a shot.
     if p == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
         kwargs = {} if temperature is None else {"temperature": temperature}
+        # Gemini 2.5 models ship with DYNAMIC "thinking" on by default, which
+        # burns seconds of reasoning tokens before the first output token. The
+        # fast tier exists for latency (copilot live answers, coach chat,
+        # router/summary utility calls) — none of it needs deliberation, so
+        # zero the budget there. Smart/mid tiers keep the default (persona
+        # consistency + structured resume work benefit from it).
+        if tier == "fast" and "2.5" in name:
+            kwargs["thinking_budget"] = 0
         return ChatGoogleGenerativeAI(
-            model=name, google_api_key=cfg.gemini_api_key, **kwargs,
+            model=name, google_api_key=cfg.gemini_api_key, max_retries=2, **kwargs,
         )
     if p == "openai":
         from langchain_openai import ChatOpenAI
         kwargs = {}
         if temperature is not None and not name.startswith(_OPENAI_NO_TEMPERATURE):
             kwargs["temperature"] = temperature
-        return ChatOpenAI(model=name, api_key=cfg.openai_api_key, **kwargs)
+        return ChatOpenAI(
+            model=name, api_key=cfg.openai_api_key, max_retries=2, **kwargs,
+        )
     if p == "anthropic":
         from langchain_anthropic import ChatAnthropic
         kwargs = {} if temperature is None else {"temperature": temperature}
         # langchain-anthropic defaults max_tokens to 1024, which truncates
         # resumes/dossiers mid-sentence — raise it for every call.
         return ChatAnthropic(
-            model=name, api_key=cfg.anthropic_api_key, max_tokens=8192, **kwargs,
+            model=name, api_key=cfg.anthropic_api_key, max_tokens=8192,
+            max_retries=2, **kwargs,
         )
     raise ValueError(f"Unknown LLM provider: {p}")
+
+
+def is_auth_error(exc: Exception) -> bool:
+    """True when the failure is a bad/missing API key. Every candidate model of
+    the provider shares the key, so callers should stop walking the candidate
+    list and surface a fix-your-key message instead of burning retries."""
+    s = str(exc).lower()
+    return any(m in s for m in (
+        "api key not valid",         # gemini
+        "api_key_invalid",           # gemini (status detail)
+        "invalid api key",           # generic
+        "incorrect api key",         # openai
+        "invalid x-api-key",         # anthropic
+        "authentication_error",      # anthropic/openai error type
+        "authenticationerror",
+        "permission_denied",
+    ))
+
+
+def auth_error_message(cfg: LLMConfig) -> str:
+    label = PROVIDER_LABELS.get(provider_of(cfg), provider_of(cfg))
+    return (
+        f"Your {label} API key was rejected. "
+        "Open **Settings → API Keys** and paste a valid key (or switch provider)."
+    )
 
 
 # ── Response/stream content helpers ──────────────────────────────────────────
@@ -184,10 +224,13 @@ async def generate_raw(
     last_err: Exception | None = None
     for name in candidate_models(cfg, tier):
         try:
-            model = make_chat_model(cfg, name, temperature=temperature)
+            model = make_chat_model(cfg, name, tier=tier, temperature=temperature)
             resp = await model.ainvoke([HumanMessage(content=prompt)])
         except Exception as exc:  # model unavailable — try the next candidate
             last_err = exc
+            if is_auth_error(exc):
+                # Same key for every candidate — no point walking the rest.
+                raise RuntimeError(auth_error_message(cfg)) from exc
             continue
         return content_text(resp), name
     raise last_err or RuntimeError("No model available")

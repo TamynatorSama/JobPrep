@@ -29,6 +29,15 @@ pub const COPILOT_LABEL: &str = "copilot";
 const COPILOT_W: f64 = 384.0;
 const COPILOT_H: f64 = 640.0;
 
+/// WebView2 additional browser args for the overlay. Disables Chromium's
+/// background/occlusion/timer throttling so the never-foreground cloaked overlay
+/// keeps animating + flushing streamed tokens at full speed. MUST be byte-for-byte
+/// identical to the main window's `additionalBrowserArgs` in tauri.conf.json —
+/// WebView2 fails to create a second environment whose options differ from the
+/// first. The `--disable-features=...` segment restates wry's default so the main
+/// window keeps it.
+const COPILOT_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
+
 // ─── Active-job context bridge ──────────────────────────────────────────────
 //
 // The copilot overlay is a SEPARATE window with its own React tree — it shares
@@ -338,6 +347,20 @@ fn build_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
 
     let win = WebviewWindowBuilder::new(app, COPILOT_LABEL, url)
         .title("Audio Service")
+        // The overlay is intentionally never-foreground (no-activate) and cloaked
+        // (WDA_EXCLUDEFROMCAPTURE), so Chromium treats it as a backgrounded window
+        // and throttles requestAnimationFrame + timers in its renderer — the
+        // streamed-answer view flushes tokens on a rAF/timer (Copilot.tsx), so
+        // throttling can leave it stuck in "Thinking…" with tokens unrendered.
+        // These flags keep the renderer at full speed while backgrounded.
+        //
+        // CRITICAL: WebView2 requires EVERY window in the process to share the
+        // SAME environment options. If this string differs from the main window's,
+        // creating the second environment fails (ERROR_INVALID_STATE) and the
+        // overlay never opens. So this MUST stay byte-identical to the main
+        // window's `additionalBrowserArgs` in tauri.conf.json. (The leading flag
+        // restates wry's default so the main window doesn't lose it.)
+        .additional_browser_args(COPILOT_BROWSER_ARGS)
         .inner_size(COPILOT_W, COPILOT_H)
         .min_inner_size(320.0, 360.0)
         .decorations(false)

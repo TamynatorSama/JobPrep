@@ -8,12 +8,15 @@ InterPrep helps you track job applications, research roles and companies, practi
 
 - **Job pipeline** — Track applications through stages (Applied → Screen → Technical → Offer) with a timeline view.
 - **Role-fit research** — Paste a job description and get structured analysis: explicit requirements, implicit signals, and prep tips.
-- **Company research** — Multi-source research (Glassdoor, Indeed, Google, Comparably, Levels.fyi, RepVue) orchestrated by an agent workflow. Optional site credentials unlock paywalled sources.
+- **Company research** — Multi-source agent workflow (plan → search → scrape → reflect → audit → synthesize) over public HTTP/JSON sources. No browser, no site logins.
 - **Coach chat** — Ask follow-up questions about a role with context from your job record and uploaded documents.
 - **Mock interviews** — Live interviewer mode with configurable focus areas, difficulty, and question style. Optional voice mode with spoken Q&A and barge-in.
+- **Interview copilot** — A movable, screen-capture-cloaked overlay that listens to the call, transcribes each interviewer question, and drafts an answer live, alongside a per-job cheatsheet.
 - **Application prep** — ATS-tailored resume (`.docx`), cover letter streaming, and a knockout-screen simulation.
+- **Browser extension** — Auto-fills job applications and creates job records from postings via a token-guarded local bridge.
 - **Resume library** — Upload and manage master resumes (PDF, DOCX, MD, TXT) used across workflows.
-- **Local-first storage** — Jobs, resumes, and chat history persist under `%LOCALAPPDATA%\InterPrep\`. API keys and site logins live in Windows Credential Manager.
+- **Multi-LLM** — Bring your own Google Gemini, OpenAI, or Anthropic API key and switch provider in Settings.
+- **Local-first storage** — Jobs, resumes, and chat history persist under `%LOCALAPPDATA%\InterPrep\`. API keys live in Windows Credential Manager.
 
 ## Architecture
 
@@ -24,7 +27,7 @@ React UI (Vite + TypeScript)
         ↕  Tauri IPC
 Rust shell (sidecar lifecycle, credentials, audio, file I/O)
         ↕  HTTP / SSE on 127.0.0.1
-Python sidecar (FastAPI + LangGraph + Playwright)
+Python sidecar (FastAPI + LangGraph)
 ```
 
 The frontend never calls the backend directly — all traffic goes through Tauri `invoke` handlers, which stream SSE events back as window events (`chat:token`, `chat:done`, etc.).
@@ -58,7 +61,7 @@ cd backend
 .\setup.ps1
 ```
 
-This creates `backend/.venv`, installs dependencies, and runs `playwright install chromium`.
+This creates `backend/.venv`, installs dependencies, and installs the company-research engine from a sibling `research_scraper` checkout when present.
 
 For optional voice mode (local STT/TTS):
 
@@ -83,7 +86,7 @@ Tauri starts the Vite dev server and launches the desktop window. The Rust shell
 
 ### 5. Configure API keys
 
-Open **Settings → API Keys** in the app and add your [Google Gemini API key](https://aistudio.google.com/apikey). Company research on Glassdoor or Indeed also accepts optional site credentials stored the same way.
+Open **Settings → API Keys** in the app, pick a provider (Google Gemini, OpenAI, or Anthropic), and paste that provider's API key — e.g. a [Gemini key](https://aistudio.google.com/apikey). A Gemini key is also used for search grounding during company research, whichever provider you select.
 
 ## Common commands
 
@@ -127,8 +130,8 @@ backend/agents/       LangGraph workflows (research, company research)
 
 - The Python sidecar binds to **127.0.0.1** only and is launched as a child of the Tauri process — it is not exposed to the network.
 - Credentials never touch disk as plain text; they are stored in Windows Credential Manager.
-- LLM calls go to Google Gemini using **your** API key. Review [Google's terms](https://ai.google.dev/gemini-api/terms) before use.
-- Company research may log into third-party sites with credentials you provide. Use at your own discretion.
+- LLM calls go to the provider you select (Google Gemini, OpenAI, or Anthropic) using **your** API key. Review your provider's terms before use.
+- Company research scrapes only public pages over HTTP — no browser automation, no site logins.
 
 ## Contributing
 

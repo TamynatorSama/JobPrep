@@ -128,13 +128,72 @@ const pill = (bg: string, color: string, br?: string): CSSProperties => ({
 const Dot = ({ c, pulse }: { c: string; pulse?: boolean }) => (
   <span style={{ width: 6, height: 6, borderRadius: "50%", background: c, flexShrink: 0, animation: pulse ? "co-blink 1.3s ease-in-out infinite" : "none" }} />
 );
-const Wave = ({ active, color, count = 22, h = 22 }: { active?: boolean; color: string; count?: number; h?: number }) => (
-  <div style={{ display: "flex", alignItems: "center", gap: 2.5, height: h }}>
-    {Array.from({ length: count }).map((_, i) => (
-      <div key={i} style={{ width: 2.5, borderRadius: 3, height: active ? h : 3, background: active ? color : T.border, transformOrigin: "center", animation: active ? `co-bar 0.5s ease-in-out ${(i % 7) * 0.08}s infinite alternate` : "none" }} />
-    ))}
-  </div>
-);
+// Live audio meter. When `levelRef` is supplied the bars are driven by the real
+// capture level on a rAF loop (DOM writes only — no React re-render): bar HEIGHT
+// tracks RMS loudness and bar COLOR tracks pitch (zero-crossing rate), so the
+// user can see voice is actually being picked up. Without `levelRef` it falls
+// back to the old decorative CSS-keyframe bars.
+const Wave = ({ active, color, count = 22, h = 22, levelRef }: {
+  active?: boolean; color: string; count?: number; h?: number;
+  levelRef?: { current: { level: number; pitch: number } };
+}) => {
+  const bars = useRef<(HTMLDivElement | null)[]>([]);
+  const heights = useRef<number[]>(Array(count).fill(0));
+
+  useEffect(() => {
+    if (!levelRef) return;            // decorative mode handled by CSS below
+    if (!active) {                    // paused → flatten the bars
+      heights.current.fill(0);
+      bars.current.forEach((b) => { if (b) { b.style.height = "3px"; b.style.background = T.border; } });
+      return;
+    }
+    let raf = 0;
+    const mid = (count - 1) / 2;
+    const tick = () => {
+      const { level, pitch } = levelRef.current;
+      // RMS of speech sits ~0..0.12; map to 0..1. Pitch (ZCR) ~0..0.4 → hue
+      // sweep from violet (low) toward cyan (high) so timbre is visible.
+      const amp = Math.min(1, level / 0.12);
+      const hue = 270 - Math.min(1, pitch / 0.35) * 90;   // 270°→180°
+      const now = performance.now();
+      for (let i = 0; i < count; i++) {
+        const dist = Math.abs(i - mid) / mid;             // 0 center → 1 edge
+        const shape = 1 - dist * 0.55;                    // center-weighted
+        const jitter = 0.78 + 0.22 * Math.sin(i * 1.7 + now / 90);
+        const target = amp * shape * jitter;
+        const prev = heights.current[i];
+        const k = target > prev ? 0.55 : 0.16;            // fast attack, slow release
+        const v = prev + (target - prev) * k;
+        heights.current[i] = v;
+        const b = bars.current[i];
+        if (b) {
+          b.style.height = `${(3 + v * (h - 3)).toFixed(1)}px`;
+          b.style.background = v > 0.04 ? `hsl(${hue.toFixed(0)},90%,${(55 + amp * 12).toFixed(0)}%)` : T.border;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [active, levelRef, count, h]);
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 2.5, height: h }}>
+      {Array.from({ length: count }).map((_, i) => (
+        <div
+          key={i}
+          ref={levelRef ? (el) => { bars.current[i] = el; } : undefined}
+          style={{
+            width: 2.5, borderRadius: 3, transformOrigin: "center",
+            height: levelRef ? 3 : (active ? h : 3),
+            background: levelRef ? T.border : (active ? color : T.border),
+            animation: levelRef ? "none" : (active ? `co-bar 0.5s ease-in-out ${(i % 7) * 0.08}s infinite alternate` : "none"),
+          }}
+        />
+      ))}
+    </div>
+  );
+};
 // Cursor stays `default` on controls — stealth contract (don't telegraph clicks).
 const press: CSSProperties = { cursor: "default" };
 
@@ -261,21 +320,52 @@ function QuickAsk({ placeholder, value, onChange, onSend, busy, listening, onMic
   );
 }
 
-// ── View: live transcript (real captured lines + listening state) ───────────
-function ListenBody({ recording, time, lines }: { recording: boolean; time: string; lines: { speaker: string; text: string; last: boolean }[] }) {
+// Pipeline status for the copilot, shown so the user always knows what's
+// happening (and that a long transcribe/think isn't a hang).
+type Phase = "idle" | "listening" | "transcribing" | "thinking" | "answering";
+const PHASE_UI: Record<Phase, { label: string; c: string; pulse: boolean }> = {
+  idle:         { label: "Paused",         c: T.textTertiary,   pulse: false },
+  listening:    { label: "Listening",      c: T.accent,         pulse: true  },
+  transcribing: { label: "Transcribing…",  c: T.amber,          pulse: true  },
+  thinking:     { label: "Thinking…",      c: T.violet,         pulse: true  },
+  answering:    { label: "Answering",      c: T.green,          pulse: true  },
+};
+
+// ── View: live transcript (real captured lines + status + streamed answer) ──
+function ListenBody({ phase, time, lines, levelRef, question, answer, answering, onFinish }: {
+  phase: Phase; time: string;
+  lines: { speaker: string; text: string; last: boolean }[];
+  levelRef: { current: { level: number; pitch: number } };
+  question: string; answer: string; answering: boolean;
+  onFinish: () => void;
+}) {
+  const u = PHASE_UI[phase];
+  const active = phase !== "idle";
   const show = lines.length ? lines : [{ speaker: "—", text: "Tap Rec audio to listen in on the call — I'll transcribe each interviewer question and draft an answer when they finish. (Or use the mic to ask your own.)", last: true }];
   return (
     <div style={{ display: "flex", flexDirection: "column" }}>
+      {/* Status header — the dot/label always reflect the current phase. */}
       <div style={{ flexShrink: 0, padding: "11px 13px", display: "flex", alignItems: "center", gap: 11, borderBottom: `1px solid ${T.glassEdge}` }}>
         <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
           <span style={{ position: "relative", width: 8, height: 8, flexShrink: 0 }}>
-            <span style={{ position: "absolute", inset: 0, borderRadius: "50%", background: recording ? T.accent : T.textTertiary, animation: recording ? "co-pulse 1.3s ease-in-out infinite" : "none" }} />
+            <span style={{ position: "absolute", inset: 0, borderRadius: "50%", background: u.c, animation: u.pulse ? "co-pulse 1.3s ease-in-out infinite" : "none" }} />
           </span>
-          <span style={{ fontSize: 11.5, fontWeight: 600, color: recording ? T.text : T.textSecondary }}>{recording ? "Listening" : "Paused"}</span>
+          <span style={{ fontSize: 11.5, fontWeight: 600, color: active ? T.text : T.textSecondary }}>{u.label}</span>
         </div>
-        <div style={{ flex: 1 }}><Wave active={recording} color={T.accent} count={24} h={20} /></div>
-        <span style={{ fontSize: 11, color: recording ? T.textSecondary : T.textTertiary, fontVariantNumeric: "tabular-nums" }}>{recording ? time : "tap Rec"}</span>
+        {/* Wave only animates while actually capturing audio. */}
+        <div style={{ flex: 1 }}><Wave active={phase === "listening"} color={T.accent} count={24} h={20} levelRef={levelRef} /></div>
+        {/* Manual override for imperfect silence detection: end capture now and
+            transcribe what's been heard. Only while actively listening. Also
+            bound to the global Ctrl+` hotkey. */}
+        {phase === "listening" && (
+          <button onClick={onFinish} title="Transcribe now (Ctrl+`) — stop waiting for silence"
+            style={{ height: 24, display: "flex", alignItems: "center", gap: 5, padding: "0 9px", borderRadius: 100, border: `0.5px solid ${T.accent}55`, background: T.accentSoft, color: T.accent, fontSize: 10.5, fontWeight: 600, fontFamily: T.fontBody, flexShrink: 0, ...press }}>
+            <Icon name="check" size={11} color={T.accent} sw={2.4} />Transcribe
+          </button>
+        )}
+        <span style={{ fontSize: 11, color: active ? T.textSecondary : T.textTertiary, fontVariantNumeric: "tabular-nums" }}>{active ? time : "tap Rec"}</span>
       </div>
+
       <div style={{ padding: "13px 14px 8px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 11 }}>
           <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary }}>Live transcript</span>
@@ -287,11 +377,28 @@ function ListenBody({ recording, time, lines }: { recording: boolean; time: stri
             <div key={i} style={{ display: "flex", gap: 9 }}>
               <div style={{ width: 22, height: 22, borderRadius: 6, flexShrink: 0, background: "#635BFF22", border: "0.5px solid #635BFF55", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#7c83ff", fontFamily: T.fontDisplay }}>{l.speaker[0] ?? "•"}</div>
               <p style={{ fontSize: 13, lineHeight: 1.5, color: l.last ? T.text : T.textSecondary, letterSpacing: "-0.13px" }}>
-                {l.text}{l.last && recording && <span style={{ marginLeft: 2, opacity: 0.55, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
+                {l.text}{l.last && phase === "transcribing" && <span style={{ marginLeft: 2, opacity: 0.55, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
               </p>
             </div>
           ))}
         </div>
+
+        {/* Live answer — same data as the Answer tab, shown inline here so the
+            user watches the question and the drafted reply in one place. */}
+        {(question && (answer || answering)) && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+              <Icon name="spark" size={12} color={T.violet} sw={2} />
+              <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.violet }}>Suggested answer</span>
+            </div>
+            <div style={{ background: "rgba(168,85,247,0.06)", border: `0.5px solid ${T.border}`, borderRadius: 12, padding: "11px 12px", minHeight: 44 }}>
+              <p style={{ fontSize: 13, lineHeight: 1.55, color: T.text, letterSpacing: "-0.13px", whiteSpace: "pre-wrap" }}>
+                {answer || "…"}
+                {answering && answer.length > 0 && <span style={{ marginLeft: 1, opacity: 0.5, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -601,6 +708,9 @@ export default function Copilot() {
   const [recording, setRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [listening, setListening] = useState(false);
+  // Pipeline phase shown in the live view + drag bar so the user always knows
+  // what's happening (listening → transcribing → thinking → answering).
+  const [phase, setPhase] = useState<Phase>("idle");
   const [input, setInput] = useState("");
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
@@ -627,6 +737,21 @@ export default function Copilot() {
   const activeStream = useRef<string | null>(null);
   const recordingRef = useRef(false);
   const lastQARef = useRef<{ q: string; a: string }>({ q: "", a: "" });
+  // Live capture level (RMS + pitch/ZCR), updated by the high-frequency
+  // `voice:level` event. Held in a ref — the Wave meter reads it on a rAF loop
+  // so the bars react to the voice without re-rendering React on every packet.
+  const levelRef = useRef({ level: 0, pitch: 0 });
+  // Token batching. Fast providers stream many tokens/sec; calling setAnswer per
+  // token re-renders the whole overlay each time and freezes the UI on long
+  // answers. Instead buffer incoming tokens and flush at most once per animation
+  // frame (~60fps), so the answer still appears live but rendering is bounded.
+  const tokBuf = useRef("");
+  const tokRaf = useRef<number | null>(null);
+  // Timer fallback for the token flush. This overlay is a never-foreground,
+  // cloaked window, so Chromium can throttle/pause its rAF — which would leave
+  // streamed tokens buffered but unrendered (stuck in "Thinking…"). A parallel
+  // setTimeout guarantees the flush still fires; whichever wins cancels the other.
+  const tokTimer = useRef<number | null>(null);
 
   // Inject keyframes + solid dark page surface once.
   useEffect(() => {
@@ -730,6 +855,17 @@ export default function Copilot() {
 
   const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
+  // Warm speech recognition as soon as the overlay opens. The copilot flow
+  // never goes through the mock-interview "Preparing engine…" modal, so without
+  // this the FIRST captured question pays the STT cold start (~13s of
+  // "Transcribing…" — model load + VAD download) right in the middle of a live
+  // interview. voice_prepare blocks server-side until ready, but we fire and
+  // forget: the user opens the overlay well before the first question lands.
+  // Idempotent + cheap when already warm.
+  useEffect(() => {
+    invoke("voice_prepare", { engine: "piper", speaker: "" }).catch(() => {});
+  }, []);
+
   // Which source the current capture is from, so the transcript line is labelled
   // correctly: "system" = the interviewer's voice off the loopback (Rec button),
   // "mic" = the user speaking their own question (QuickAsk mic button).
@@ -746,6 +882,18 @@ export default function Copilot() {
     invoke("voice_listen_system").catch(() => setListening(false));
   };
 
+  // Drain the buffered tokens into the answer in one render. Safe to call
+  // directly (final drain on done/error) or via rAF (per-frame during stream).
+  const flushTokens = () => {
+    if (tokRaf.current != null) { cancelAnimationFrame(tokRaf.current); tokRaf.current = null; }
+    if (tokTimer.current != null) { clearTimeout(tokTimer.current); tokTimer.current = null; }
+    if (!tokBuf.current) return;
+    const chunk = tokBuf.current;
+    tokBuf.current = "";
+    setPhase("answering");
+    setAnswer((a) => { const next = a + chunk; lastQARef.current.a = next; return next; });
+  };
+
   // chat:* + voice:* listeners (StrictMode-safe).
   useEffect(() => {
     const unsubs: UnlistenFn[] = [];
@@ -756,32 +904,46 @@ export default function Copilot() {
 
     reg<{ streamId: string; content: string }>("chat:token", (p) => {
       if (p.streamId !== activeStream.current) return;
-      setAnswer((a) => { const next = a + p.content; lastQARef.current.a = next; return next; });
+      // Buffer, then flush to bound re-renders. Schedule via rAF (smooth while
+      // visible) AND a timer fallback (in case rAF is throttled in the
+      // backgrounded overlay); flushTokens cancels whichever loses the race.
+      tokBuf.current += p.content;
+      if (tokRaf.current == null) tokRaf.current = requestAnimationFrame(flushTokens);
+      if (tokTimer.current == null) tokTimer.current = window.setTimeout(flushTokens, 50);
     });
     reg<{ streamId: string }>("chat:done", (p) => {
       if (p.streamId !== activeStream.current) return;
+      flushTokens();                 // drain any buffered tail before finishing
       activeStream.current = null;
       setAnswering(false);
+      setPhase(recordingRef.current ? "listening" : "idle");
       if (recordingRef.current) startSystemListen(); // re-arm for the next question
     });
     reg<{ streamId: string; content: string }>("chat:error", (p) => {
       if (p.streamId !== activeStream.current) return;
+      flushTokens();
       activeStream.current = null;
       setAnswering(false);
       setAnswer((a) => a || `Error: ${p.content}`);
+      setPhase(recordingRef.current ? "listening" : "idle");
       if (recordingRef.current) startSystemListen();
     });
 
-    reg<unknown>("voice:listening", () => setListening(true));
+    reg<{ level: number; pitch: number }>("voice:level", (p) => {
+      // High-frequency: write to the ref only (the Wave meter reads it via rAF).
+      levelRef.current = { level: p.level ?? 0, pitch: p.pitch ?? 0 };
+    });
+    reg<unknown>("voice:listening", () => { setListening(true); setPhase("listening"); });
+    reg<unknown>("voice:transcribing", () => { setListening(false); setPhase("transcribing"); });
     reg<string>("voice:transcript", (text) => {
       setListening(false);
       const t = (text || "").trim();
-      if (!t) { if (recordingRef.current) startSystemListen(); return; }
+      if (!t) { setPhase(recordingRef.current ? "listening" : "idle"); if (recordingRef.current) startSystemListen(); return; }
       const speaker = listenSourceRef.current === "system" ? "Interviewer" : "You";
       setLines((ls) => [...ls.map((l) => ({ ...l, last: false })), { speaker, text: t, last: true }]);
       ask(t);
     });
-    reg<unknown>("voice:error", () => { setListening(false); if (recordingRef.current) startSystemListen(); });
+    reg<unknown>("voice:error", () => { setListening(false); setPhase(recordingRef.current ? "listening" : "idle"); if (recordingRef.current) startSystemListen(); });
 
     return () => { alive = false; unsubs.forEach((u) => u()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -791,9 +953,16 @@ export default function Copilot() {
     if (activeStream.current) return;
     const sid = newStreamId();
     activeStream.current = sid;
+    // Drop any tokens still buffered from a prior answer so they don't bleed in.
+    if (tokRaf.current != null) { cancelAnimationFrame(tokRaf.current); tokRaf.current = null; }
+    tokBuf.current = "";
     setAnswer("");
     setAnswering(true);
-    setView("answer");
+    setPhase("thinking");
+    // During the Rec loop keep the user on the live view (transcript + status +
+    // streamed answer all in one place). For a manual/typed ask, jump to the
+    // dedicated Answer tab.
+    if (!recordingRef.current) setView("answer");
     // Grab the freshest active-job context right before streaming so the answer
     // is grounded on the job the user is on now (it may have changed since open).
     await refreshContext();
@@ -832,8 +1001,13 @@ export default function Copilot() {
     // Rec captures SYSTEM audio (the interviewer's voice via the meeting app),
     // endpoints on silence, transcribes the question, and drafts an answer —
     // then re-arms for the next question (see the chat:done handler).
-    if (next) { setElapsed(0); setView("live"); startSystemListen(); }
-    else { invoke("voice_stop_listening").catch(() => {}); setListening(false); }
+    if (next) {
+      setElapsed(0); setView("live"); setPhase("listening");
+      // Re-fire the STT warmup (idempotent, ~instant when already warm) in case
+      // the overlay sat open long enough for the sidecar to have restarted.
+      invoke("voice_prepare", { engine: "piper", speaker: "" }).catch(() => {});
+      startSystemListen();
+    } else { invoke("voice_stop_listening").catch(() => {}); setListening(false); setPhase("idle"); }
   };
 
   const micOnce = () => { if (!listening) startListen(); };
@@ -851,10 +1025,10 @@ export default function Copilot() {
     <div style={{ height: "100vh", width: "100vw", background: T.glass, color: T.text, fontFamily: T.fontBody, display: "flex", flexDirection: "column", overflow: "hidden", borderLeft: `2px solid ${T.accent}`, boxSizing: "border-box", position: "relative" }}>
       <div id="co-flash" style={{ position: "absolute", inset: 0, background: "#fff", opacity: 0, zIndex: 60, pointerEvents: "none" }} />
       <style>{`@keyframes co-flash{0%{opacity:0}12%{opacity:0.9}100%{opacity:0}}`}</style>
-      <DragBar state={STATE_LABEL[view]} job={jobLabel} cloak={cloak} onMin={() => win.minimize().catch(() => {})} onClose={() => win.close().catch(() => {})} />
+      <DragBar state={phase === "idle" ? STATE_LABEL[view] : PHASE_UI[phase].label} job={jobLabel} cloak={cloak} onMin={() => win.minimize().catch(() => {})} onClose={() => win.close().catch(() => {})} />
       <NavBar view={view} setView={setView} recording={recording} onToggleRec={toggleRec} onCapture={capture} time={fmt(elapsed)} />
       <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-        {view === "live" && <ListenBody recording={recording} time={fmt(elapsed)} lines={lines} />}
+        {view === "live" && <ListenBody phase={phase} time={fmt(elapsed)} lines={lines} levelRef={levelRef} question={question} answer={answer} answering={answering} onFinish={() => invoke("voice_finish_listening").catch(() => {})} />}
         {view === "answer" && <AnswerBody question={question} answer={answer} answering={answering} jobLabel={jobLabel} onRephrase={() => followUp("Rephrase that answer more concisely.")} onDeeper={() => followUp("Go deeper — expand that answer with a specific example and metrics.")} onCopy={() => navigator.clipboard.writeText(answer).catch(() => {})} />}
         {view === "cheat" && <CheatBody cheat={cheat} busy={cheatBusy} jobLabel={jobLabel} onRefresh={refreshCheatsheet} />}
         {view === "settings" && <SettingsBody cloak={cloak} opacity={opacity} onOpacity={applyOpacity} />}

@@ -23,6 +23,28 @@ fn log_dir() -> PathBuf {
     base.join("InterPrep")
 }
 
+/// Load the persistent bridge token, minting one on first run. Persisted so
+/// the extension pairing code (base64 of "port:token") survives app restarts —
+/// a per-boot token forced the user to re-pair the extension every launch.
+/// Same trust domain as the rest of `%LOCALAPPDATA%\InterPrep` (jobs.json,
+/// bridge.json): local-file read access already implies bridge access while
+/// the app runs, and the token is useless once the sidecar is down.
+pub fn load_or_mint_token(mint: impl FnOnce() -> String) -> String {
+    let path = log_dir().join("bridge_token");
+    if let Ok(s) = fs::read_to_string(&path) {
+        let t = s.trim().to_string();
+        // 64 hex chars = the 256-bit token this app writes; anything else is
+        // corrupt/foreign — mint fresh rather than trust it.
+        if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return t;
+        }
+    }
+    let t = mint();
+    let _ = fs::create_dir_all(log_dir());
+    let _ = fs::write(&path, &t);
+    t
+}
+
 /// Write `%LOCALAPPDATA%\InterPrep\bridge.json` = `{port, token}` so the
 /// browser extension can discover the (dynamic) port and the shared secret.
 /// The Gemini key is never written here. Best-effort: a failure just means the
@@ -86,7 +108,7 @@ impl PythonSidecar {
         })?;
         log(&format!("backend_dir={}", backend_dir.display()));
 
-        let port = find_free_port().unwrap_or(8765);
+        let port = pick_port();
         let (python_exe, python_prefix_args) = find_python().map_err(|e| {
             log(&format!("find_python failed: {e}"));
             e
@@ -108,10 +130,13 @@ impl PythonSidecar {
             "127.0.0.1".into(),
             "--port".into(),
             port.to_string(),
-            // Info-level keeps access logs in sidecar.log so the user can
-            // confirm requests arrive and trace where a stream stalls.
+            // Info-level keeps uvicorn lifecycle + our own [chat]/[voice]
+            // prints in sidecar.log, but NOT per-request access logs: the UI
+            // polls /inbox/* every few seconds, which floods the log (tens of
+            // thousands of lines/day) and buries real errors.
             "--log-level".into(),
             "info".into(),
+            "--no-access-log".into(),
         ]);
         log(&format!("spawn args: {args:?}"));
 
@@ -226,13 +251,12 @@ impl PythonSidecar {
 }
 
 impl PythonSidecar {
-    /// Kill the sidecar and every descendant (uvicorn workers, Playwright's
-    /// Chromium tree). Idempotent — safe to call from both an explicit
+    /// Kill the sidecar and every descendant (uvicorn workers and anything the
+    /// Python process spawned). Idempotent — safe to call from both an explicit
     /// shutdown handler and `Drop`.
     ///
-    /// On Windows, `Child::kill` only terminates the immediate process. The
-    /// Python interpreter spawns Playwright's `chrome.exe` which itself forks
-    /// renderer/GPU subprocesses; those become orphans unless we walk the
+    /// On Windows, `Child::kill` only terminates the immediate process; any
+    /// children the interpreter spawned become orphans unless we walk the
     /// tree. `taskkill /T /F /PID …` does exactly that.
     pub fn shutdown(&mut self) {
         if let Some(mut child) = self.process.take() {
@@ -364,4 +388,25 @@ fn find_free_port() -> Option<u16> {
         .ok()
         .and_then(|l| l.local_addr().ok())
         .map(|a| a.port())
+}
+
+/// Pick the sidecar port, preferring the one used last boot so the extension
+/// pairing code (which embeds the port) keeps working across app restarts.
+/// Falls back to a fresh OS-assigned port when the remembered one is taken.
+/// The bind test releases the port before uvicorn claims it — the same benign
+/// race `find_free_port` already has on a single-user localhost.
+fn pick_port() -> u16 {
+    use std::net::TcpListener;
+    let path = log_dir().join("last_port");
+    if let Ok(s) = fs::read_to_string(&path) {
+        if let Ok(p) = s.trim().parse::<u16>() {
+            if p != 0 && TcpListener::bind(("127.0.0.1", p)).is_ok() {
+                return p;
+            }
+        }
+    }
+    let p = find_free_port().unwrap_or(8765);
+    let _ = fs::create_dir_all(log_dir());
+    let _ = fs::write(&path, p.to_string());
+    p
 }

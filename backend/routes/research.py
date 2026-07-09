@@ -66,6 +66,10 @@ async def research_stream(req: ResearchRequest):
             yield {"data": json.dumps({"type": "done"})}
 
         except Exception as exc:
-            yield {"data": json.dumps({"type": "error", "content": str(exc)})}
+            content = (
+                llm_factory.auth_error_message(req.llm)
+                if llm_factory.is_auth_error(exc) else str(exc)
+            )
+            yield {"data": json.dumps({"type": "error", "content": content})}
 
     return EventSourceResponse(generate())

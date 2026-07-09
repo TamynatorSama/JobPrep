@@ -310,27 +310,6 @@ pub fn voice_status(base_url: &str) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
-/// POST /voice/tts — synthesize `text`, returning decoded WAV bytes.
-pub fn voice_tts(base_url: &str, text: &str) -> Result<Vec<u8>, String> {
-    use base64::Engine;
-    let client = reqwest::blocking::Client::new();
-    let resp: Value = client
-        .post(format!("{base_url}/voice/tts"))
-        .json(&serde_json::json!({ "text": text }))
-        // First call also loads the model — allow generous time.
-        .timeout(std::time::Duration::from_secs(180))
-        .send()
-        .and_then(|r| r.json::<Value>())
-        .map_err(|e| e.to_string())?;
-    if let Some(err) = resp["error"].as_str() {
-        return Err(err.to_string());
-    }
-    let b64 = resp["audio_b64"].as_str().ok_or("no audio in TTS response")?;
-    base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .map_err(|e| format!("base64 decode failed: {e}"))
-}
-
 /// POST /voice/tts_stream — synthesize `text`, returning the streaming HTTP
 /// response (raw LE 16-bit mono PCM body) and the sample rate from the
 /// `X-Sample-Rate` header. The caller reads the body incrementally so playback
@@ -387,6 +366,22 @@ pub fn voice_warm(base_url: &str, engine: &str, speaker: &str) -> Result<(), Str
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// POST /voice/prepare — warm STT + the chosen TTS engine and BLOCK until ready,
+/// returning the readiness report. Unlike `voice_warm` (fire-and-forget), this
+/// waits for completion so the "Preparing engine…" modal can dismiss only once
+/// the interview engine is actually ready. vibe-rt's first synth is ~30s on a
+/// laptop GPU, so the timeout is generous.
+pub fn voice_prepare(base_url: &str, engine: &str, speaker: &str) -> Result<Value, String> {
+    let client = reqwest::blocking::Client::new();
+    client
+        .post(format!("{base_url}/voice/prepare"))
+        .json(&serde_json::json!({ "text": "", "engine": engine, "speaker": speaker }))
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .and_then(|r| r.json::<Value>())
         .map_err(|e| e.to_string())
 }
 

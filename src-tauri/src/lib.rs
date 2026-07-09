@@ -83,6 +83,11 @@ struct VoiceState {
     /// anything else (incl. empty) = Piper (fast default).
     engine: Arc<Mutex<String>>,
     listen_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Manual "transcribe now" trigger for the active capture. Distinct from
+    /// `listen_stop` (which cancels/discards): tripping this ends capture AND
+    /// keeps the audio for transcription. Set by `voice_finish_listening` (button)
+    /// and the finish hotkey.
+    listen_finish: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 // ─── Jobs ─────────────────────────────────────────────────────────────────
@@ -470,7 +475,7 @@ fn start_recording(
         poll_timeout_ms:    recorder::DEFAULT_POLL_TIMEOUT_MS,
     };
 
-    let session = recorder::RecordingSession::start(config, None)
+    let session = recorder::RecordingSession::start(config)
         .map_err(|e| format!("start failed: {e:#}"))?;
     *slot = Some(session);
 
@@ -769,6 +774,26 @@ fn voice_warm(sidecar: State<SidecarState>, engine: String, speaker: Option<Stri
     });
 }
 
+/// Warm STT + the chosen TTS engine and BLOCK until ready, returning the
+/// sidecar's readiness report. Called when the user starts a mock interview so
+/// the cold start lands behind the "Preparing engine…" modal instead of at app
+/// startup. Async + `spawn_blocking` so the ~30s wait runs off the main thread
+/// and never freezes the UI.
+#[tauri::command]
+async fn voice_prepare(
+    sidecar: State<'_, SidecarState>,
+    engine: String,
+    speaker: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let url = require_url(&sidecar)?;
+    let speaker = speaker.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        backend_client::voice_prepare(&url, &engine, &speaker)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Abort current playback + drain the rest of the queued utterance.
 #[tauri::command]
 fn voice_interrupt(voice: State<VoiceState>) {
@@ -789,7 +814,9 @@ fn voice_listen(
 ) -> Result<(), String> {
     let url = require_url(&sidecar)?;
     let stop = Arc::new(AtomicBool::new(false));
+    let finish = Arc::new(AtomicBool::new(false));
     *voice.listen_stop.lock().unwrap() = Some(Arc::clone(&stop));
+    *voice.listen_finish.lock().unwrap() = Some(Arc::clone(&finish));
 
     std::thread::spawn(move || {
         let _ = app.emit("voice:listening", ());
@@ -802,11 +829,17 @@ fn voice_listen(
                 let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "listening" }));
             }
         };
-        let result = voice_audio::record_answer(&stop, &mut on_level);
+        // Model-based endpointing: verdicts come from the sidecar's Silero VAD;
+        // record_answer falls back to energy heuristics if it's unreachable.
+        let vad = voice_audio::VadClient::start(url.clone());
+        let result = voice_audio::record_answer(&stop, &finish, Some(&vad), &mut on_level);
         let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "listening" }));
         match result {
             Ok(Some(wav)) => {
                 use base64::Engine;
+                // Capture ended; STT can take a while on CPU. Tell the UI so it
+                // can show a "transcribing" status instead of looking stuck.
+                let _ = app.emit("voice:transcribing", ());
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
                 match backend_client::voice_stt(&url, &b64) {
                     Ok(text) => { let _ = app.emit("voice:transcript", text); }
@@ -841,7 +874,9 @@ fn voice_listen_system(
 ) -> Result<(), String> {
     let url = require_url(&sidecar)?;
     let stop = Arc::new(AtomicBool::new(false));
+    let finish = Arc::new(AtomicBool::new(false));
     *voice.listen_stop.lock().unwrap() = Some(Arc::clone(&stop));
+    *voice.listen_finish.lock().unwrap() = Some(Arc::clone(&finish));
 
     std::thread::spawn(move || {
         let _ = app.emit("voice:listening", ());
@@ -854,37 +889,119 @@ fn voice_listen_system(
                 let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "listening" }));
             }
         };
-        let result = voice_audio::record_question(&stop, &mut on_level);
-        let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "listening" }));
-        match result {
-            Ok(Some(wav)) => {
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
-                match backend_client::voice_stt(&url, &b64) {
-                    Ok(text) => { let _ = app.emit("voice:transcript", text); }
-                    Err(e) => {
-                        let _ = app.emit("voice:error", e);
-                        let _ = app.emit("voice:transcript", String::new());
+        // Model-based endpointing: verdicts come from the sidecar's Silero VAD;
+        // record_question falls back to energy heuristics if it's unreachable.
+        let vad = voice_audio::VadClient::start(url.clone());
+        use base64::Engine;
+        // Semantic continuation: whisper punctuates its transcripts, so a
+        // segment ending WITHOUT terminal punctuation usually means the VAD
+        // endpointed on a mid-question think-pause. In that case listen again
+        // briefly for the rest and stitch the segments — the answer is only
+        // drafted on a question that reads complete (or after 3 segments).
+        let mut full_text = String::new();
+        let mut timeout = voice_audio::Q_NO_SPEECH_TIMEOUT_S;
+        for _segment in 0..3 {
+            let result =
+                voice_audio::record_question(&stop, &finish, Some(&vad), timeout, &mut on_level);
+            match result {
+                Ok(Some(wav)) => {
+                    // Capture ended; STT can take a while on CPU. Tell the UI
+                    // so it shows "transcribing" instead of looking stuck.
+                    let _ = app.emit("voice:transcribing", ());
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+                    match backend_client::voice_stt(&url, &b64) {
+                        Ok(text) => {
+                            let t = text.trim().to_string();
+                            if !t.is_empty() {
+                                if !full_text.is_empty() {
+                                    full_text.push(' ');
+                                }
+                                full_text.push_str(&t);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = app.emit("voice:error", e);
+                            break;
+                        }
                     }
+                    // Manual "transcribe now" — the user forced the end; never
+                    // re-listen against their explicit intent.
+                    if finish.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Only re-listen on STRONG "mid-sentence" evidence. Whisper
+                    // regularly omits the trailing "?" on questions, so merely
+                    // missing terminal punctuation must NOT trigger the ~2.8s
+                    // continuation wait on every complete question — only a cut
+                    // that ends on a comma or a clause-opening word does.
+                    if !looks_unfinished(&full_text) {
+                        break;
+                    }
+                    eprintln!("[voice] transcript looks unfinished — listening for the rest");
+                    let _ = app.emit("voice:listening", ());
+                    timeout = voice_audio::Q_CONTINUATION_TIMEOUT_S;
+                }
+                Ok(None) => break, // silence / cancel — nothing more coming
+                Err(e) => {
+                    let _ = app.emit("voice:error", format!("system listen failed: {e:#}"));
+                    break;
                 }
             }
-            Ok(None) => { let _ = app.emit("voice:transcript", String::new()); }
-            Err(e) => {
-                let _ = app.emit("voice:error", format!("system listen failed: {e:#}"));
-                let _ = app.emit("voice:transcript", String::new());
-            }
         }
+        let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "listening" }));
+        // A cancel (stop flag) mid-flow discards everything — the user backed out.
+        if stop.load(Ordering::SeqCst) {
+            full_text.clear();
+        }
+        let _ = app.emit("voice:transcript", full_text);
     });
 
     Ok(())
 }
 
-/// Force-end mic capture early (user pressed stop / disabled voice).
+/// Force-end mic capture early (user pressed stop / disabled voice). The audio
+/// captured so far is DISCARDED — use `voice_finish_listening` to end + transcribe.
 #[tauri::command]
 fn voice_stop_listening(voice: State<VoiceState>) {
     if let Some(flag) = voice.listen_stop.lock().unwrap().as_ref() {
         flag.store(true, Ordering::SeqCst);
     }
+}
+
+/// Manually end the active capture AND transcribe what was captured — the user's
+/// override for imperfect silence detection ("transcribe now" button / hotkey).
+/// No-op if nothing is listening.
+#[tauri::command]
+fn voice_finish_listening(voice: State<VoiceState>) {
+    if let Some(flag) = voice.listen_finish.lock().unwrap().as_ref() {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Strong "the speaker was cut off mid-sentence" heuristic for the semantic
+/// continuation listen. Deliberately conservative: false positives cost ~2.8s
+/// on every question, false negatives just mean one question gets answered
+/// from its first clause — so only a trailing comma or an obviously
+/// clause-opening final word counts.
+fn looks_unfinished(text: &str) -> bool {
+    let t = text.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    if t.ends_with(',') || t.ends_with(';') || t.ends_with(':') || t.ends_with('-') {
+        return true;
+    }
+    let last_word = t
+        .rsplit(|c: char| !c.is_alphanumeric() && c != '\'')
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(
+        last_word.as_str(),
+        "and" | "or" | "but" | "so" | "because" | "if" | "when" | "while"
+            | "with" | "to" | "of" | "for" | "about" | "the" | "a" | "an"
+            | "your" | "how" | "what" | "which" | "that" | "into" | "on" | "in"
+    )
 }
 
 fn opt(s: String) -> Option<String> {
@@ -908,11 +1025,26 @@ pub fn run() {
         // handler doesn't need to disambiguate which fired.
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        if let Err(e) = copilot::toggle(app) {
-                            eprintln!("[copilot] hotkey toggle failed: {e}");
+                .with_handler(|app, shortcut, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    use tauri::Manager;
+                    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+                    // Ctrl+`  → manually end + transcribe the active capture (the
+                    // user's override for imperfect silence detection). Anything
+                    // else registered (Ctrl+\) toggles the stealth overlay.
+                    let finish_sc = Shortcut::new(Some(Modifiers::CONTROL), Code::Backquote);
+                    if *shortcut == finish_sc {
+                        if let Some(flag) =
+                            app.state::<VoiceState>().listen_finish.lock().unwrap().as_ref()
+                        {
+                            flag.store(true, Ordering::SeqCst);
                         }
+                        return;
+                    }
+                    if let Err(e) = copilot::toggle(app) {
+                        eprintln!("[copilot] hotkey toggle failed: {e}");
                     }
                 })
                 .build(),
@@ -931,15 +1063,24 @@ pub fn run() {
                 if let Err(e) = app.global_shortcut().register(sc) {
                     eprintln!("[copilot] global shortcut register failed: {e}");
                 }
+                // Ctrl+`  → manually end + transcribe the active capture, for when
+                // the silence detector mis-judges the end of a question/answer.
+                let finish_sc = Shortcut::new(Some(Modifiers::CONTROL), Code::Backquote);
+                if let Err(e) = app.global_shortcut().register(finish_sc) {
+                    eprintln!("[copilot] finish shortcut register failed: {e}");
+                }
             }
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let state = handle.state::<SidecarState>();
-                // Mint the bridge token and seed the sidecar with the stored
-                // Gemini key so the extension's autofill works without the app
-                // forwarding the key on every request.
-                let token = gen_token();
+                // Load the persistent bridge token (minted on first run) and
+                // seed the sidecar with the stored Gemini key so the
+                // extension's autofill works without the app forwarding the
+                // key on every request. Persistent + sticky port (see
+                // sidecar::pick_port) keep the extension pairing valid across
+                // app restarts instead of forcing a re-pair every launch.
+                let token = sidecar::load_or_mint_token(gen_token);
                 let creds = Credentials::load();
                 match PythonSidecar::start(&token, &creds.gemini_api_key) {
                     Ok(sidecar) => {
@@ -1004,10 +1145,12 @@ pub fn run() {
             voice_set_barge,
             voice_set_engine,
             voice_warm,
+            voice_prepare,
             voice_interrupt,
             voice_listen,
             voice_listen_system,
             voice_stop_listening,
+            voice_finish_listening,
             copilot::open_copilot,
             copilot::close_copilot,
             copilot::toggle_copilot,
@@ -1022,9 +1165,9 @@ pub fn run() {
         .run(|app_handle, event| {
             // Drop on managed State only runs reliably during a normal exit
             // path. ExitRequested fires before the Tauri runtime tears down,
-            // which is the right window to kill the Python sidecar (and its
-            // Chromium grandchildren). Without this, closing the window
-            // leaves python.exe + chrome.exe orphaned until reboot.
+            // which is the right window to kill the Python sidecar's process
+            // tree. Without this, closing the window leaves python.exe (and
+            // any children) orphaned until reboot.
             if let RunEvent::ExitRequested { .. } = event {
                 let sidecar_state = app_handle.state::<SidecarState>();
                 let mut inner = sidecar_state.inner.lock().unwrap();

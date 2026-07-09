@@ -111,7 +111,13 @@ async def company_research_stream(req: CompanyResearchRequest):
                     elif etype == "token":
                         yield {"data": json.dumps({"type": "token", "content": ev["content"]})}
                     elif etype == "error":
-                        yield {"data": json.dumps({"type": "error", "content": ev["content"]})}
+                        content = str(ev["content"])
+                        # A rejected key fails every engine lane the same way —
+                        # surface the fix instead of the raw provider JSON.
+                        if llm_factory.is_auth_error(Exception(content)) \
+                                or "valid api key" in content.lower():
+                            content = llm_factory.auth_error_message(cfg)
+                        yield {"data": json.dumps({"type": "error", "content": content})}
                     elif etype == "done":
                         yield {"data": json.dumps({"type": "done"})}
                     # "result" (structured fields) is not part of the frontend contract; skip.

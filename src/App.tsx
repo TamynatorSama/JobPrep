@@ -2196,11 +2196,29 @@ interface NewJobModalProps {
 interface MockInterviewModalProps {
   job: Job;
   onClose: () => void;
-  onStart: (config: InterviewConfig) => void;
+  // Async: the parent warms the interview engine (voice_prepare) before creating
+  // the thread, so the modal stays up showing "Preparing engine…" until it
+  // resolves. May reject — the modal surfaces the error and re-enables Start.
+  onStart: (config: InterviewConfig) => void | Promise<void>;
 }
 
 const MockInterviewModal = ({ job, onClose, onStart }: MockInterviewModalProps) => {
   const [config, setConfig] = useState<InterviewConfig>(DEFAULT_INTERVIEW_CONFIG);
+  // While true, the engine is warming up (STT + TTS cold start). Block dismissal
+  // and swap the footer for a progress state so the user knows it isn't hung.
+  const [preparing, setPreparing] = useState(false);
+  const [prepError, setPrepError] = useState<string | null>(null);
+  const start = async () => {
+    setPrepError(null);
+    setPreparing(true);
+    try {
+      await onStart(config);
+      // On success the parent unmounts this modal; no need to reset state.
+    } catch (e) {
+      setPreparing(false);
+      setPrepError(String(e));
+    }
+  };
   const sel: CSSProperties = {
     width: "100%", padding: "10px 14px", borderRadius: 10,
     border: `0.5px solid ${T.border}`, background: T.bg, color: T.text,
@@ -2215,7 +2233,7 @@ const MockInterviewModal = ({ job, onClose, onStart }: MockInterviewModalProps) 
     </Field>
   );
   return (
-    <div onClick={onClose} style={{
+    <div onClick={preparing ? undefined : onClose} style={{
       position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)",
       display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
     }}>
@@ -2228,31 +2246,52 @@ const MockInterviewModal = ({ job, onClose, onStart }: MockInterviewModalProps) 
             <h2 style={{ fontSize: 18, fontWeight: 700, color: T.text, letterSpacing: "-0.5px", fontFamily: T.fontDisplay }}>Mock Interview</h2>
             <p style={{ fontSize: 12, color: T.textSecondary, marginTop: 3, letterSpacing: "-0.12px" }}>{job.role} · {job.company}</p>
           </div>
-          <button onClick={onClose} style={{
-            background: T.surface2, border: "none", cursor: "pointer", padding: 6, borderRadius: 100,
+          <button onClick={onClose} disabled={preparing} style={{
+            background: T.surface2, border: "none", cursor: preparing ? "default" : "pointer", padding: 6, borderRadius: 100,
             color: T.textSecondary, display: "flex", alignItems: "center", width: 28, height: 28, justifyContent: "center",
+            opacity: preparing ? 0.5 : 1,
           }}>
             <Icon name="x" size={14} />
           </button>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 14px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 14px", opacity: preparing ? 0.5 : 1, pointerEvents: preparing ? "none" : "auto" }}>
           {row("Focus", "focus", INTERVIEW_OPTIONS.focus)}
           {row("Difficulty", "difficulty", INTERVIEW_OPTIONS.difficulty)}
           {row("Interviewer tone", "tone", INTERVIEW_OPTIONS.tone)}
           {row("Length", "length", INTERVIEW_OPTIONS.length)}
         </div>
-        <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
-          <button type="button" onClick={onClose} style={{
-            flex: 1, padding: "10px 0", borderRadius: 100, border: "none",
-            background: T.surface2, color: T.textSecondary, fontSize: 13, fontWeight: 500,
-            cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.13px",
-          }}>Cancel</button>
-          <button type="button" onClick={() => onStart(config)} style={{
-            flex: 1, padding: "10px 0", borderRadius: 100, border: "none",
-            background: "#fff", color: "#0C0C0C", fontSize: 13, fontWeight: 600,
-            cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.13px",
-          }}>Start interview</button>
-        </div>
+        {prepError && (
+          <p style={{ fontSize: 12, color: "#EF4444", marginTop: 10, letterSpacing: "-0.12px" }}>
+            Couldn't prepare the interview engine: {prepError}
+          </p>
+        )}
+        {preparing ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 16, padding: "12px 14px", borderRadius: 12, background: T.surface2, border: `0.5px solid ${T.border}` }}>
+            <span style={{
+              width: 18, height: 18, borderRadius: "50%", flexShrink: 0,
+              border: `2px solid ${T.border}`, borderTopColor: T.accent,
+              animation: "mi-spin 0.7s linear infinite",
+            }} />
+            <div style={{ minWidth: 0 }}>
+              <p style={{ fontSize: 13, fontWeight: 600, color: T.text, letterSpacing: "-0.13px" }}>Preparing engine…</p>
+              <p style={{ fontSize: 11.5, color: T.textSecondary, marginTop: 2 }}>Loading speech recognition + interview voice. The first ever run can take a few minutes (voice-model download + GPU warm-up); after that it's quick.</p>
+            </div>
+            <style>{`@keyframes mi-spin{to{transform:rotate(360deg)}}`}</style>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+            <button type="button" onClick={onClose} style={{
+              flex: 1, padding: "10px 0", borderRadius: 100, border: "none",
+              background: T.surface2, color: T.textSecondary, fontSize: 13, fontWeight: 500,
+              cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.13px",
+            }}>Cancel</button>
+            <button type="button" onClick={start} style={{
+              flex: 1, padding: "10px 0", borderRadius: 100, border: "none",
+              background: "#fff", color: "#0C0C0C", fontSize: 13, fontWeight: 600,
+              cursor: "pointer", fontFamily: T.fontBody, letterSpacing: "-0.13px",
+            }}>Start interview</button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -3672,10 +3711,10 @@ const App = () => {
   useEffect(() => {
     try { localStorage.setItem("interprep.voxVoice", voxVoice ? "1" : "0"); } catch { /* ignore */ }
     invoke("voice_set_engine", { engine: voxVoice ? "vibe-rt" : "piper" }).catch(() => {});
-    // VibeVoice has a brutal cold start (~2.5 min: model load + first-synth JIT
-    // on a laptop GPU). Kick the warmup the moment the user enables it so that
-    // cost lands here, not on the first interview question. Idempotent server-side.
-    if (voxVoice) invoke("voice_warm", { engine: "vibe-rt" }).catch(() => {});
+    // No warmup here. VibeVoice's brutal cold start (~30s: model load + first-
+    // synth JIT on a laptop GPU) is paid in the "Preparing engine…" step when the
+    // user starts a mock interview (voice_prepare), NOT at app startup — warming
+    // at boot froze the app.
   }, [voxVoice]);
 
   // Persist the panel size so it survives restarts.
@@ -4205,11 +4244,9 @@ const App = () => {
           voiceEnabledRef.current = false;
           setVoiceOverlayOpen(false);
           alert(`Voice unavailable: ${s.detail ?? "voice stack not installed"}\n\nRun: backend\\setup.ps1 -Voice`);
-        } else if (voxVoice) {
-          // Warm VibeVoice now (idempotent) so its cold start doesn't stall the
-          // first question if the user jumped straight into the interview.
-          invoke("voice_warm", { engine: "vibe-rt", speaker: s.default_speaker ?? "" }).catch(() => {});
         }
+        // No warmup here — the engine is warmed in the "Preparing engine…" step
+        // when a mock interview starts (voice_prepare), not on voice-enable.
       })
       .catch((e) => {
         setVoiceStatus({ available: false, detail: String(e) });
@@ -4566,7 +4603,21 @@ const App = () => {
         <MockInterviewModal
           job={mockConfigForJob}
           onClose={() => setMockConfigForJob(null)}
-          onStart={(config) => { const j = mockConfigForJob; setMockConfigForJob(null); startMockInterview(j, config); }}
+          onStart={async (config) => {
+            const j = mockConfigForJob;
+            if (!j) return;
+            // Warm the interview engine BEFORE the thread starts so the cold start
+            // (STT + the selected TTS engine — vibe-rt is ~30s on a laptop GPU)
+            // lands here, behind the modal's "Preparing engine…" state, not at
+            // app startup or on the first question. Best-effort: a warm failure
+            // (e.g. voice stack not installed) must not block a text interview.
+            const engine = voxVoice ? "vibe-rt" : "piper";
+            const speaker = voxVoice ? (voiceStatus?.default_speaker ?? "") : "";
+            try { await invoke("voice_prepare", { engine, speaker }); }
+            catch (e) { console.warn("voice_prepare failed; starting interview anyway", e); }
+            setMockConfigForJob(null);
+            startMockInterview(j, config);
+          }}
         />
       )}
       {voiceOverlayOpen && (

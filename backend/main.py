@@ -1,5 +1,5 @@
-import asyncio
 import os
+import threading
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -18,21 +18,30 @@ from routes.autofill import router as autofill_router
 from routes.inbox import router as inbox_router
 
 
+def _preimport_llm_packages() -> None:
+    """Import the LangChain partner packages in the background so the first chat
+    doesn't pay their cold import (langchain_google_genai alone is ~30s on a
+    cold disk cache — the sidecar imports them lazily per provider, and that
+    stall used to land on the user's first message). Imports only: no model
+    load, no GPU, no network — unlike the old model warmup this cannot freeze
+    the app at launch."""
+    for pkg in ("langchain_google_genai", "langchain_openai", "langchain_anthropic"):
+        try:
+            __import__(pkg)
+        except Exception:
+            pass  # missing optional provider — the factory reports it per-request
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Company research is now the in-process `research_scraper` engine (HTTP/JSON,
-    # no browser), so there's nothing to pre-warm for it.
-    async def _warm_voice():
-        # Load the TTS model + reference clip off the event loop so the first
-        # interview question doesn't pay the cold start. Heavy (torch + model
-        # download on first ever run) so it runs in a thread, best-effort.
-        try:
-            from routes.voice import prewarm
-            await asyncio.to_thread(prewarm)
-        except Exception:
-            pass
-
-    asyncio.create_task(_warm_voice())
+    # No MODEL is warmed at startup. Company research is the in-process
+    # `research_scraper` engine (HTTP/JSON, no browser), and the interview voice
+    # stack (faster-whisper STT + the chosen TTS engine) is warmed ON DEMAND via
+    # POST /voice/prepare when the user starts a mock interview, behind the
+    # "Preparing engine…" modal. Warming models at boot stacked the STT load and
+    # the VibeVoice cold synth on the same device and froze the app on launch.
+    # Pure Python imports are safe to pre-warm, and big enough to matter.
+    threading.Thread(target=_preimport_llm_packages, daemon=True).start()
     yield
 
 

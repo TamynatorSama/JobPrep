@@ -23,6 +23,8 @@ Everything here is best-effort and stateless: nothing is persisted to disk
 """
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
 from typing import List, Sequence, Tuple
 
 import llm_provider as llm_factory
@@ -102,6 +104,15 @@ prose — no preamble, no markdown headers. Do NOT invent turns that aren't belo
 """
 
 
+# Recap cache. The chat route calls summarize_older on EVERY message of a long
+# thread, and the older block is identical between turns until enough new turns
+# roll past the recent-budget — so without a cache each message pays an extra
+# serial LLM call (latency before the stream even starts) for the same recap.
+# Keyed by content hash; tiny LRU since threads in one app session are few.
+_summary_cache: OrderedDict[str, str] = OrderedDict()
+_SUMMARY_CACHE_MAX = 64
+
+
 async def summarize_older(
     cfg: LLMConfig,
     older: Sequence[ChatMessage],
@@ -112,6 +123,10 @@ async def summarize_older(
     transcript = render_transcript(older, mode)
     if len(transcript) < MIN_OLDER_CHARS:
         return ""
+    key = hashlib.sha1(f"{mode}\x00{transcript}".encode("utf-8")).hexdigest()
+    if key in _summary_cache:
+        _summary_cache.move_to_end(key)
+        return _summary_cache[key]
     template = (
         _SUMMARY_PROMPT_INTERVIEWER if mode == "interviewer" else _SUMMARY_PROMPT_COACH
     )
@@ -122,4 +137,9 @@ async def summarize_older(
         )
     except Exception:  # noqa: BLE001 — recap is optional; never break chat
         return ""
-    return (text or "").strip()
+    summary = (text or "").strip()
+    if summary:
+        _summary_cache[key] = summary
+        while len(_summary_cache) > _SUMMARY_CACHE_MAX:
+            _summary_cache.popitem(last=False)
+    return summary

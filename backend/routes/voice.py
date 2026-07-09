@@ -24,6 +24,7 @@ import asyncio
 import base64
 import io
 import threading
+import time
 import wave
 
 from fastapi import APIRouter
@@ -102,6 +103,13 @@ class SttRequest(BaseModel):
     audio_b64: str
 
 
+class VadRequest(BaseModel):
+    # Base64-encoded RAW little-endian 16-bit mono PCM at 16 kHz (no WAV header)
+    # — the rolling audio tail the capture loop wants a speech/no-speech verdict
+    # for. Raw PCM keeps the 4×/s hot path allocation-light on both sides.
+    audio_b64: str
+
+
 # ── lazy singletons ──────────────────────────────────────────────────────────
 _lock = threading.Lock()
 # Serializes VibeVoice synth. One model on one GPU can't run two generate() calls
@@ -109,6 +117,9 @@ _lock = threading.Lock()
 # decodes corrupt each other and yield garbled / no audio. Every vibe-rt synth
 # acquires this so they run strictly one at a time.
 _synth_lock = threading.Lock()
+# Serializes prepare() — see its docstring. Distinct from _lock (model loads)
+# and _synth_lock (vibe synth) so a long warm doesn't block unrelated paths.
+_prepare_lock = threading.Lock()
 _state = {
     "device": None,         # "cuda" | "cpu"
     "piper": None,          # PiperVoice (fast default engine)
@@ -359,12 +370,26 @@ def _get_piper():
             except ImportError:
                 from piper.voice import PiperVoice  # older module layout
             model = _ensure_piper_model()
-            use_cuda = _device() == "cuda"
+            # Only ask onnxruntime for CUDA when its CUDA provider is actually
+            # installed (the plain `onnxruntime` wheel is CPU-only). Requesting
+            # a missing provider sent ORT through a ~80s probe-and-fallback at
+            # load (observed in the field, blocking the "Preparing engine…"
+            # modal) — and Piper is faster than real-time on CPU regardless.
+            use_cuda = False
+            try:
+                import onnxruntime
+                use_cuda = (_device() == "cuda"
+                            and "CUDAExecutionProvider" in onnxruntime.get_available_providers())
+            except Exception:
+                pass
+            t0 = time.time()
             try:
                 voice = PiperVoice.load(str(model), use_cuda=use_cuda)
             except TypeError:
                 # Older/newer signatures may not accept use_cuda.
                 voice = PiperVoice.load(str(model))
+            print(f"[voice] piper loaded (cuda={use_cuda}) in {time.time() - t0:.1f}s",
+                  flush=True)
             _state["piper"] = voice
             _state["piper_sr"] = int(getattr(voice.config, "sample_rate", _state["piper_sr"]))
     return _state["piper"]
@@ -389,18 +414,66 @@ def _piper_pcm_iter(voice, text: str):
         yield bytes(data)
 
 
+def _pin_torch_cudnn() -> None:
+    """Preload torch's bundled cuDNN DLLs before ctranslate2 can load its own.
+
+    ctranslate2 (faster-whisper's backend) ships a LONE cudnn64_9.dll. If STT
+    loads first — the normal prepare() order — Windows registers that copy,
+    and when VibeVoice's torch stack later asks cuDNN for symbols the lone
+    DLL can't serve without its companion DLLs, the process HARD-CRASHES
+    mid-synth ("Could not load symbol cudnnGetLibConfig. Error code 127" —
+    kills the whole sidecar, observed 2026-07-07). Loading torch's complete
+    cuDNN set first makes the loader dedupe by module name so both libraries
+    share the good copies. Best-effort no-op when torch isn't installed."""
+    try:
+        import ctypes
+        import glob as _glob
+        import os as _os
+        import torch
+        lib = _os.path.join(_os.path.dirname(torch.__file__), "lib")
+        for dll in sorted(_glob.glob(_os.path.join(lib, "cudnn*.dll"))):
+            try:
+                ctypes.WinDLL(dll)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _get_stt():
     """Load faster-whisper once, on the auto-detected device."""
     if _state["stt"] is not None:
         return _state["stt"]
     with _lock:
         if _state["stt"] is None:
+            import os
+            _pin_torch_cudnn()  # MUST precede the ctranslate2 import below
             from faster_whisper import WhisperModel
-            device = _device()
+            # STT runs on the GPU when one exists — ~4× faster decode, which is
+            # the biggest chunk of question→answer latency on CPU (~3s for a
+            # long question vs <1s on GPU). Historical note: this used to
+            # default to CPU because loading whisper alongside VibeVoice
+            # "froze the app" — that freeze was actually the cuDNN DLL clash
+            # fixed in _pin_torch_cudnn (both stacks now verified coexisting on
+            # one GPU), and in practice the capture→STT→LLM→TTS cycle is
+            # sequential so they don't contend per-turn anyway. Force with
+            # INTERPREP_STT_DEVICE=cpu|cuda if a specific box misbehaves.
+            device = os.environ.get("INTERPREP_STT_DEVICE", "auto").strip().lower()
+            if device not in ("cpu", "cuda"):
+                device = _device()  # auto: cuda when available
+            if device == "cuda" and _device() != "cuda":
+                device = "cpu"
             compute = "float16" if device == "cuda" else "int8"
-            # "base" balances accuracy vs. latency for interview answers; bump
-            # to "small"/"medium" if transcripts are weak and the box can take it.
-            _state["stt"] = WhisperModel("base", device=device, compute_type=compute)
+            # English-only "base.en" — faster AND more accurate than multilingual
+            # "base" for English interviews. Override with INTERPREP_STT_MODEL
+            # (e.g. "tiny.en" for max speed, "small.en" if transcripts are weak).
+            model_name = os.environ.get("INTERPREP_STT_MODEL", "base.en")
+            t0 = time.time()
+            _state["stt"] = WhisperModel(
+                model_name, device=device, compute_type=compute, cpu_threads=0,
+            )
+            print(f"[voice] STT loaded: model={model_name} device={device} "
+                  f"({time.time() - t0:.1f}s)", flush=True)
     return _state["stt"]
 
 
@@ -457,23 +530,94 @@ def _synth_stream(text: str, engine: str, speaker: str):
 
 def _transcribe(wav_bytes: bytes) -> str:
     model = _get_stt()
-    segments, _info = model.transcribe(io.BytesIO(wav_bytes), beam_size=1)
-    return "".join(seg.text for seg in segments).strip()
+    # vad_filter drops non-speech (leading/trailing silence + mid-question think
+    # pauses) before decoding, so a long question with pauses transcribes faster
+    # and doesn't emit hallucinated text over the silent stretches.
+    # language pinned + condition_on_previous_text off: skips language detection
+    # and the per-window prompt threading — measurably faster on long clips and
+    # less prone to repetition-loop hallucinations.
+    # temperature pinned to a single pass: the default fallback ladder re-decodes
+    # any segment whose compression ratio looks off at up to 5 higher
+    # temperatures, which multiplied decode time 3-6× on real loopback captures
+    # (observed 6.7s for one question). A single greedy pass on interview speech
+    # is accurate enough, and latency here is user-facing dead air.
+    t0 = time.time()
+    segments, _info = model.transcribe(
+        io.BytesIO(wav_bytes), beam_size=1, vad_filter=True,
+        language="en", condition_on_previous_text=False,
+        temperature=0.0,
+    )
+    text = "".join(seg.text for seg in segments).strip()
+    print(f"[voice] STT transcribe: {time.time() - t0:.2f}s, {len(text)} chars", flush=True)
+    return text
 
 
-def prewarm() -> None:
-    """Load the default (Piper) engine ahead of time, downloading its voice model
-    on first ever run.
+def _warm_stt() -> None:
+    """Load + warm faster-whisper so the first real transcribe doesn't pay the
+    cold start (base.en download ~140MB + model load + CUDA/CPU kernel autotune +
+    silero-VAD download — the ~30s "transcribing" stall on the first question).
+    Decodes a short throwaway buffer: vad=False warms the encoder/decoder kernels;
+    vad=True then loads the silero VAD model real transcribes use. Raises on
+    failure so the caller can report it."""
+    import numpy as np
+    model = _get_stt()
+    if _state.get("stt_warm"):
+        return
+    t0 = time.time()
+    warm = (np.random.randn(16000 * 2).astype(np.float32) * 0.02).clip(-1, 1)
+    warm_wav = _pcm16_to_wav((warm * 32767.0).astype("<i2").tobytes(), 16000)
+    list(model.transcribe(io.BytesIO(warm_wav), beam_size=1)[0])
+    list(model.transcribe(io.BytesIO(warm_wav), beam_size=1, vad_filter=True)[0])
+    # ALSO warm on a long buffer: on CUDA the kernels are shape-tuned on first
+    # use, so a warmup that only ever saw a 2s clip leaves the FIRST real long
+    # question (30-60s captures are common) paying several seconds of one-time
+    # autotune right when the user is waiting. ~40s of low noise covers the
+    # long-shape path; vad_filter skips most of the decode so this stays cheap.
+    warm_long = (np.random.randn(16000 * 40).astype(np.float32) * 0.02).clip(-1, 1)
+    long_wav = _pcm16_to_wav((warm_long * 32767.0).astype("<i2").tobytes(), 16000)
+    list(model.transcribe(io.BytesIO(long_wav), beam_size=1, vad_filter=True,
+                          language="en", condition_on_previous_text=False)[0])
+    _state["stt_warm"] = True
+    print(f"[voice] STT warmed in {time.time() - t0:.1f}s", flush=True)
 
-    Called from the app lifespan in a background thread so the first interview
-    question doesn't pay the model-load (and one-time download) cold start.
-    Best-effort — silently no-ops if the voice stack isn't installed. VibeVoice
-    is NOT warmed here: it's opt-in and heavy, so it loads lazily when toggled on.
-    """
-    try:
-        _get_piper()
-    except Exception:
-        pass
+
+def prepare(engine: str, speaker: str = VIBE_DEFAULT_SPEAKER) -> dict:
+    """Warm everything a live interview needs — speech recognition (faster-whisper)
+    + the chosen TTS engine — and BLOCK until ready.
+
+    Called from POST /voice/prepare when the user starts a mock interview, behind
+    the "Preparing engine…" modal, so the model-load + cold-start cost (vibe-rt's
+    first synth is ~30s on a laptop GPU) lands there instead of at app startup or
+    on the first question. Nothing is warmed at boot anymore — that stacked the
+    STT load and the VibeVoice cold synth on the same device at launch and froze
+    the app. Idempotent: a second call is near-instant once warm. Returns a
+    per-stage readiness report (best-effort per stage)."""
+    engine = _norm_engine(engine)
+    speaker = _norm_speaker(speaker)
+    t0 = time.time()
+    report: dict = {"engine": engine, "stt": False, "tts": False}
+    # Serialized: callers fire this fire-and-forget from several places (the
+    # copilot overlay on open AND on Rec — twice each under React StrictMode —
+    # plus the mock-interview modal). Concurrent warms would run two
+    # transcribes on one WhisperModel, which is not thread-safe. Late callers
+    # block briefly, then every stage is a warm no-op.
+    with _prepare_lock:
+        try:
+            _warm_stt()
+            report["stt"] = True
+        except Exception as exc:
+            report["stt_error"] = str(exc)
+            print(f"[voice] prepare: STT warm failed: {exc}", flush=True)
+        # warm() is best-effort and never raises, so read the loaded-state
+        # directly to report TTS readiness honestly.
+        warm(engine, speaker)
+    report["tts"] = bool(_state["vibe_warm"]) if engine == "vibe-rt" \
+        else (_state["piper"] is not None)
+    report["ready"] = report["stt"] and report["tts"]
+    report["took_ms"] = int((time.time() - t0) * 1000)
+    print(f"[voice] prepare engine={engine} ready={report['ready']} "
+          f"({report['took_ms']}ms)", flush=True)
+    return report
 
 
 def warm(engine: str, speaker: str = VIBE_DEFAULT_SPEAKER) -> None:
@@ -554,6 +698,18 @@ async def warm_endpoint(req: TtsRequest):
     return {"warming": True, "engine": engine}
 
 
+@router.post("/prepare")
+async def prepare_endpoint(req: TtsRequest):
+    """Warm STT + the chosen TTS engine and BLOCK until ready, returning a
+    readiness report. The mock-interview "Preparing engine…" modal awaits this so
+    the cold start happens there instead of at app startup. Runs off the event
+    loop so the sidecar keeps serving other requests during the ~30s vibe-rt
+    cold synth."""
+    engine = _norm_engine(req.engine)
+    speaker = _norm_speaker(req.speaker)
+    return await asyncio.to_thread(prepare, engine, speaker)
+
+
 @router.post("/tts")
 async def tts(req: TtsRequest):
     text = (req.text or "").strip()
@@ -611,3 +767,53 @@ async def stt(req: SttRequest):
         return {"text": text}
     except Exception as exc:
         return {"error": f"STT failed: {exc}"}
+
+
+def _vad_tail(pcm: bytes) -> dict:
+    """Silero-VAD verdict on a rolling audio tail: how many ms of NON-SPEECH
+    trail the window. Neural speech detection — unlike the energy heuristic it
+    ignores transmitted room tone, comfort noise, music and typing, so it
+    neither cuts a quiet-voiced speaker short nor waits forever on a noisy
+    call. Warm inference is ~4 ms for a 2 s window; the model itself is the
+    one already bundled with faster-whisper (loaded during /voice/prepare)."""
+    import numpy as np
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    window_ms = len(audio) / 16.0
+    ts = get_speech_timestamps(audio, vad_options=VadOptions(
+        threshold=0.5,
+        min_speech_duration_ms=100,   # ignore sub-100ms blips
+        min_silence_duration_ms=150,  # merge segments split by tiny gaps
+        speech_pad_ms=100,            # pad segment ends → verdict errs ~100ms safe
+    ))
+    if not ts:
+        return {"has_speech": False, "trailing_silence_ms": window_ms,
+                "window_ms": window_ms}
+    trailing = max(0.0, window_ms - ts[-1]["end"] / 16.0)
+    return {"has_speech": True, "trailing_silence_ms": trailing,
+            "window_ms": window_ms}
+
+
+_vad_stats = {"n": 0}
+
+
+@router.post("/vad")
+async def vad(req: VadRequest):
+    """Speech/no-speech verdict for the capture loop's endpointing (see
+    `_vad_tail`). Called ~4×/s with the rolling tail while a question or answer
+    is being captured; must stay fast and never raise."""
+    try:
+        pcm = base64.b64decode(req.audio_b64)
+        out = await asyncio.to_thread(_vad_tail, pcm)
+        # Sampled field telemetry (~every 5s of capture at the 4/s cadence):
+        # proves in sidecar.log that model endpointing is active and shows the
+        # trailing-silence values the capture loop is acting on.
+        _vad_stats["n"] += 1
+        if _vad_stats["n"] % 20 == 1:
+            print(f"[voice] vad#{_vad_stats['n']}: "
+                  f"trailing={out['trailing_silence_ms']:.0f}ms "
+                  f"speech={out['has_speech']}", flush=True)
+        return out
+    except Exception as exc:
+        print(f"[voice] vad error: {exc}", flush=True)
+        return {"error": str(exc)}

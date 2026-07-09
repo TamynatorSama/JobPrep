@@ -9,13 +9,18 @@
 //!   * `wait_for_speech` — lightweight monitor used while the interviewer is
 //!     talking; trips `detected` as soon as the candidate starts speaking.
 //!
-//! VAD here is deliberately crude (energy threshold + hangover). It's good
-//! enough for turn-taking in a quiet room and easy to tune via the consts.
+//! Endpointing is model-first: while capturing, a rolling 16 kHz tail is sent
+//! ~4×/s to the sidecar's Silero-VAD endpoint (`/voice/vad`, see `VadClient`),
+//! and the turn ends on the NEURAL speech/no-speech verdict — energy heuristics
+//! can't tell a quiet-voiced speaker from silence or transmitted room tone from
+//! speech, which caused both premature cuts and never-ending captures. The
+//! adaptive energy logic below remains as the fallback when the voice stack is
+//! missing or the VAD endpoint is unreachable.
 
 use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Instant;
 
@@ -43,7 +48,9 @@ const PREROLL_SECS: f64 = 1.0;
 const SPEECH_RMS: f32 = 0.02;        // above this = speech onset
 const CONTINUE_RMS: f32 = 0.011;     // above this during an answer = still talking
 const START_SPEECH_MS: f64 = 160.0;  // sustained voice to count as speech start
-const END_SILENCE_MS: f64 = 1700.0;  // trailing silence that ends an answer (generous)
+const END_SILENCE_MS: f64 = 1400.0;  // trailing silence that ends an answer — generous
+                                     // (answers have longer think-pauses than
+                                     // questions, so this stays above Q_END_SILENCE_MS)
 const NO_SPEECH_TIMEOUT_S: f64 = 10.0; // give up if the user never speaks
 const MAX_ANSWER_S: f64 = 120.0;      // hard cap on a single answer
 const BARGE_SPEECH_MS: f64 = 240.0;   // sustained voice to trigger barge-in
@@ -59,15 +66,197 @@ const BARGE_SPEECH_MS: f64 = 240.0;   // sustained voice to trigger barge-in
 //   * a minimum total-voiced guard — a click/notification can't be mistaken for
 //     a complete question; if a transient trips onset and then goes silent, we
 //     discard it and keep listening instead of "answering" garbage.
-const Q_CALIBRATION_MS: f64 = 400.0;   // measure ambient noise floor at start
+const Q_CALIBRATION_MS: f64 = 250.0;   // measure ambient noise floor at start
 const Q_ONSET_MULT: f32 = 3.0;         // onset threshold = noise_floor * this
 const Q_CONT_MULT: f32 = 1.8;          // continue threshold = noise_floor * this
 const Q_FLOOR_MIN: f32 = 0.006;        // floor so thresholds don't collapse in dead silence
-const Q_START_SPEECH_MS: f64 = 200.0;  // sustained voice to count as question onset
-const Q_END_SILENCE_MS: f64 = 1500.0;  // sustained trailing silence = question complete
+const Q_START_SPEECH_MS: f64 = 120.0;  // sustained voice to count as question onset
+const Q_END_SILENCE_MS: f64 = 1100.0;  // sustained trailing silence = question complete
+                                       // (mid-question think-pauses are typically
+                                       // <1s; the adaptive floor below is what
+                                       // makes a tighter window safe)
+// The one-shot calibration above is taken while the call is often near-silent,
+// so its floor is ~0 — but once someone talks, the meeting app transmits their
+// room tone / comfort noise CONTINUOUSLY at a level far above digital silence.
+// A cont threshold frozen at calibration time then never sees "silence" and the
+// capture runs to the hard cap (observed: 50s+ over-captures → 8s transcribes →
+// the app "not noticing the question ended"). So during capture the floor is
+// re-learned every block: it snaps DOWN to any quieter block instantly and
+// drifts UP by Q_FLOOR_DRIFT per block (~+18%/s at ~30ms blocks), folding the
+// transmitted background into "silence". It is capped at Q_FLOOR_PEAK_CAP of
+// the speaker's running peak so nonstop talking can never drag the floor up to
+// speech level and cause a false end.
+const Q_FLOOR_DRIFT: f32 = 1.005;      // per-block upward re-learn rate
+const Q_FLOOR_PEAK_CAP: f32 = 0.15;    // floor may never exceed this × speech peak
+const Q_PEAK_FRACTION: f32 = 0.10;     // silence must also sit below this × speech peak.
+                                       // Middle ground for the FALLBACK path: when the
+                                       // model verdict is unavailable, a too-loose
+                                       // fraction re-creates never-ending captures on
+                                       // noisy calls (observed in the field), which is
+                                       // worse than an occasional early cut.
+const Q_PEAK_DECAY: f32 = 0.998;       // running speech-peak decay (~6.5%/s) so the
+                                       // reference adapts down to a trailing-off voice
 const Q_MIN_VOICED_MS: f64 = 350.0;    // a "question" must contain at least this much voice
-const Q_NO_SPEECH_TIMEOUT_S: f64 = 30.0; // interviewer may take a while — wait longer than the mic
-const PREROLL_MS: f64 = 300.0;         // audio kept before confirmed onset so we don't clip the start
+pub const Q_NO_SPEECH_TIMEOUT_S: f64 = 30.0; // interviewer may take a while — wait longer than the mic
+/// No-speech window for the semantic CONTINUATION capture (see lib.rs): how
+/// long to wait for the interviewer to resume after a transcript that ended
+/// mid-sentence. Short — a genuine end just costs this much extra once.
+pub const Q_CONTINUATION_TIMEOUT_S: f64 = 2.5;
+const Q_MAX_QUESTION_S: f64 = 28.0;    // hard cap on one captured question. Real interview
+                                       // questions rarely exceed ~25s of continuous speech;
+                                       // when the source NEVER pauses (video voiceover,
+                                       // back-to-back speakers — observed in the field as
+                                       // 40s+ captures with Silero reporting nonstop
+                                       // speech), this flushes what we have so the user
+                                       // gets a transcript + answer for the first chunk
+                                       // instead of waiting on silence that never comes.
+const PREROLL_MS: f64 = 700.0;         // audio kept before confirmed onset so we don't clip the start
+
+// ─── Silero-VAD client (model-based endpointing) ─────────────────────────────
+
+/// Latest verdict from the sidecar's Silero VAD, tagged with the capture-clock
+/// time of the tail it was computed on so the capture loop can extrapolate:
+/// `silence_now ≈ trailing_silence_ms + (elapsed_now − snapshot_elapsed_ms)`.
+#[derive(Clone, Copy, Default)]
+pub struct VadVerdict {
+    pub snapshot_elapsed_ms: f64,
+    pub trailing_silence_ms: f64,
+    pub healthy: bool,
+}
+
+/// Posts rolling 16 kHz PCM tails to the sidecar's `/voice/vad` from a worker
+/// thread and shares the newest verdict with the capture loop. Bounded(1)
+/// channel + `try_send`: the audio loop never blocks on HTTP — if the worker is
+/// mid-request a snapshot is simply skipped and the next one lands ~250 ms
+/// later. The worker exits when the client is dropped.
+pub struct VadClient {
+    tx: std::sync::mpsc::SyncSender<(f64, Vec<i16>)>,
+    verdict: Arc<Mutex<VadVerdict>>,
+}
+
+impl VadClient {
+    pub fn start(base_url: String) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(f64, Vec<i16>)>(1);
+        let verdict = Arc::new(Mutex::new(VadVerdict::default()));
+        let shared = Arc::clone(&verdict);
+        std::thread::spawn(move || {
+            use base64::Engine;
+            let client = reqwest::blocking::Client::new();
+            let url = format!("{base_url}/voice/vad");
+            while let Ok((snap_ms, tail)) = rx.recv() {
+                let mut bytes = Vec::with_capacity(tail.len() * 2);
+                for s in &tail {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let resp = client
+                    .post(&url)
+                    .json(&serde_json::json!({ "audio_b64": b64 }))
+                    // Generous: a busy box mid-transcribe can stall the verdict;
+                    // a late verdict is still better than dropping to the energy
+                    // fallback for the rest of the turn.
+                    .timeout(std::time::Duration::from_millis(3000))
+                    .send()
+                    .and_then(|r| r.json::<serde_json::Value>());
+                let mut v = shared.lock().unwrap();
+                match resp {
+                    Ok(j) if j.get("trailing_silence_ms").is_some() => {
+                        v.snapshot_elapsed_ms = snap_ms;
+                        v.trailing_silence_ms =
+                            j["trailing_silence_ms"].as_f64().unwrap_or(0.0);
+                        v.healthy = true;
+                    }
+                    Ok(j) => {
+                        eprintln!("[vad-client] endpoint answered without verdict: {j}");
+                        v.healthy = false;
+                    }
+                    Err(e) => {
+                        eprintln!("[vad-client] request failed: {e}");
+                        v.healthy = false;
+                    }
+                }
+            }
+        });
+        Self { tx, verdict }
+    }
+
+    pub fn submit(&self, snapshot_elapsed_ms: f64, tail: Vec<i16>) {
+        let _ = self.tx.try_send((snapshot_elapsed_ms, tail));
+    }
+
+    pub fn latest(&self) -> VadVerdict {
+        *self.verdict.lock().unwrap()
+    }
+}
+
+// How the model verdict is applied while capturing:
+const VAD_SUBMIT_EVERY_MS: f64 = 250.0;  // tail snapshot cadence
+const VAD_TAIL_MS: f64 = 2000.0;         // rolling window sent per snapshot
+// A verdict older than this is stale (worker wedged / endpoint down) — fall
+// back to energy until a fresh one lands. Verdicts land every ~280 ms, so
+// this only trips when something is actually wrong.
+const VAD_MAX_AGE_MS: f64 = 900.0;
+
+/// Box-averaging decimator to 16 kHz for the VAD tail — each output sample is
+/// the mean of the input samples it spans, a crude low-pass that avoids the
+/// aliasing a nearest-sample pick would fold into Silero's input.
+struct Tail16k {
+    buf: std::collections::VecDeque<i16>,
+    cap: usize,
+    phase: f64,
+    acc: f32,
+    acc_n: u32,
+}
+
+impl Tail16k {
+    fn new() -> Self {
+        Self {
+            buf: std::collections::VecDeque::new(),
+            cap: (16000.0 * VAD_TAIL_MS / 1000.0) as usize,
+            phase: 0.0,
+            acc: 0.0,
+            acc_n: 0,
+        }
+    }
+    fn push(&mut self, mono: &[f32], sr: u32) {
+        let step = 16000.0 / sr.max(1) as f64;
+        for &s in mono {
+            self.acc += s;
+            self.acc_n += 1;
+            self.phase += step;
+            if self.phase >= 1.0 {
+                self.phase -= 1.0;
+                let v = self.acc / self.acc_n as f32;
+                self.acc = 0.0;
+                self.acc_n = 0;
+                if self.buf.len() == self.cap {
+                    self.buf.pop_front();
+                }
+                self.buf.push_back((v.clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
+        }
+    }
+    fn snapshot(&self) -> Vec<i16> {
+        self.buf.iter().copied().collect()
+    }
+}
+
+/// Model-measured trailing silence, or `None` when the verdict is missing or
+/// stale (caller falls back to the energy estimate). Deliberately NOT
+/// extrapolated past the snapshot: projecting silence forward assumes the
+/// speaker didn't resume, and that assumption cut questions short in the field
+/// — the end threshold must be met by silence Silero actually saw.
+fn model_silence_ms(vad: Option<&VadClient>, elapsed_ms: f64) -> Option<f64> {
+    let v = vad?.latest();
+    if !v.healthy {
+        return None;
+    }
+    let age = elapsed_ms - v.snapshot_elapsed_ms;
+    if !(0.0..=VAD_MAX_AGE_MS).contains(&age) {
+        return None;
+    }
+    Some(v.trailing_silence_ms)
+}
 
 struct ComGuard;
 impl Drop for ComGuard {
@@ -88,6 +277,11 @@ fn init_mta() -> Result<ComGuard> {
 /// Render `wav_bytes` to the default output device. `on_level(rms, zcr)` is
 /// called per written chunk so the UI orb can react to the voice. Returns
 /// `Ok(true)` if it played to the end, `Ok(false)` if `interrupt` cut it short.
+///
+/// Currently unused: live TTS playback goes through the streaming PCM path in
+/// `lib.rs` (chunks play as they arrive). Kept as the whole-buffer fallback —
+/// it's the only complete WASAPI render reference in the crate.
+#[allow(dead_code)]
 pub fn play_wav(
     wav_bytes: &[u8],
     interrupt: &Arc<AtomicBool>,
@@ -482,6 +676,8 @@ pub fn wait_for_speech(stop: &Arc<AtomicBool>, detected: &Arc<AtomicBool>) -> Re
 /// user never spoke.
 pub fn record_answer(
     stop: &Arc<AtomicBool>,
+    finish: &Arc<AtomicBool>,
+    vad: Option<&VadClient>,
     on_level: &mut dyn FnMut(f32, f32),
 ) -> Result<Option<Vec<u8>>> {
     let mut collected: Vec<f32> = Vec::new();
@@ -490,12 +686,29 @@ pub fn record_answer(
     let mut voiced_ms = 0.0;
     let mut silence_ms = 0.0;
     let mut elapsed_ms = 0.0;
+    // Adaptive-floor state (see the Q_FLOOR_* consts + record_question).
+    let mut floor_est = CONTINUE_RMS * 0.5;
+    let mut peak_ema = 0.0f32;
+    let mut tail16 = Tail16k::new();
+    let mut last_vad_submit_ms = 0.0f64;
 
     capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, |mono, sample_rate, block_ms| {
+        // Manual "transcribe now" (button / hotkey): end capture immediately and
+        // keep what we have — unlike `stop`, which the caller treats as cancel.
+        if finish.load(Ordering::SeqCst) {
+            return false;
+        }
         sr = sample_rate;
         elapsed_ms += block_ms;
         let (level, zcr) = level_of(mono);
         on_level(level, zcr);
+        tail16.push(mono, sample_rate);
+        if let Some(v) = vad {
+            if speech_started && elapsed_ms - last_vad_submit_ms >= VAD_SUBMIT_EVERY_MS {
+                last_vad_submit_ms = elapsed_ms;
+                v.submit(elapsed_ms, tail16.snapshot());
+            }
+        }
 
         if !speech_started {
             if level >= SPEECH_RMS {
@@ -503,6 +716,7 @@ pub fn record_answer(
                 collected.extend_from_slice(mono); // keep the onset
                 if voiced_ms >= START_SPEECH_MS {
                     speech_started = true;
+                    peak_ema = level;
                 }
             } else {
                 voiced_ms = 0.0;
@@ -514,21 +728,45 @@ pub fn record_answer(
             return true;
         }
 
-        // Recording the answer. Use the lower CONTINUE_RMS so soft speech and
-        // brief pauses don't prematurely end the turn.
+        // Recording the answer, with the same continuously-adaptive silence
+        // threshold as the question capture: a static CONTINUE_RMS never ends
+        // the turn when steady mic noise (fan, AC, breath on the capsule) sits
+        // above it. Floor snaps down instantly, drifts up slowly, is capped
+        // well below the speaker's running peak.
         collected.extend_from_slice(mono);
-        if level >= CONTINUE_RMS {
+        peak_ema = (peak_ema * Q_PEAK_DECAY).max(level.min(1.0));
+        if level < floor_est {
+            floor_est = level;
+        } else {
+            floor_est = (floor_est * Q_FLOOR_DRIFT).min(peak_ema * Q_FLOOR_PEAK_CAP);
+        }
+        let cont_th = (floor_est * Q_CONT_MULT)
+            .max(peak_ema * Q_PEAK_FRACTION)
+            .max(CONTINUE_RMS * 0.5);
+        if level >= cont_th {
             silence_ms = 0.0;
         } else {
             silence_ms += block_ms;
-            if silence_ms >= END_SILENCE_MS {
-                return false; // sustained trailing silence → end of answer
-            }
+        }
+        // Model-first end decision (see record_question): the fresh Silero
+        // verdict overrides the energy estimate in both directions.
+        if model_silence_ms(vad, elapsed_ms).unwrap_or(silence_ms) >= END_SILENCE_MS {
+            return false; // sustained trailing silence → end of answer
         }
         true
     })?;
 
-    if !speech_started || collected.is_empty() {
+    // External stop = cancel (user hit stop / disabled voice): DISCARD what was
+    // captured — the caller documented `voice_stop_listening` as discard, and
+    // transcribing it would pop an unwanted answer after the user backed out.
+    if stop.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    // Manual finish returns whatever was captured even if VAD never confirmed an
+    // onset — the user explicitly ended the turn. Auto endpointing still requires
+    // a real onset so a silent timeout doesn't transcribe noise.
+    let manual = finish.load(Ordering::SeqCst);
+    if collected.is_empty() || (!manual && !speech_started) {
         return Ok(None);
     }
     Ok(Some(encode_wav_mono16(&collected, sr)))
@@ -538,8 +776,15 @@ pub fn record_answer(
 /// adaptive VAD endpointing. Returns 16-bit mono WAV bytes, or `None` if nothing
 /// usable was heard before the timeout. Tuned to NOT end on a mid-question pause
 /// and to discard transient blips (see the `Q_*` consts).
+/// `no_speech_timeout_s`: give up if nobody talks within this window. The
+/// first capture of a turn uses `Q_NO_SPEECH_TIMEOUT_S`; the semantic
+/// CONTINUATION capture (the transcript looked unfinished, so the caller
+/// listens again for the rest of the question) uses a couple of seconds.
 pub fn record_question(
     stop: &Arc<AtomicBool>,
+    finish: &Arc<AtomicBool>,
+    vad: Option<&VadClient>,
+    no_speech_timeout_s: f64,
     on_level: &mut dyn FnMut(f32, f32),
 ) -> Result<Option<Vec<u8>>> {
     use std::collections::VecDeque;
@@ -548,14 +793,25 @@ pub fn record_question(
     let mut preroll: VecDeque<f32> = VecDeque::new();
     let mut preroll_cap = 0usize; // sized once sample rate is known
     let mut sr = 16000u32;
+    let mut tail16 = Tail16k::new();
+    let mut last_vad_submit_ms = 0.0f64;
 
-    // Calibration accumulators.
+    // Calibration accumulators. Floor = the QUIETEST block seen, not the mean:
+    // if the interviewer is already mid-sentence when capture (re)arms — common
+    // when re-arming right after an answer — a mean would fold that speech into
+    // the "noise floor" and inflate the thresholds, clipping the start of the
+    // next question. The min tracks the inter-word gaps (≈ true room hum) and
+    // ignores the speech bursts, so onset stays sensitive.
     let mut calib_ms = 0.0;
-    let mut calib_sum = 0.0f32;
-    let mut calib_n = 0usize;
+    let mut calib_min = f32::INFINITY;
     let mut calibrated = false;
     let mut onset_th = Q_FLOOR_MIN * Q_ONSET_MULT; // provisional until calibrated
-    let mut cont_th = Q_FLOOR_MIN * Q_CONT_MULT;
+    // Adaptive-floor state for phase 3 (see the Q_FLOOR_* consts): the floor
+    // estimate re-learns continuously during capture; `peak_ema` tracks how
+    // loud the speaker actually is so both the floor cap and the silence
+    // threshold scale with the (unknown) meeting volume.
+    let mut floor_est = Q_FLOOR_MIN;
+    let mut peak_ema = 0.0f32;
 
     let mut speech_started = false;
     let mut voiced_ms = 0.0;       // consecutive voiced run while waiting for onset
@@ -577,7 +833,12 @@ pub fn record_question(
         }
     }
 
-    capture_run(CaptureSource::System, stop, MAX_ANSWER_S, |mono, sample_rate, block_ms| {
+    capture_run(CaptureSource::System, stop, Q_MAX_QUESTION_S, |mono, sample_rate, block_ms| {
+        // Manual "transcribe now" (button / hotkey): end capture immediately,
+        // bypassing the silence detector the user is overriding.
+        if finish.load(Ordering::SeqCst) {
+            return false;
+        }
         sr = sample_rate;
         elapsed_ms += block_ms;
         if preroll_cap == 0 {
@@ -585,18 +846,32 @@ pub fn record_question(
         }
         let (level, zcr) = level_of(mono);
         on_level(level, zcr);
+        // Feed the model tail continuously (even pre-onset, so the window has
+        // context) and, while recording, ship a snapshot every ~250 ms.
+        tail16.push(mono, sample_rate);
+        if let Some(v) = vad {
+            if speech_started && elapsed_ms - last_vad_submit_ms >= VAD_SUBMIT_EVERY_MS {
+                last_vad_submit_ms = elapsed_ms;
+                v.submit(elapsed_ms, tail16.snapshot());
+            }
+        }
 
         // Phase 1 — calibrate the ambient noise floor, set relative thresholds.
         if !calibrated {
-            calib_sum += level;
-            calib_n += 1;
+            if level < calib_min {
+                calib_min = level;
+            }
             calib_ms += block_ms;
             push_preroll(&mut preroll, mono, preroll_cap);
             if calib_ms >= Q_CALIBRATION_MS {
-                let floor = if calib_n > 0 { calib_sum / calib_n as f32 } else { 0.0 };
+                let floor = if calib_min.is_finite() { calib_min } else { 0.0 };
                 onset_th = (floor * Q_ONSET_MULT).max(Q_FLOOR_MIN);
-                cont_th = (floor * Q_CONT_MULT).max(Q_FLOOR_MIN * 0.7);
+                floor_est = floor;
                 calibrated = true;
+                eprintln!(
+                    "[vad] calibrated: floor={floor:.4} onset_th={onset_th:.4} \
+                     (end_silence={Q_END_SILENCE_MS:.0}ms preroll={PREROLL_MS:.0}ms max={Q_MAX_QUESTION_S:.0}s)"
+                );
             }
             return true;
         }
@@ -611,44 +886,106 @@ pub fn record_question(
                     // Prepend the pre-roll so the start of the question isn't clipped.
                     collected.extend(preroll.drain(..));
                     total_voiced_ms = voiced_ms;
+                    peak_ema = level; // seed the speaker-loudness estimate
+                    eprintln!("[vad] onset @ {:.1}s (level={level:.4})", elapsed_ms / 1000.0);
                 }
             } else {
                 voiced_ms = 0.0;
-                if elapsed_ms / 1000.0 > Q_NO_SPEECH_TIMEOUT_S {
+                if elapsed_ms / 1000.0 > no_speech_timeout_s {
+                    eprintln!("[vad] no speech within {no_speech_timeout_s:.0}s — giving up");
                     return false; // interviewer never spoke in the window
                 }
             }
             return true;
         }
 
-        // Phase 3 — recording the question. Lower CONT threshold + generous
-        // trailing-silence so pauses between sentences don't end the turn.
+        // Phase 3 — recording the question, with a continuously-adaptive
+        // silence threshold. The floor snaps down to any quieter block and
+        // drifts back up slowly (capped well below the speaker's level), and
+        // "silence" must also sit below a fraction of the speaker's running
+        // peak — so both a near-silent call and one with transmitted room
+        // tone / comfort noise endpoint correctly at the same tuning.
         collected.extend_from_slice(mono);
+        peak_ema = (peak_ema * Q_PEAK_DECAY).max(level.min(1.0));
+        if level < floor_est {
+            floor_est = level;
+        } else {
+            floor_est = (floor_est * Q_FLOOR_DRIFT).min(peak_ema * Q_FLOOR_PEAK_CAP);
+        }
+        let cont_th = (floor_est * Q_CONT_MULT)
+            .max(peak_ema * Q_PEAK_FRACTION)
+            .max(Q_FLOOR_MIN * 0.7);
         if level >= cont_th {
             silence_ms = 0.0;
             total_voiced_ms += block_ms;
         } else {
             silence_ms += block_ms;
-            if silence_ms >= Q_END_SILENCE_MS {
-                if total_voiced_ms >= Q_MIN_VOICED_MS {
-                    return false; // genuine question, fully ended → transcribe
-                }
-                // False trigger (a click / notification blip): discard and keep
-                // listening rather than answering a non-question.
-                speech_started = false;
-                voiced_ms = 0.0;
-                silence_ms = 0.0;
-                total_voiced_ms = 0.0;
-                collected.clear();
-                preroll.clear();
+        }
+        // End decision. When the Silero verdict is fresh it is AUTHORITATIVE —
+        // for both directions: it keeps the turn alive through a quiet-voiced
+        // stretch the energy path would misread as silence, and it ends the
+        // turn through background noise the energy path would misread as
+        // speech. Energy-only is the fallback (voice stack absent / endpoint
+        // down / verdict stale).
+        let effective_silence = model_silence_ms(vad, elapsed_ms).unwrap_or(silence_ms);
+        if effective_silence >= Q_END_SILENCE_MS {
+            if total_voiced_ms >= Q_MIN_VOICED_MS {
+                eprintln!(
+                    "[vad] END (silence {:.0}ms): dur={:.1}s voiced={:.0}ms \
+                     floor={floor_est:.4} peak={peak_ema:.4} cont_th={cont_th:.4}",
+                    effective_silence, elapsed_ms / 1000.0, total_voiced_ms
+                );
+                return false; // genuine question, fully ended → transcribe
             }
+            // False trigger (a click / notification blip): discard and keep
+            // listening rather than answering a non-question.
+            eprintln!("[vad] discard blip: voiced={:.0}ms (< {:.0}ms min)", total_voiced_ms, Q_MIN_VOICED_MS);
+            speech_started = false;
+            voiced_ms = 0.0;
+            silence_ms = 0.0;
+            total_voiced_ms = 0.0;
+            collected.clear();
+            preroll.clear();
         }
         true
     })?;
 
-    if !speech_started || total_voiced_ms < Q_MIN_VOICED_MS || collected.is_empty() {
+    // Reached here without a silence-triggered end ⇒ hit the hard cap (or stop).
+    // A capture that runs to Q_MAX_QUESTION_S means silence was NEVER detected —
+    // i.e. continuous meeting audio kept `level` above cont_th the whole time.
+    if speech_started && elapsed_ms / 1000.0 >= Q_MAX_QUESTION_S - 0.5 {
+        eprintln!(
+            "[vad] HARD CAP {:.0}s hit — silence never detected \
+             (floor={floor_est:.4} peak={peak_ema:.4} vs continuous background?). Captured {:.1}s.",
+            Q_MAX_QUESTION_S, collected.len() as f64 / sr.max(1) as f64
+        );
+    }
+
+    // External stop = cancel (user hit stop / turned Rec off): DISCARD what was
+    // captured — transcribing it would pop an unwanted answer after backing out.
+    if stop.load(Ordering::SeqCst) {
+        eprintln!("[vad] externally stopped — discarding capture");
         return Ok(None);
     }
+    // Manual finish overrides the silence detector: return whatever was captured.
+    // If the user forced it before a confirmed onset, fall back to the pre-roll
+    // ring so we still transcribe the most recent audio rather than nothing.
+    let manual = finish.load(Ordering::SeqCst);
+    if manual && !speech_started {
+        collected.extend(preroll.drain(..));
+    }
+    if collected.is_empty() || (!manual && (!speech_started || total_voiced_ms < Q_MIN_VOICED_MS)) {
+        eprintln!(
+            "[vad] no usable question (started={speech_started} voiced={total_voiced_ms:.0}ms \
+             collected={} manual={manual})",
+            collected.len()
+        );
+        return Ok(None);
+    }
+    eprintln!(
+        "[vad] question captured: {:.1}s audio @ {}Hz → STT",
+        collected.len() as f64 / sr.max(1) as f64, sr
+    );
     Ok(Some(encode_wav_mono16(&collected, sr)))
 }
 

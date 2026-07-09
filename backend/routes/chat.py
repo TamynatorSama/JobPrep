@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import time
 
 from fastapi import APIRouter
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -199,29 +201,80 @@ async def chat_stream(req: ChatRequest):
                     messages.append(AIMessage(content=turn.content))
             messages.append(HumanMessage(content=req.message))
 
-            # Mock interview wants the strongest persona consistency, so use
-            # the provider's "smart" tier; coach mode keeps the fast tier for
-            # cost + latency. Falling back only happens BEFORE the first token
-            # — once we've streamed output we can't switch models.
-            tier = "smart" if req.mode == "interviewer" else "fast"
+            # Both modes run the fast tier. Coach: cost + latency. Interviewer:
+            # it's a live SPOKEN conversation — measured TTFT on the smart tier
+            # was 9.5s (gemini-3.1-pro) per turn, a dead-air killer, vs 0.5s on
+            # flash with thinking zeroed, and the fast models hold the persona
+            # and ask equally specific questions. Set
+            # INTERPREP_INTERVIEWER_TIER=smart to trade latency for maximum
+            # persona depth. Falling back only happens BEFORE the first token —
+            # once we've streamed output we can't switch models.
+            tier = (
+                os.environ.get("INTERPREP_INTERVIEWER_TIER", "fast").strip() or "fast"
+            ) if req.mode == "interviewer" else "fast"
+            # Cap time-to-first-token. A slow/unavailable candidate must NOT hang
+            # the whole stream — the Rust SSE client waits up to 300s, so a dead
+            # first candidate would stall the answer for minutes. If no token
+            # arrives within this window, abandon that model and fail over to the
+            # next. Once tokens flow, there's no cap (a long answer is fine).
+            ttft_timeout = float(os.environ.get("INTERPREP_TTFT_TIMEOUT", "12"))
             last_err: Exception | None = None
             for model_name in llm_factory.candidate_models(req.llm, tier):
                 started = False
+                t0 = time.monotonic()
                 try:
-                    model = llm_factory.make_chat_model(req.llm, model_name)
-                    async for chunk in model.astream(messages):
+                    model = llm_factory.make_chat_model(req.llm, model_name, tier=tier)
+                    agen = model.astream(messages).__aiter__()
+                    while True:
+                        try:
+                            if started:
+                                chunk = await agen.__anext__()
+                            else:
+                                # Not wait_for: wait_for AWAITS the cancelled
+                                # inner coroutine, and langchain may be bridging
+                                # a sync stream through a worker thread that
+                                # can't be interrupted — wait_for would then
+                                # block until the provider's own retry loop
+                                # gives up. asyncio.wait + abandon enforces the
+                                # deadline no matter what the task is doing.
+                                fut = asyncio.ensure_future(agen.__anext__())
+                                done, _ = await asyncio.wait(
+                                    {fut}, timeout=ttft_timeout,
+                                )
+                                if not done:
+                                    fut.cancel()
+                                    raise asyncio.TimeoutError()
+                                chunk = fut.result()
+                        except StopAsyncIteration:
+                            break
                         text = llm_factory.content_text(chunk)
                         if text:
+                            if not started:
+                                print(f"[chat] {model_name} TTFT="
+                                      f"{time.monotonic() - t0:.2f}s", flush=True)
                             started = True
                             yield {"data": json.dumps({"type": "token", "content": text})}
                             await asyncio.sleep(0)
                     yield {"data": json.dumps({"type": "done"})}
                     return
+                except asyncio.TimeoutError:
+                    print(f"[chat] {model_name} no token in {ttft_timeout}s — "
+                          f"failing over to next candidate", flush=True)
+                    last_err = TimeoutError(f"{model_name}: no token in {ttft_timeout}s")
+                    continue
                 except Exception as exc:
                     last_err = exc
                     if started:
                         # Already mid-answer — surface the error, don't restart.
                         yield {"data": json.dumps({"type": "error", "content": str(exc)})}
+                        return
+                    if llm_factory.is_auth_error(exc):
+                        # Bad key fails every candidate identically — stop now
+                        # with an actionable message instead of walking the list.
+                        yield {"data": json.dumps({
+                            "type": "error",
+                            "content": llm_factory.auth_error_message(req.llm),
+                        })}
                         return
                     # Model unavailable before any token — try the next one.
                     continue

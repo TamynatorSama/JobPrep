@@ -8,7 +8,6 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 use wasapi::{Device, DeviceEnumerator, Direction, SampleType, StreamMode, WasapiError, WaveFormat};
 
 pub const DEFAULT_POLL_TIMEOUT_MS: u32 = 100;
@@ -67,7 +66,6 @@ impl CaptureSource {
 
 #[derive(Clone, Debug)]
 pub struct CaptureSummary {
-    pub source: CaptureSource,
     pub device_name: String,
     pub output_path: PathBuf,
     pub sample_rate: u32,
@@ -95,8 +93,6 @@ pub struct RecordingSession {
     stop: Arc<AtomicBool>,
     system_handle: Option<JoinHandle<Result<CaptureSummary>>>,
     mic_handle: Option<JoinHandle<Result<CaptureSummary>>>,
-    started_at: Instant,
-    duration: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -116,7 +112,7 @@ impl Drop for ComGuard {
 }
 
 impl RecordingSession {
-    pub fn start(config: RecorderConfig, duration: Option<Duration>) -> Result<Self> {
+    pub fn start(config: RecorderConfig) -> Result<Self> {
         fs::create_dir_all(&config.output_dir).with_context(|| {
             format!(
                 "failed to create output directory '{}'",
@@ -152,30 +148,11 @@ impl RecordingSession {
             stop,
             system_handle: Some(system_handle),
             mic_handle: Some(mic_handle),
-            started_at: Instant::now(),
-            duration,
         })
     }
 
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.system_handle
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-            && self.mic_handle.as_ref().is_some_and(JoinHandle::is_finished)
-    }
-
-    pub fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
-    }
-
-    pub fn should_auto_stop(&self) -> bool {
-        self.duration
-            .map(|duration| self.elapsed() >= duration)
-            .unwrap_or(false)
     }
 
     pub fn finish(mut self) -> Result<RecordingReport> {
@@ -209,38 +186,6 @@ pub fn query_device_catalog() -> Result<DeviceCatalog> {
     }
 }
 
-pub fn print_device_catalog(catalog: &DeviceCatalog) {
-    println!("Render devices (system audio loopback targets):");
-    print_devices_for_humans(&catalog.render_devices);
-    println!();
-    println!("Capture devices (microphones / line-in):");
-    print_devices_for_humans(&catalog.capture_devices);
-}
-
-pub fn print_capture_summary(summary: &CaptureSummary) {
-    println!(
-        "{}: device='{}', file='{}', sample_rate={}Hz, channels={}, frames={}, duration={:.2}s",
-        summary.source.label(),
-        summary.device_name,
-        summary.output_path.display(),
-        summary.sample_rate,
-        summary.channels,
-        summary.frames_written,
-        summary.duration_seconds()
-    );
-}
-
-fn print_devices_for_humans(devices: &[AudioDeviceEntry]) {
-    if devices.is_empty() {
-        println!("  (no active devices found)");
-        return;
-    }
-
-    for device in devices {
-        let marker = if device.is_default { "default" } else { "       " };
-        println!("  [{marker}] {}", device.name);
-    }
-}
 
 fn collect_devices(enumerator: &DeviceEnumerator, direction: Direction) -> Result<Vec<AudioDeviceEntry>> {
     let default_id = enumerator
@@ -403,7 +348,6 @@ fn record_source(job: CaptureJob, stop: Arc<AtomicBool>) -> Result<CaptureSummar
     writer.finalize().context("failed to finalize WAV file")?;
 
     Ok(CaptureSummary {
-        source: job.source,
         device_name,
         output_path: job.output_path,
         sample_rate: wave_format.get_samplespersec(),
