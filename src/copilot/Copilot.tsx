@@ -355,12 +355,12 @@ function ListenBody({ phase, time, lines, levelRef, question, answer, answering,
         {/* Wave only animates while actually capturing audio. */}
         <div style={{ flex: 1 }}><Wave active={phase === "listening"} color={T.accent} count={24} h={20} levelRef={levelRef} /></div>
         {/* Manual override for imperfect silence detection: end capture now and
-            transcribe what's been heard. Only while actively listening. Also
-            bound to the global Ctrl+` hotkey. */}
+            immediately process what's been heard. Only while actively listening.
+            Also bound to the global Ctrl+` hotkey. */}
         {phase === "listening" && (
-          <button onClick={onFinish} title="Transcribe now (Ctrl+`) — stop waiting for silence"
+          <button onClick={onFinish} title="Process now (Ctrl+`) — stop waiting for silence"
             style={{ height: 24, display: "flex", alignItems: "center", gap: 5, padding: "0 9px", borderRadius: 100, border: `0.5px solid ${T.accent}55`, background: T.accentSoft, color: T.accent, fontSize: 10.5, fontWeight: 600, fontFamily: T.fontBody, flexShrink: 0, ...press }}>
-            <Icon name="check" size={11} color={T.accent} sw={2.4} />Transcribe
+            <Icon name="check" size={11} color={T.accent} sw={2.4} />Process now
           </button>
         )}
         <span style={{ fontSize: 11, color: active ? T.textSecondary : T.textTertiary, fontVariantNumeric: "tabular-nums" }}>{active ? time : "tap Rec"}</span>
@@ -863,7 +863,7 @@ export default function Copilot() {
   // forget: the user opens the overlay well before the first question lands.
   // Idempotent + cheap when already warm.
   useEffect(() => {
-    invoke("voice_prepare", { engine: "piper", speaker: "" }).catch(() => {});
+    invoke("voice_prepare", { engine: "piper", speaker: "", sttEngine: "whisper" }).catch(() => {});
   }, []);
 
   // Which source the current capture is from, so the transcript line is labelled
@@ -1005,7 +1005,7 @@ export default function Copilot() {
       setElapsed(0); setView("live"); setPhase("listening");
       // Re-fire the STT warmup (idempotent, ~instant when already warm) in case
       // the overlay sat open long enough for the sidecar to have restarted.
-      invoke("voice_prepare", { engine: "piper", speaker: "" }).catch(() => {});
+      invoke("voice_prepare", { engine: "piper", speaker: "", sttEngine: "whisper" }).catch(() => {});
       startSystemListen();
     } else { invoke("voice_stop_listening").catch(() => {}); setListening(false); setPhase("idle"); }
   };

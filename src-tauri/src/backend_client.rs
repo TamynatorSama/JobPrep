@@ -356,6 +356,101 @@ pub fn voice_stt(base_url: &str, wav_b64: &str) -> Result<String, String> {
     Ok(resp["text"].as_str().unwrap_or("").to_string())
 }
 
+/// Latest endpointing/transcript state returned after an ordered Moonshine
+/// audio chunk. `completion_audio_ms` is the stream clock at which Moonshine
+/// finalized its most recent phrase.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct VoiceSttStreamState {
+    #[serde(default)]
+    pub healthy: bool,
+    #[serde(default)]
+    pub completion_seq: u64,
+    #[serde(default)]
+    pub completion_audio_ms: f64,
+}
+
+/// One keep-alive HTTP client + sidecar session for a candidate answer. Calls
+/// are made by a single ordered worker so Moonshine receives every PCM block in
+/// capture order and can reuse its streaming encoder/decoder cache.
+pub struct VoiceSttStreamClient {
+    client: reqwest::blocking::Client,
+    base_url: String,
+    session_id: String,
+}
+
+impl VoiceSttStreamClient {
+    pub fn start(base_url: &str) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::new();
+        let resp: Value = client
+            .post(format!("{base_url}/voice/stt-stream/start"))
+            .timeout(std::time::Duration::from_secs(180))
+            .send()
+            .and_then(|r| r.json())
+            .map_err(|e| e.to_string())?;
+        if let Some(err) = resp["error"].as_str() {
+            return Err(err.to_string());
+        }
+        let session_id = resp["session_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "Moonshine start returned no session id".to_string())?
+            .to_string();
+        Ok(Self { client, base_url: base_url.to_string(), session_id })
+    }
+
+    pub fn push(
+        &self,
+        pcm: &[i16],
+        sample_rate: u32,
+        elapsed_ms: f64,
+    ) -> Result<VoiceSttStreamState, String> {
+        use base64::Engine;
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for sample in pcm {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let audio_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let resp: Value = self.client
+            .post(format!("{}/voice/stt-stream/chunk", self.base_url))
+            .json(&serde_json::json!({
+                "session_id": self.session_id,
+                "audio_b64": audio_b64,
+                "sample_rate": sample_rate,
+                "elapsed_ms": elapsed_ms,
+            }))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .and_then(|r| r.json())
+            .map_err(|e| e.to_string())?;
+        if let Some(err) = resp["error"].as_str() {
+            return Err(err.to_string());
+        }
+        serde_json::from_value(resp).map_err(|e| e.to_string())
+    }
+
+    pub fn finish(self) -> Result<String, String> {
+        let resp: Value = self.client
+            .post(format!("{}/voice/stt-stream/finish", self.base_url))
+            .json(&serde_json::json!({ "session_id": self.session_id }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .and_then(|r| r.json())
+            .map_err(|e| e.to_string())?;
+        if let Some(err) = resp["error"].as_str() {
+            return Err(err.to_string());
+        }
+        Ok(resp["text"].as_str().unwrap_or("").to_string())
+    }
+
+    pub fn cancel(self) {
+        let _ = self.client
+            .post(format!("{}/voice/stt-stream/cancel", self.base_url))
+            .json(&serde_json::json!({ "session_id": self.session_id }))
+            .timeout(std::time::Duration::from_secs(5))
+            .send();
+    }
+}
+
 /// POST /voice/warm — kick the engine's cold-start warmup. Returns once the
 /// request is accepted; the warmup proceeds on the sidecar in the background.
 pub fn voice_warm(base_url: &str, engine: &str, speaker: &str) -> Result<(), String> {
@@ -374,11 +469,21 @@ pub fn voice_warm(base_url: &str, engine: &str, speaker: &str) -> Result<(), Str
 /// waits for completion so the "Preparing engine…" modal can dismiss only once
 /// the interview engine is actually ready. vibe-rt's first synth is ~30s on a
 /// laptop GPU, so the timeout is generous.
-pub fn voice_prepare(base_url: &str, engine: &str, speaker: &str) -> Result<Value, String> {
+pub fn voice_prepare(
+    base_url: &str,
+    engine: &str,
+    speaker: &str,
+    stt_engine: &str,
+) -> Result<Value, String> {
     let client = reqwest::blocking::Client::new();
     client
         .post(format!("{base_url}/voice/prepare"))
-        .json(&serde_json::json!({ "text": "", "engine": engine, "speaker": speaker }))
+        .json(&serde_json::json!({
+            "text": "",
+            "engine": engine,
+            "speaker": speaker,
+            "stt_engine": stt_engine,
+        }))
         .timeout(std::time::Duration::from_secs(300))
         .send()
         .and_then(|r| r.json::<Value>())

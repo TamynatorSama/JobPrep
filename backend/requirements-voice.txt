@@ -11,3 +11,4 @@
 numpy>=1.26
 piper-tts             # fast neural TTS (default interview voice; offline, CPU, onnxruntime)
 faster-whisper>=1.0.0  # local STT, auto GPU/CPU
+moonshine-voice==0.0.69 # streaming STT; pinned while its Python API is alpha

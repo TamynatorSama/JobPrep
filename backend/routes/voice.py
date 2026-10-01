@@ -1,7 +1,8 @@
 """Voice services for the live mock interview.
 
   POST /voice/tts    {text,engine,speaker} -> {audio_b64, sample_rate}   (piper | vibe-rt)
-  POST /voice/stt    {audio_b64}           -> {text}                     (faster-whisper)
+  POST /voice/stt    {audio_b64}           -> {text}                     (faster-whisper fallback)
+  POST /voice/stt-stream/{start|chunk|finish|cancel}                       (Moonshine)
   GET  /voice/status                       -> capability + device report
 
 Two TTS engines:
@@ -25,6 +26,7 @@ import base64
 import io
 import threading
 import time
+import uuid
 import wave
 
 from fastapi import APIRouter
@@ -96,6 +98,9 @@ class TtsRequest(BaseModel):
     # Which panelist voice to use (vibe-rt only). One of VIBE_VOICES; ignored by
     # Piper. Lets the interview pick a different voice per panelist per turn.
     speaker: str | None = None
+    # "moonshine" for the mock-interview candidate stream; omitted by the
+    # copilot, which still warms faster-whisper for system-audio transcription.
+    stt_engine: str | None = None
 
 
 class SttRequest(BaseModel):
@@ -108,6 +113,18 @@ class VadRequest(BaseModel):
     # — the rolling audio tail the capture loop wants a speech/no-speech verdict
     # for. Raw PCM keeps the 4×/s hot path allocation-light on both sides.
     audio_b64: str
+
+
+class SttStreamChunkRequest(BaseModel):
+    session_id: str
+    # RAW little-endian mono PCM16. Moonshine accepts arbitrary sample rates.
+    audio_b64: str
+    sample_rate: int
+    elapsed_ms: float
+
+
+class SttStreamSessionRequest(BaseModel):
+    session_id: str
 
 
 # ── lazy singletons ──────────────────────────────────────────────────────────
@@ -125,6 +142,8 @@ _state = {
     "piper": None,          # PiperVoice (fast default engine)
     "piper_sr": 22050,      # Piper voice output sample rate
     "stt": None,            # faster-whisper WhisperModel
+    "moonshine": None,      # shared Moonshine Transcriber (per-turn streams)
+    "moonshine_warm": False,
     "import_error": None,   # str if torch/models can't be imported
     "vibe_model": None,     # VibeVoiceStreamingForConditionalGenerationInference
     "vibe_proc": None,      # VibeVoiceStreamingProcessor
@@ -132,6 +151,24 @@ _state = {
     "vibe_warm": False,     # True once a throwaway synth has JIT-compiled kernels
     "vibe_warming": False,  # guards against overlapping warm requests
 }
+
+# Moonshine streams are stateful and receive ordered chunks from one Rust
+# capture worker. The model is shared, but each answer owns an independent
+# stream/listener. Sessions are short-lived and evicted defensively if a client
+# disappears without sending finish/cancel.
+_moonshine_lock = threading.Lock()
+# moonshine-voice shares one native Transcriber across streams. Keep native
+# operations single-flight until concurrent Windows inference is explicitly
+# validated; HTTP/session bookkeeping remains concurrent around this lock.
+_moonshine_inference_lock = threading.Lock()
+_moonshine_sessions_lock = threading.Lock()
+_moonshine_sessions: dict[str, "_MoonshineSession"] = {}
+MOONSHINE_SESSION_TTL_S = 180.0
+# The library recommends 500ms. Smaller values repeatedly invoke the decoder
+# faster than this Windows CPU can keep up, creating a backlog that defeats
+# streaming; 500ms keeps inference near real-time while phrase completion still
+# arrives well before the conservative 1.4s endpoint.
+MOONSHINE_UPDATE_INTERVAL_S = 0.5
 
 
 def _device() -> str:
@@ -477,6 +514,171 @@ def _get_stt():
     return _state["stt"]
 
 
+def _get_moonshine():
+    """Load the shared English Tiny Streaming transcriber once.
+
+    Tiny stays ahead of real-time on the target Windows CPU (local benchmark:
+    2.7s inference for 3.7s audio); Small took 11s and created a backlog. Unlike
+    Whisper, streaming caches work while the candidate is talking. Model files
+    are cached by moonshine-voice after the first download.
+    """
+    if _state["moonshine"] is not None:
+        return _state["moonshine"]
+    with _moonshine_lock:
+        if _state["moonshine"] is None:
+            from moonshine_voice import ModelArch, Transcriber, get_model_for_language
+            t0 = time.time()
+            model_path, model_arch = get_model_for_language(
+                "en", ModelArch.TINY_STREAMING
+            )
+            _state["moonshine"] = Transcriber(
+                model_path=model_path,
+                model_arch=model_arch,
+                update_interval=MOONSHINE_UPDATE_INTERVAL_S,
+            )
+            print(
+                f"[voice] Moonshine loaded: tiny-streaming-en "
+                f"({time.time() - t0:.1f}s)",
+                flush=True,
+            )
+    return _state["moonshine"]
+
+
+class _MoonshineSession:
+    """One candidate answer streamed through the shared Moonshine model."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        # add_audio synchronously emits listener callbacks, so this must be
+        # re-entrant: chunk() owns it while _on_event() updates state.
+        self.lock = threading.RLock()
+        self.completed: list[str] = []
+        self.completed_ids: set[int] = set()
+        self.partial = ""
+        self.completion_seq = 0
+        self.completion_audio_ms = 0.0
+        self.submitted_audio_ms = 0.0
+        self.touched = time.monotonic()
+        stream.add_listener(self._on_event)
+
+    def _on_event(self, event) -> None:
+        line = getattr(event, "line", None)
+        if line is None:
+            return
+        text = (getattr(line, "text", "") or "").strip()
+        kind = type(event).__name__
+        with self.lock:
+            self.touched = time.monotonic()
+            if text:
+                self.partial = text
+            if kind == "LineCompleted":
+                line_id = int(getattr(line, "line_id", id(line)))
+                if line_id not in self.completed_ids:
+                    self.completed_ids.add(line_id)
+                    if text:
+                        self.completed.append(text)
+                    self.completion_seq += 1
+                    self.completion_audio_ms = self.submitted_audio_ms
+                self.partial = ""
+
+    def add_pcm16(self, pcm: bytes, sample_rate: int, elapsed_ms: float) -> dict:
+        import numpy as np
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        with self.lock:
+            self.submitted_audio_ms = max(self.submitted_audio_ms, elapsed_ms)
+            self.touched = time.monotonic()
+            before = self.completion_seq
+            if samples.size:
+                with _moonshine_inference_lock:
+                    self.stream.add_audio(samples, max(1, sample_rate))
+            return {
+                "healthy": True,
+                "phrase_completed": self.completion_seq > before,
+                "completion_seq": self.completion_seq,
+                "completion_audio_ms": self.completion_audio_ms,
+                "partial": self.partial,
+            }
+
+    def finish(self) -> str:
+        with self.lock:
+            try:
+                with _moonshine_inference_lock:
+                    transcript = self.stream.stop()
+                # stop() emits LineCompleted, but also inspect its returned
+                # snapshot for versions that coalesce listener notifications.
+                for line in getattr(transcript, "lines", []) if transcript else []:
+                    text = (getattr(line, "text", "") or "").strip()
+                    line_id = int(getattr(line, "line_id", id(line)))
+                    if text and line_id not in self.completed_ids:
+                        self.completed_ids.add(line_id)
+                        self.completed.append(text)
+                parts = self.completed.copy()
+                if self.partial and (not parts or parts[-1] != self.partial):
+                    parts.append(self.partial)
+                return " ".join(parts).strip()
+            finally:
+                with _moonshine_inference_lock:
+                    self.stream.close()
+
+    def cancel(self) -> None:
+        with self.lock:
+            try:
+                with _moonshine_inference_lock:
+                    self.stream.stop()
+            except Exception:
+                pass
+            finally:
+                with _moonshine_inference_lock:
+                    self.stream.close()
+
+
+def _evict_stale_moonshine_sessions() -> None:
+    cutoff = time.monotonic() - MOONSHINE_SESSION_TTL_S
+    with _moonshine_sessions_lock:
+        stale = [
+            sid for sid, session in _moonshine_sessions.items()
+            if session.touched < cutoff
+        ]
+        sessions = [_moonshine_sessions.pop(sid) for sid in stale]
+    for session in sessions:
+        session.cancel()
+
+
+def _moonshine_start() -> str:
+    _evict_stale_moonshine_sessions()
+    transcriber = _get_moonshine()
+    with _moonshine_inference_lock:
+        stream = transcriber.create_stream(
+            update_interval=MOONSHINE_UPDATE_INTERVAL_S
+        )
+    session = _MoonshineSession(stream)
+    with _moonshine_inference_lock:
+        stream.start()
+    session_id = uuid.uuid4().hex
+    with _moonshine_sessions_lock:
+        _moonshine_sessions[session_id] = session
+    return session_id
+
+
+def _moonshine_session(session_id: str) -> _MoonshineSession:
+    with _moonshine_sessions_lock:
+        session = _moonshine_sessions.get(session_id)
+    if session is None:
+        raise ValueError("unknown or expired Moonshine session")
+    return session
+
+
+def _moonshine_finish(session_id: str, cancel: bool = False) -> str:
+    with _moonshine_sessions_lock:
+        session = _moonshine_sessions.pop(session_id, None)
+    if session is None:
+        raise ValueError("unknown or expired Moonshine session")
+    if cancel:
+        session.cancel()
+        return ""
+    return session.finish()
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     """Wrap raw 16-bit mono PCM bytes in a WAV container."""
@@ -581,9 +783,31 @@ def _warm_stt() -> None:
     print(f"[voice] STT warmed in {time.time() - t0:.1f}s", flush=True)
 
 
-def prepare(engine: str, speaker: str = VIBE_DEFAULT_SPEAKER) -> dict:
-    """Warm everything a live interview needs — speech recognition (faster-whisper)
-    + the chosen TTS engine — and BLOCK until ready.
+def _warm_moonshine() -> None:
+    """Load Moonshine and exercise its streaming path before the interview."""
+    if _state.get("moonshine_warm"):
+        return
+    import numpy as np
+    t0 = time.time()
+    transcriber = _get_moonshine()
+    with _moonshine_inference_lock:
+        stream = transcriber.create_stream(
+            update_interval=MOONSHINE_UPDATE_INTERVAL_S
+        )
+        stream.start()
+        stream.add_audio(np.zeros(3200, dtype=np.float32), 16000)
+        stream.stop()
+        stream.close()
+    _state["moonshine_warm"] = True
+    print(f"[voice] Moonshine warmed in {time.time() - t0:.1f}s", flush=True)
+
+
+def prepare(
+    engine: str,
+    speaker: str = VIBE_DEFAULT_SPEAKER,
+    stt_engine: str = "whisper",
+) -> dict:
+    """Warm the requested speech recognizer and TTS engine, blocking until ready.
 
     Called from POST /voice/prepare when the user starts a mock interview, behind
     the "Preparing engine…" modal, so the model-load + cold-start cost (vibe-rt's
@@ -594,8 +818,11 @@ def prepare(engine: str, speaker: str = VIBE_DEFAULT_SPEAKER) -> dict:
     per-stage readiness report (best-effort per stage)."""
     engine = _norm_engine(engine)
     speaker = _norm_speaker(speaker)
+    stt_engine = "moonshine" if stt_engine == "moonshine" else "whisper"
     t0 = time.time()
-    report: dict = {"engine": engine, "stt": False, "tts": False}
+    report: dict = {
+        "engine": engine, "stt_engine": stt_engine, "stt": False, "tts": False
+    }
     # Serialized: callers fire this fire-and-forget from several places (the
     # copilot overlay on open AND on Rec — twice each under React StrictMode —
     # plus the mock-interview modal). Concurrent warms would run two
@@ -603,11 +830,24 @@ def prepare(engine: str, speaker: str = VIBE_DEFAULT_SPEAKER) -> dict:
     # block briefly, then every stage is a warm no-op.
     with _prepare_lock:
         try:
-            _warm_stt()
+            if stt_engine == "moonshine":
+                _warm_moonshine()
+            else:
+                _warm_stt()
             report["stt"] = True
         except Exception as exc:
             report["stt_error"] = str(exc)
-            print(f"[voice] prepare: STT warm failed: {exc}", flush=True)
+            print(f"[voice] prepare: {stt_engine} warm failed: {exc}", flush=True)
+            # Keep mock interviews usable when Moonshine is missing or its model
+            # download fails. This pays Whisper's warmup only on that failure.
+            if stt_engine == "moonshine":
+                try:
+                    _warm_stt()
+                    report["stt"] = True
+                    report["stt_engine"] = "whisper"
+                    report["stt_fallback"] = True
+                except Exception as fallback_exc:
+                    report["stt_fallback_error"] = str(fallback_exc)
         # warm() is best-effort and never raises, so read the loaded-state
         # directly to report TTS readiness honestly.
         warm(engine, speaker)
@@ -615,7 +855,7 @@ def prepare(engine: str, speaker: str = VIBE_DEFAULT_SPEAKER) -> dict:
         else (_state["piper"] is not None)
     report["ready"] = report["stt"] and report["tts"]
     report["took_ms"] = int((time.time() - t0) * 1000)
-    print(f"[voice] prepare engine={engine} ready={report['ready']} "
+    print(f"[voice] prepare engine={engine} stt={report['stt_engine']} ready={report['ready']} "
           f"({report['took_ms']}ms)", flush=True)
     return report
 
@@ -665,6 +905,7 @@ async def status():
             return importlib.util.find_spec(mod) is not None
         piper_ok = have("piper")
         stt_ok = have("faster_whisper")
+        moonshine_ok = have("moonshine_voice")
         vibe_ok = have("torch") and have("vibevoice")
         available = piper_ok and stt_ok
         if not available:
@@ -674,15 +915,22 @@ async def status():
     except Exception as exc:
         available = False
         vibe_ok = False
+        moonshine_ok = False
         detail = str(exc)
     return {
         "available": available,
         "device": device,
         "vibe_available": vibe_ok,
+        "moonshine_available": moonshine_ok,
+        "stt_engines": [
+            name for name, ok in
+            (("moonshine", moonshine_ok), ("whisper", stt_ok)) if ok
+        ],
         "voices": list(VIBE_VOICES.keys()),
         "default_speaker": VIBE_DEFAULT_SPEAKER,
         "tts_loaded": (_state["piper"] is not None) or (_state["vibe_model"] is not None),
         "stt_loaded": _state["stt"] is not None,
+        "moonshine_loaded": _state["moonshine"] is not None,
         "detail": detail,
     }
 
@@ -707,7 +955,9 @@ async def prepare_endpoint(req: TtsRequest):
     cold synth."""
     engine = _norm_engine(req.engine)
     speaker = _norm_speaker(req.speaker)
-    return await asyncio.to_thread(prepare, engine, speaker)
+    return await asyncio.to_thread(
+        prepare, engine, speaker, (req.stt_engine or "whisper").strip().lower()
+    )
 
 
 @router.post("/tts")
@@ -754,6 +1004,58 @@ async def tts_stream(req: TtsRequest):
         media_type="application/octet-stream",
         headers={"X-Sample-Rate": str(sr)},
     )
+
+
+@router.post("/stt-stream/start")
+async def stt_stream_start():
+    """Create one ordered Moonshine stream for a candidate answer."""
+    try:
+        session_id = await asyncio.to_thread(_moonshine_start)
+        return {"session_id": session_id, "engine": "moonshine"}
+    except Exception as exc:
+        print(f"[voice] Moonshine stream start failed: {exc}", flush=True)
+        return {"error": str(exc)}
+
+
+@router.post("/stt-stream/chunk")
+async def stt_stream_chunk(req: SttStreamChunkRequest):
+    """Append one ordered PCM chunk and return the latest phrase state."""
+    try:
+        pcm = base64.b64decode(req.audio_b64)
+        session = _moonshine_session(req.session_id)
+        return await asyncio.to_thread(
+            session.add_pcm16, pcm, req.sample_rate, req.elapsed_ms
+        )
+    except Exception as exc:
+        print(f"[voice] Moonshine stream chunk failed: {exc}", flush=True)
+        return {"error": str(exc), "healthy": False}
+
+
+@router.post("/stt-stream/finish")
+async def stt_stream_finish(req: SttStreamSessionRequest):
+    """Flush the stream and return the final answer text."""
+    try:
+        t0 = time.time()
+        text = await asyncio.to_thread(_moonshine_finish, req.session_id)
+        print(
+            f"[voice] Moonshine final: {time.time() - t0:.2f}s, "
+            f"{len(text)} chars",
+            flush=True,
+        )
+        return {"text": text, "engine": "moonshine"}
+    except Exception as exc:
+        print(f"[voice] Moonshine stream finish failed: {exc}", flush=True)
+        return {"error": str(exc)}
+
+
+@router.post("/stt-stream/cancel")
+async def stt_stream_cancel(req: SttStreamSessionRequest):
+    """Discard an abandoned candidate stream."""
+    try:
+        await asyncio.to_thread(_moonshine_finish, req.session_id, True)
+    except Exception:
+        pass
+    return {"cancelled": True}
 
 
 @router.post("/stt")

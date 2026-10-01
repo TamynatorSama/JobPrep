@@ -1,7 +1,7 @@
 # InterPrep backend setup
 # Run once from the backend/ directory: .\setup.ps1
-#   -Voice   also install the optional voice stack (Piper + VibeVoice TTS +
-#            faster-whisper STT). Auto-picks the CUDA torch build if an NVIDIA
+#   -Voice   also install the optional voice stack (Piper + VibeVoice TTS,
+#            Moonshine streaming STT + faster-whisper fallback). Auto-picks the CUDA torch build if an NVIDIA
 #            GPU is present, otherwise the CPU build (slower TTS).
 #            Piper is the fast default voice; VibeVoice ("vibe-rt") is opt-in in
 #            Settings for a more humanlike voice + a multi-interviewer panel.
@@ -78,6 +78,19 @@ if ($Voice) {
     }
 
     & .\.venv\Scripts\pip install -r requirements-voice.txt
+
+    # Pre-fetch Moonshine Tiny Streaming. It stays ahead of real-time on the
+    # target Windows CPU and performs transcription while the
+    # candidate is still talking, so the final text is ready at end-of-turn.
+    # Best-effort: faster-whisper remains the transparent fallback.
+    Write-Host "==> Fetching Moonshine Tiny Streaming English model ..."
+    try {
+        & .\.venv\Scripts\python -c "from moonshine_voice import ModelArch, get_model_for_language; get_model_for_language('en', ModelArch.TINY_STREAMING)"
+        if ($LASTEXITCODE -ne 0) { throw "Moonshine model download failed" }
+        Write-Host "    Moonshine model ready." -ForegroundColor Green
+    } catch {
+        Write-Host "    Moonshine setup failed (faster-whisper fallback still works): $_" -ForegroundColor Yellow
+    }
 
     # ── VibeVoice (humanlike "vibe-rt" voice + panel) ────────────────────────
     # Installed SEPARATELY and best-effort: VibeVoice pins an older transformers

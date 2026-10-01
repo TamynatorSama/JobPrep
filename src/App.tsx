@@ -4481,6 +4481,11 @@ const App = () => {
   /// message (sendMessage maps that title to `mode: "interviewer"`).
   const startMockInterview = (job: Job, config: InterviewConfig) => {
     const mockThreadId = `c-mock-${job.id}-${Date.now()}`;
+    // Mock interviews are voice-first. Enable voice before triggering the
+    // opening question so its streamed response is spoken from the first token.
+    // The status check still falls back to text mode if voice is unavailable.
+    enableVoice();
+    setVoiceOverlayOpen(true);
     setJobs((prev) => prev.map((j) =>
       j.id !== job.id ? j : {
         ...j,

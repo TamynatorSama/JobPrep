@@ -48,12 +48,16 @@ const PREROLL_SECS: f64 = 1.0;
 const SPEECH_RMS: f32 = 0.02;        // above this = speech onset
 const CONTINUE_RMS: f32 = 0.011;     // above this during an answer = still talking
 const START_SPEECH_MS: f64 = 160.0;  // sustained voice to count as speech start
+const ANSWER_FAST_END_SILENCE_MS: f64 = 700.0; // Moonshine phrase + local silence agree
 const END_SILENCE_MS: f64 = 1400.0;  // trailing silence that ends an answer — generous
                                      // (answers have longer think-pauses than
                                      // questions, so this stays above Q_END_SILENCE_MS)
 const NO_SPEECH_TIMEOUT_S: f64 = 10.0; // give up if the user never speaks
 const MAX_ANSWER_S: f64 = 120.0;      // hard cap on a single answer
 const BARGE_SPEECH_MS: f64 = 240.0;   // sustained voice to trigger barge-in
+const MOONSHINE_SUBMIT_MS: f64 = 100.0; // ordered PCM chunk cadence
+const MOONSHINE_MAX_AGE_MS: f64 = 800.0;
+const MOONSHINE_COMPLETION_MAX_AGE_MS: f64 = 1200.0;
 
 // ── System-audio (interviewer) question capture ────────────────────────────
 // Capturing the *interviewer's* voice off the system loopback is a different
@@ -71,10 +75,10 @@ const Q_ONSET_MULT: f32 = 3.0;         // onset threshold = noise_floor * this
 const Q_CONT_MULT: f32 = 1.8;          // continue threshold = noise_floor * this
 const Q_FLOOR_MIN: f32 = 0.006;        // floor so thresholds don't collapse in dead silence
 const Q_START_SPEECH_MS: f64 = 120.0;  // sustained voice to count as question onset
+const Q_FAST_END_SILENCE_MS: f64 = 650.0; // fast end when neural + energy VAD agree
 const Q_END_SILENCE_MS: f64 = 1100.0;  // sustained trailing silence = question complete
-                                       // (mid-question think-pauses are typically
-                                       // <1s; the adaptive floor below is what
-                                       // makes a tighter window safe)
+                                       // conservative fallback when only one detector
+                                       // can confidently distinguish speech from noise
 // The one-shot calibration above is taken while the call is often near-silent,
 // so its floor is ~0 — but once someone talks, the meeting app transmits their
 // room tone / comfort noise CONTINUOUSLY at a level far above digital silence.
@@ -111,6 +115,130 @@ const Q_MAX_QUESTION_S: f64 = 28.0;    // hard cap on one captured question. Rea
                                        // gets a transcript + answer for the first chunk
                                        // instead of waiting on silence that never comes.
 const PREROLL_MS: f64 = 700.0;         // audio kept before confirmed onset so we don't clip the start
+
+// ─── Moonshine streaming STT client ─────────────────────────────────────────
+
+#[derive(Clone, Default)]
+pub struct MoonshineVerdict {
+    pub snapshot_elapsed_ms: f64,
+    pub completion_audio_ms: f64,
+    pub completion_seq: u64,
+    pub healthy: bool,
+}
+
+enum MoonshineMsg {
+    Audio { elapsed_ms: f64, samples: Vec<i16>, sample_rate: u32 },
+    Finish(std::sync::mpsc::Sender<std::result::Result<String, String>>),
+    Cancel,
+}
+
+/// Ordered, non-blocking bridge from the WASAPI capture loop to one Moonshine
+/// stream in the sidecar. The unbounded channel is deliberate: dropping even
+/// one audio chunk corrupts a streaming transcript, while a full 120-second
+/// answer is only a few MB of mono PCM if the sidecar briefly falls behind.
+pub struct MoonshineClient {
+    tx: std::sync::mpsc::Sender<MoonshineMsg>,
+    verdict: Arc<Mutex<MoonshineVerdict>>,
+}
+
+impl MoonshineClient {
+    pub fn start(base_url: String) -> std::result::Result<Self, String> {
+        let client = crate::backend_client::VoiceSttStreamClient::start(&base_url)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let verdict = Arc::new(Mutex::new(MoonshineVerdict {
+            healthy: true,
+            ..Default::default()
+        }));
+        let shared = Arc::clone(&verdict);
+        std::thread::spawn(move || {
+            let mut client = Some(client);
+            let mut stream_error: Option<String> = None;
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    MoonshineMsg::Audio { elapsed_ms, samples, sample_rate } => {
+                        if stream_error.is_some() {
+                            continue;
+                        }
+                        let result = client.as_ref().unwrap().push(
+                            &samples, sample_rate, elapsed_ms,
+                        );
+                        match result {
+                            Ok(state) => {
+                                let mut v = shared.lock().unwrap();
+                                v.snapshot_elapsed_ms = elapsed_ms;
+                                v.completion_audio_ms = state.completion_audio_ms;
+                                v.completion_seq = state.completion_seq;
+                                v.healthy = state.healthy;
+                            }
+                            Err(e) => {
+                                eprintln!("[moonshine-client] chunk failed: {e}");
+                                shared.lock().unwrap().healthy = false;
+                                stream_error = Some(e);
+                            }
+                        }
+                    }
+                    MoonshineMsg::Finish(reply) => {
+                        let result = match stream_error {
+                            Some(e) => {
+                                if let Some(c) = client.take() { c.cancel(); }
+                                Err(e)
+                            }
+                            None => client.take().unwrap().finish(),
+                        };
+                        let _ = reply.send(result);
+                        return;
+                    }
+                    MoonshineMsg::Cancel => {
+                        if let Some(c) = client.take() { c.cancel(); }
+                        return;
+                    }
+                }
+            }
+            if let Some(c) = client.take() { c.cancel(); }
+        });
+        Ok(Self { tx, verdict })
+    }
+
+    pub fn submit(&self, elapsed_ms: f64, mono: &[f32], sample_rate: u32) {
+        let samples = mono.iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect();
+        let _ = self.tx.send(MoonshineMsg::Audio {
+            elapsed_ms, samples, sample_rate,
+        });
+    }
+
+    pub fn latest(&self) -> MoonshineVerdict {
+        self.verdict.lock().unwrap().clone()
+    }
+
+    pub fn finish(self) -> std::result::Result<String, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx.send(MoonshineMsg::Finish(tx)).map_err(|e| e.to_string())?;
+        rx.recv_timeout(std::time::Duration::from_secs(35))
+            .map_err(|e| e.to_string())?
+    }
+
+    pub fn cancel(self) {
+        let _ = self.tx.send(MoonshineMsg::Cancel);
+    }
+}
+
+fn moonshine_fast_end(
+    verdict: &MoonshineVerdict,
+    elapsed_ms: f64,
+    local_silence_ms: f64,
+) -> bool {
+    if !verdict.healthy || verdict.completion_seq == 0
+        || local_silence_ms < ANSWER_FAST_END_SILENCE_MS
+    {
+        return false;
+    }
+    let snapshot_age = elapsed_ms - verdict.snapshot_elapsed_ms;
+    let completion_age = elapsed_ms - verdict.completion_audio_ms;
+    (0.0..=MOONSHINE_MAX_AGE_MS).contains(&snapshot_age)
+        && (0.0..=MOONSHINE_COMPLETION_MAX_AGE_MS).contains(&completion_age)
+}
 
 // ─── Silero-VAD client (model-based endpointing) ─────────────────────────────
 
@@ -190,10 +318,11 @@ impl VadClient {
 }
 
 // How the model verdict is applied while capturing:
-const VAD_SUBMIT_EVERY_MS: f64 = 250.0;  // tail snapshot cadence
+const VAD_SUBMIT_EVERY_MS: f64 = 160.0;  // tighter cadence lowers end-of-turn latency
 const VAD_TAIL_MS: f64 = 2000.0;         // rolling window sent per snapshot
 // A verdict older than this is stale (worker wedged / endpoint down) — fall
-// back to energy until a fresh one lands. Verdicts land every ~280 ms, so
+// back to energy until a fresh one lands. Verdicts normally land within a few
+// hundred milliseconds, so
 // this only trips when something is actually wrong.
 const VAD_MAX_AGE_MS: f64 = 900.0;
 
@@ -678,6 +807,7 @@ pub fn record_answer(
     stop: &Arc<AtomicBool>,
     finish: &Arc<AtomicBool>,
     vad: Option<&VadClient>,
+    moonshine: Option<&MoonshineClient>,
     on_level: &mut dyn FnMut(f32, f32),
 ) -> Result<Option<Vec<u8>>> {
     let mut collected: Vec<f32> = Vec::new();
@@ -691,6 +821,8 @@ pub fn record_answer(
     let mut peak_ema = 0.0f32;
     let mut tail16 = Tail16k::new();
     let mut last_vad_submit_ms = 0.0f64;
+    let mut moonshine_buf: Vec<f32> = Vec::new();
+    let mut last_moonshine_submit_ms = 0.0f64;
 
     capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, |mono, sample_rate, block_ms| {
         // Manual "transcribe now" (button / hotkey): end capture immediately and
@@ -702,6 +834,14 @@ pub fn record_answer(
         elapsed_ms += block_ms;
         let (level, zcr) = level_of(mono);
         on_level(level, zcr);
+        if let Some(m) = moonshine {
+            moonshine_buf.extend_from_slice(mono);
+            if elapsed_ms - last_moonshine_submit_ms >= MOONSHINE_SUBMIT_MS {
+                last_moonshine_submit_ms = elapsed_ms;
+                m.submit(elapsed_ms, &moonshine_buf, sample_rate);
+                moonshine_buf.clear();
+            }
+        }
         tail16.push(mono, sample_rate);
         if let Some(v) = vad {
             if speech_started && elapsed_ms - last_vad_submit_ms >= VAD_SUBMIT_EVERY_MS {
@@ -748,13 +888,25 @@ pub fn record_answer(
         } else {
             silence_ms += block_ms;
         }
-        // Model-first end decision (see record_question): the fresh Silero
-        // verdict overrides the energy estimate in both directions.
-        if model_silence_ms(vad, elapsed_ms).unwrap_or(silence_ms) >= END_SILENCE_MS {
+        // Moonshine has already decoded this phrase while the candidate spoke.
+        // When its phrase-completion event and local trailing silence agree, end
+        // early. If either signal is stale/disagrees, retain the conservative
+        // Silero/energy fallback used before streaming was introduced.
+        let moonshine_done = moonshine
+            .is_some_and(|m| moonshine_fast_end(&m.latest(), elapsed_ms, silence_ms));
+        if moonshine_done
+            || model_silence_ms(vad, elapsed_ms).unwrap_or(silence_ms) >= END_SILENCE_MS
+        {
             return false; // sustained trailing silence → end of answer
         }
         true
     })?;
+
+    if let Some(m) = moonshine {
+        if !moonshine_buf.is_empty() {
+            m.submit(elapsed_ms, &moonshine_buf, sr);
+        }
+    }
 
     // External stop = cancel (user hit stop / disabled voice): DISCARD what was
     // captured — the caller documented `voice_stop_listening` as discard, and
@@ -921,19 +1073,24 @@ pub fn record_question(
         } else {
             silence_ms += block_ms;
         }
-        // End decision. When the Silero verdict is fresh it is AUTHORITATIVE —
-        // for both directions: it keeps the turn alive through a quiet-voiced
-        // stretch the energy path would misread as silence, and it ends the
-        // turn through background noise the energy path would misread as
-        // speech. Energy-only is the fallback (voice stack absent / endpoint
-        // down / verdict stale).
-        let effective_silence = model_silence_ms(vad, elapsed_ms).unwrap_or(silence_ms);
-        if effective_silence >= Q_END_SILENCE_MS {
+        // End quickly when the independent neural and adaptive-energy detectors
+        // BOTH see trailing silence. If they disagree, keep the conservative
+        // model-first threshold: this avoids cutting a quiet speaker short and
+        // still endpoints correctly through transmitted room tone. Energy-only
+        // remains the fallback when the sidecar verdict is missing or stale.
+        let neural_silence = model_silence_ms(vad, elapsed_ms);
+        let effective_silence = neural_silence.unwrap_or(silence_ms);
+        let fast_agreement = neural_silence.is_some_and(|model_ms| {
+            model_ms >= Q_FAST_END_SILENCE_MS && silence_ms >= Q_FAST_END_SILENCE_MS
+        });
+        if fast_agreement || effective_silence >= Q_END_SILENCE_MS {
             if total_voiced_ms >= Q_MIN_VOICED_MS {
                 eprintln!(
-                    "[vad] END (silence {:.0}ms): dur={:.1}s voiced={:.0}ms \
-                     floor={floor_est:.4} peak={peak_ema:.4} cont_th={cont_th:.4}",
-                    effective_silence, elapsed_ms / 1000.0, total_voiced_ms
+                    "[vad] END (silence {:.0}ms, energy {:.0}ms, fast={}): \
+                     dur={:.1}s voiced={:.0}ms floor={floor_est:.4} \
+                     peak={peak_ema:.4} cont_th={cont_th:.4}",
+                    effective_silence, silence_ms, fast_agreement,
+                    elapsed_ms / 1000.0, total_voiced_ms
                 );
                 return false; // genuine question, fully ended → transcribe
             }
@@ -1065,5 +1222,50 @@ fn decode_sample(stype: SampleType, bits: u16, chunk: &[u8]) -> f32 {
             signed as f32 / 8_388_608.0
         }
         _ => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        moonshine_fast_end, MoonshineVerdict, ANSWER_FAST_END_SILENCE_MS,
+    };
+
+    fn completed(snapshot_ms: f64) -> MoonshineVerdict {
+        MoonshineVerdict {
+            snapshot_elapsed_ms: snapshot_ms,
+            completion_audio_ms: snapshot_ms,
+            completion_seq: 1,
+            healthy: true,
+        }
+    }
+
+    #[test]
+    fn moonshine_completion_and_local_silence_take_fast_path() {
+        let v = completed(1_000.0);
+        assert!(moonshine_fast_end(
+            &v, 1_100.0, ANSWER_FAST_END_SILENCE_MS,
+        ));
+    }
+
+    #[test]
+    fn completion_without_enough_local_silence_keeps_listening() {
+        let v = completed(1_000.0);
+        assert!(!moonshine_fast_end(
+            &v, 1_100.0, ANSWER_FAST_END_SILENCE_MS - 1.0,
+        ));
+    }
+
+    #[test]
+    fn stale_or_unhealthy_completion_keeps_listening() {
+        let stale = completed(1_000.0);
+        assert!(!moonshine_fast_end(
+            &stale, 3_000.0, ANSWER_FAST_END_SILENCE_MS,
+        ));
+        let mut unhealthy = completed(1_000.0);
+        unhealthy.healthy = false;
+        assert!(!moonshine_fast_end(
+            &unhealthy, 1_100.0, ANSWER_FAST_END_SILENCE_MS,
+        ));
     }
 }

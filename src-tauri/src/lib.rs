@@ -784,11 +784,15 @@ async fn voice_prepare(
     sidecar: State<'_, SidecarState>,
     engine: String,
     speaker: Option<String>,
+    stt_engine: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let url = require_url(&sidecar)?;
     let speaker = speaker.unwrap_or_default();
+    // The main window's only caller is the mock-interview start, so Moonshine
+    // is the default. The copilot explicitly requests Whisper for loopback STT.
+    let stt_engine = stt_engine.unwrap_or_else(|| "moonshine".to_string());
     tauri::async_runtime::spawn_blocking(move || {
-        backend_client::voice_prepare(&url, &engine, &speaker)
+        backend_client::voice_prepare(&url, &engine, &speaker, &stt_engine)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -829,19 +833,52 @@ fn voice_listen(
                 let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "listening" }));
             }
         };
-        // Model-based endpointing: verdicts come from the sidecar's Silero VAD;
-        // record_answer falls back to energy heuristics if it's unreachable.
+        // Moonshine transcribes ordered PCM while the candidate is still
+        // speaking. If it is unavailable, retain the old Silero endpoint +
+        // post-capture faster-whisper path unchanged.
+        let moonshine = match voice_audio::MoonshineClient::start(url.clone()) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                eprintln!("[voice] Moonshine unavailable, using Whisper: {e}");
+                None
+            }
+        };
+        // Keep Silero running as the conservative endpoint fallback even after
+        // Moonshine starts: a mid-turn stream failure must not degrade a noisy
+        // microphone all the way to energy-only endpointing.
         let vad = voice_audio::VadClient::start(url.clone());
-        let result = voice_audio::record_answer(&stop, &finish, Some(&vad), &mut on_level);
+        let result = voice_audio::record_answer(
+            &stop, &finish, Some(&vad), moonshine.as_ref(), &mut on_level,
+        );
         let _ = app.emit("voice:level", serde_json::json!({ "level": 0.0, "pitch": 0.0, "mode": "listening" }));
         match result {
             Ok(Some(wav)) => {
                 use base64::Engine;
-                // Capture ended; STT can take a while on CPU. Tell the UI so it
-                // can show a "transcribing" status instead of looking stuck.
+                // Capture ended. Moonshine usually only needs to flush its
+                // already-decoded tail; Whisper remains the transparent fallback.
                 let _ = app.emit("voice:transcribing", ());
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
-                match backend_client::voice_stt(&url, &b64) {
+                let moonshine_text = match moonshine {
+                    Some(client) => match client.finish() {
+                        Ok(text) if !text.trim().is_empty() => Some(text),
+                        Ok(_) => {
+                            eprintln!("[voice] Moonshine returned empty text; using Whisper");
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("[voice] Moonshine finalization failed; using Whisper: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let transcript = match moonshine_text {
+                    Some(text) => Ok(text),
+                    None => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+                        backend_client::voice_stt(&url, &b64)
+                    }
+                };
+                match transcript {
                     Ok(text) => { let _ = app.emit("voice:transcript", text); }
                     Err(e) => {
                         let _ = app.emit("voice:error", e);
@@ -849,8 +886,12 @@ fn voice_listen(
                     }
                 }
             }
-            Ok(None) => { let _ = app.emit("voice:transcript", String::new()); }
+            Ok(None) => {
+                if let Some(client) = moonshine { client.cancel(); }
+                let _ = app.emit("voice:transcript", String::new());
+            }
             Err(e) => {
+                if let Some(client) = moonshine { client.cancel(); }
                 let _ = app.emit("voice:error", format!("listen failed: {e:#}"));
                 let _ = app.emit("voice:transcript", String::new());
             }
@@ -988,6 +1029,13 @@ fn looks_unfinished(text: &str) -> bool {
     if t.is_empty() {
         return false;
     }
+    // Trust explicit terminal punctuation before inspecting the last word.
+    // Without this guard, complete questions such as "What are you passionate
+    // about?" matched the clause-opening word list below and paid an unnecessary
+    // Q_CONTINUATION_TIMEOUT_S re-listen on every turn.
+    if t.ends_with('.') || t.ends_with('?') || t.ends_with('!') {
+        return false;
+    }
     if t.ends_with(',') || t.ends_with(';') || t.ends_with(':') || t.ends_with('-') {
         return true;
     }
@@ -1002,6 +1050,31 @@ fn looks_unfinished(text: &str) -> bool {
             | "with" | "to" | "of" | "for" | "about" | "the" | "a" | "an"
             | "your" | "how" | "what" | "which" | "that" | "into" | "on" | "in"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_unfinished;
+
+    #[test]
+    fn terminal_punctuation_never_requests_continuation() {
+        assert!(!looks_unfinished("What are you passionate about?"));
+        assert!(!looks_unfinished("Tell me about your last role."));
+        assert!(!looks_unfinished("Why this company!"));
+    }
+
+    #[test]
+    fn clause_openers_without_terminal_punctuation_request_continuation() {
+        assert!(looks_unfinished("Tell me about"));
+        assert!(looks_unfinished("What would you do if"));
+        assert!(looks_unfinished("The main reason is,"));
+    }
+
+    #[test]
+    fn complete_plain_text_does_not_request_continuation() {
+        assert!(!looks_unfinished("Describe your most successful project"));
+        assert!(!looks_unfinished("How did you measure success"));
+    }
 }
 
 fn opt(s: String) -> Option<String> {
