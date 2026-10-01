@@ -43,19 +43,9 @@ const T = {
   fontDisplay: "'Geist','Inter',sans-serif", fontBody: "'Inter',sans-serif",
 };
 
-// ── Backend helpers (mirror App.tsx) ────────────────────────────────────────
-interface Creds {
-  llmProvider?: string;
-  geminiApiKey?: string;
-  openaiApiKey?: string;
-  anthropicApiKey?: string;
-}
-const llmPayload = (c: Creds) => ({
-  provider: c.llmProvider || "gemini",
-  gemini_api_key: c.geminiApiKey ?? "",
-  openai_api_key: c.openaiApiKey ?? "",
-  anthropic_api_key: c.anthropicApiKey ?? "",
-});
+// ── Backend helpers ─────────────────────────────────────────────────────────
+// No API keys ever enter this window: Rust builds each request's LLM config
+// from AI routing + Credential Manager (ai_routing.rs, feature "copilot").
 const newStreamId = () =>
   `cop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -72,6 +62,43 @@ interface Cheatsheet {
   updatedAt?: number;
 }
 interface CopilotCtx { label: string; context: string; cheatsheet: Cheatsheet | null; }
+
+// One live-transcript row. `qid` ties an interviewer line to the Rust listener's
+// question so partial transcripts update it in place.
+interface Line { speaker: string; text: string; last: boolean; qid?: number; partial?: boolean; }
+
+// ── Instant card: the cheatsheet story that best fits the question ───────────
+// Zero tokens, ~1 ms: word overlap after crude stemming, plus a few behavioural-
+// question synonyms. Shown while the model drafts, so there's something to say
+// in the first second even before the first answer token lands.
+const STOP = new Set("a an the and or but to of in on for with about at by from your you me my i we our us is are was were be been do did does have has had how what when where why which who tell describe give walk talk time times would could should can will this that it its as if so any some".split(" "));
+const SYNONYMS: Record<string, string> = {
+  disagre: "conflict", argument: "conflict", tension: "conflict", pushback: "conflict",
+  mistak: "fail", failur: "fail", setback: "fail", wrong: "fail",
+  led: "lead", leader: "lead", leadership: "lead", mentor: "lead",
+  proud: "impact", achievement: "impact", accomplish: "impact", success: "impact",
+  deadlin: "pressure", urgent: "pressure", stress: "pressure", prioritiz: "priorit",
+  learn: "learn", quickly: "learn", new: "learn",
+};
+const stem = (w: string) => {
+  const s = w.replace(/(ing|ed|es|s|ly|ure|ment)$/, "");
+  return SYNONYMS[s] ?? SYNONYMS[w] ?? s;
+};
+const terms = (text: string) =>
+  new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !STOP.has(w)).map(stem));
+function matchStory(question: string, cheat: Cheatsheet | null): CheatStory | null {
+  const q = terms(question);
+  if (q.size === 0 || !cheat?.stories?.length) return null;
+  let best: CheatStory | null = null, bestScore = 0;
+  for (const s of cheat.stories) {
+    const head = terms(`${s.title} ${s.tag ?? ""}`);
+    const body = terms(`${s.metric ?? ""} ${(s.beats ?? []).join(" ")}`);
+    let score = 0;
+    q.forEach((t) => { if (head.has(t)) score += 2; else if (body.has(t)) score += 1; });
+    if (score > bestScore) { best = s; bestScore = score; }
+  }
+  return bestScore >= 2 ? best : null;
+}
 
 // ── Icons (ported from the design) ──────────────────────────────────────────
 type IconName =
@@ -222,7 +249,27 @@ const StealthPill = ({ status, compact }: { status: CloakStatus; compact?: boole
 // ── Shell: drag bar ─────────────────────────────────────────────────────────
 const ctrlMini: CSSProperties = { width: 22, height: 22, borderRadius: 6, border: "none", background: "none", display: "flex", alignItems: "center", justifyContent: "center", ...press };
 
-function DragBar({ state, job, cloak, onMin, onClose }: { state?: string; job?: string; cloak: CloakStatus; onMin: () => void; onClose: () => void }) {
+// The answer came from a provider other than the one picked in Settings →
+// AI routing (a fallback kicked in, or the pick can't run here). Shape of the
+// backend's `route` event (llm_provider.route_event).
+interface RouteInfo {
+  provider: string; providerLabel: string; model: string;
+  fallback: boolean; substitutedFrom: string; chosenLabel: string;
+}
+const routeReason = (r: RouteInfo) => r.fallback
+  ? `${r.chosenLabel} didn't answer, so ${r.providerLabel} (${r.model}) did.`
+  : `${r.chosenLabel} can't run this or isn't connected, so ${r.providerLabel} (${r.model}) answered.`;
+
+// Small "via X · fallback" pill. Click (never hover — hover tooltips leak on
+// screen share) toggles the reason line under the drag bar.
+const RoutePill = ({ route, onClick }: { route: RouteInfo; onClick: () => void }) => (
+  <button onClick={onClick} aria-label={routeReason(route)}
+    style={{ ...pill("rgba(245,158,11,0.12)", T.amber, `0.5px solid ${T.amber}44`), fontFamily: T.fontBody, flexShrink: 0, ...press }}>
+    via {route.providerLabel} · fallback
+  </button>
+);
+
+function DragBar({ state, job, cloak, route, onRoute, onMin, onClose }: { state?: string; job?: string; cloak: CloakStatus; route: RouteInfo | null; onRoute: () => void; onMin: () => void; onClose: () => void }) {
   // The whole bar is a drag handle. Children sit on top of the parent, and a
   // child is only draggable if it ALSO carries the attribute — so tag every
   // non-interactive child (the buttons + stealth pill stay clickable).
@@ -239,13 +286,14 @@ function DragBar({ state, job, cloak, onMin, onClose }: { state?: string; job?: 
           the user which research the answers are drawn from. Ellipsizes so it
           never crowds the stealth pill / window controls. */}
       {job
-        ? <span data-tauri-drag-region title={`Grounded on ${job}`} style={{ fontSize: 11, color: T.textSecondary, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>· {job}</span>
+        ? <span data-tauri-drag-region style={{ fontSize: 11, color: T.textSecondary, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>· {job}</span>
         : state && <span data-tauri-drag-region style={{ fontSize: 11, color: T.textTertiary, flexShrink: 0 }}>· {state}</span>}
       <div data-tauri-drag-region style={{ flex: 1, minWidth: 8 }} />
+      {route && <RoutePill route={route} onClick={onRoute} />}
       <StealthPill status={cloak} compact />
       <div style={{ display: "flex", alignItems: "center", gap: 1, flexShrink: 0 }}>
-        <button onClick={onMin} style={ctrlMini} title="Minimize"><Icon name="minus" size={13} color={T.textTertiary} /></button>
-        <button onClick={onClose} style={ctrlMini} title="Close (Ctrl+\\)"><Icon name="x" size={13} color={T.textTertiary} /></button>
+        <button onClick={onMin} style={ctrlMini} aria-label="Minimize"><Icon name="minus" size={13} color={T.textTertiary} /></button>
+        <button onClick={onClose} style={ctrlMini} aria-label="Close (Ctrl+\\)"><Icon name="x" size={13} color={T.textTertiary} /></button>
       </div>
     </div>
   );
@@ -259,7 +307,7 @@ function NavBar({ view, setView, recording, onToggleRec, onCapture, time }: {
   const Tab = ({ id, icon, label }: { id: View; icon: IconName; label: string }) => {
     const on = view === id;
     return (
-      <button onClick={() => setView(id)} title={label} style={{ width: 30, height: 28, borderRadius: 100, border: "none", background: on ? "#fff" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", ...press, transition: "background .15s" }}>
+      <button onClick={() => setView(id)} aria-label={label} style={{ width: 30, height: 28, borderRadius: 100, border: "none", background: on ? "#fff" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", ...press, transition: "background .15s" }}>
         <Icon name={icon} size={14} color={on ? "#0C0C0C" : T.textSecondary} sw={on ? 2 : 1.8} />
       </button>
     );
@@ -271,14 +319,14 @@ function NavBar({ view, setView, recording, onToggleRec, onCapture, time }: {
         <Tab id="answer" icon="spark" label="Suggested answer" />
         <Tab id="cheat" icon="brief" label="Cheatsheet" />
       </div>
-      <button onClick={() => setView("settings")} title="Settings & privacy" style={{ width: 30, height: 30, borderRadius: 9, border: "none", background: view === "settings" ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.04)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, ...press }}>
+      <button onClick={() => setView("settings")} aria-label="Settings & privacy" style={{ width: 30, height: 30, borderRadius: 9, border: "none", background: view === "settings" ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.04)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, ...press }}>
         <Icon name="sliders" size={14} color={view === "settings" ? T.text : T.textSecondary} />
       </button>
       <div style={{ flex: 1 }} />
-      <button onClick={onCapture} title="Capture screen — send a screenshot to the AI" style={{ height: 30, display: "flex", alignItems: "center", gap: 5, padding: "0 10px", borderRadius: 100, border: `0.5px solid ${T.border}`, background: "rgba(255,255,255,0.05)", color: T.textSecondary, fontSize: 11, fontWeight: 600, flexShrink: 0, fontFamily: T.fontBody, ...press }}>
+      <button onClick={onCapture} aria-label="Capture screen — send a screenshot to the AI" style={{ height: 30, display: "flex", alignItems: "center", gap: 5, padding: "0 10px", borderRadius: 100, border: `0.5px solid ${T.border}`, background: "rgba(255,255,255,0.05)", color: T.textSecondary, fontSize: 11, fontWeight: 600, flexShrink: 0, fontFamily: T.fontBody, ...press }}>
         <Icon name="camera" size={13} color={T.textSecondary} />Capture
       </button>
-      <button onClick={onToggleRec} title="Listen to the call (system audio) — auto-answers each question on silence" style={{ height: 30, display: "flex", alignItems: "center", gap: 6, padding: "0 11px", borderRadius: 100, border: `0.5px solid ${recording ? "rgba(239,68,68,0.45)" : T.border}`, background: recording ? "rgba(239,68,68,0.16)" : "rgba(255,255,255,0.05)", color: recording ? "#ff6b6b" : T.text, fontSize: 11, fontWeight: 600, flexShrink: 0, fontFamily: T.fontBody, ...press }}>
+      <button onClick={onToggleRec} aria-label="Listen to the call (system audio) — auto-answers each question on silence" style={{ height: 30, display: "flex", alignItems: "center", gap: 6, padding: "0 11px", borderRadius: 100, border: `0.5px solid ${recording ? "rgba(239,68,68,0.45)" : T.border}`, background: recording ? "rgba(239,68,68,0.16)" : "rgba(255,255,255,0.05)", color: recording ? "#ff6b6b" : T.text, fontSize: 11, fontWeight: 600, flexShrink: 0, fontFamily: T.fontBody, ...press }}>
         {recording
           ? <><span style={{ width: 9, height: 9, borderRadius: 2, background: "#ff5b5b" }} /><span style={{ fontVariantNumeric: "tabular-nums" }}>{time}</span></>
           : <><span style={{ width: 8, height: 8, borderRadius: "50%", background: T.red }} />Rec audio</>}
@@ -297,6 +345,10 @@ function QuickAsk({ placeholder, value, onChange, onSend, busy, listening, onMic
         <Icon name="spark" size={13} color={T.textTertiary} sw={2} />
         <input
           value={value}
+          // No browser-drawn popups: autofill / spellcheck suggestion windows are
+          // separate top-level surfaces outside the capture cloak.
+          autoComplete="off"
+          spellCheck={false}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); onSend(); } }}
           // The overlay is no-activate (never steals focus). Briefly allow
@@ -309,10 +361,10 @@ function QuickAsk({ placeholder, value, onChange, onSend, busy, listening, onMic
           placeholder={placeholder}
           style={{ flex: 1, minWidth: 0, background: "transparent", border: "none", outline: "none", color: T.text, fontSize: 12, fontFamily: T.fontBody, letterSpacing: "-0.12px" }}
         />
-        <button onClick={onMic} title="Hold mic — capture a spoken question" style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: listening ? T.accentSoft : "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, ...press }}>
+        <button onClick={onMic} aria-label="Hold mic — capture a spoken question" style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: listening ? T.accentSoft : "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, ...press }}>
           <Icon name="mic" size={13} color={listening ? T.accent : T.textSecondary} />
         </button>
-        <button onClick={onSend} disabled={busy || !value.trim()} title="Send" style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: value.trim() && !busy ? "#fff" : "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: busy ? 0.6 : 1, ...press }}>
+        <button onClick={onSend} disabled={busy || !value.trim()} aria-label="Send" style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: value.trim() && !busy ? "#fff" : "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: busy ? 0.6 : 1, ...press }}>
           <Icon name="send" size={12} color={value.trim() && !busy ? "#0C0C0C" : T.textSecondary} sw={2} />
         </button>
       </div>
@@ -332,15 +384,19 @@ const PHASE_UI: Record<Phase, { label: string; c: string; pulse: boolean }> = {
 };
 
 // ── View: live transcript (real captured lines + status + streamed answer) ──
-function ListenBody({ phase, time, lines, levelRef, question, answer, answering, onFinish }: {
+function ListenBody({ phase, time, lines, levelRef, question, answer, answering, story, speech, onFinish }: {
   phase: Phase; time: string;
-  lines: { speaker: string; text: string; last: boolean }[];
+  lines: Line[];
   levelRef: { current: { level: number; pitch: number } };
   question: string; answer: string; answering: boolean;
+  story: CheatStory | null;
+  // Speech recognizer state from /voice/status ("ready" once warmed).
+  speech: string;
   onFinish: () => void;
 }) {
   const u = PHASE_UI[phase];
   const active = phase !== "idle";
+  const speechCold = active && speech !== "ready" && speech !== "loaded";
   const show = lines.length ? lines : [{ speaker: "—", text: "Tap Rec audio to listen in on the call — I'll transcribe each interviewer question and draft an answer when they finish. (Or use the mic to ask your own.)", last: true }];
   return (
     <div style={{ display: "flex", flexDirection: "column" }}>
@@ -358,7 +414,7 @@ function ListenBody({ phase, time, lines, levelRef, question, answer, answering,
             immediately process what's been heard. Only while actively listening.
             Also bound to the global Ctrl+` hotkey. */}
         {phase === "listening" && (
-          <button onClick={onFinish} title="Process now (Ctrl+`) — stop waiting for silence"
+          <button onClick={onFinish} aria-label="Process now (Ctrl+`) — stop waiting for silence"
             style={{ height: 24, display: "flex", alignItems: "center", gap: 5, padding: "0 9px", borderRadius: 100, border: `0.5px solid ${T.accent}55`, background: T.accentSoft, color: T.accent, fontSize: 10.5, fontWeight: 600, fontFamily: T.fontBody, flexShrink: 0, ...press }}>
             <Icon name="check" size={11} color={T.accent} sw={2.4} />Process now
           </button>
@@ -370,18 +426,35 @@ function ListenBody({ phase, time, lines, levelRef, question, answer, answering,
         <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 11 }}>
           <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary }}>Live transcript</span>
           <div style={{ flex: 1, height: 1, background: T.border }} />
-          <span style={pill("rgba(255,255,255,0.05)", T.textSecondary)}>System audio</span>
+          {speechCold
+            ? <span style={pill("rgba(245,158,11,0.12)", T.amber)}><Dot c={T.amber} pulse />Speech model loading</span>
+            : <span style={pill("rgba(255,255,255,0.05)", T.textSecondary)}>System audio</span>}
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {show.map((l, i) => (
             <div key={i} style={{ display: "flex", gap: 9 }}>
               <div style={{ width: 22, height: 22, borderRadius: 6, flexShrink: 0, background: "#635BFF22", border: "0.5px solid #635BFF55", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#7c83ff", fontFamily: T.fontDisplay }}>{l.speaker[0] ?? "•"}</div>
               <p style={{ fontSize: 13, lineHeight: 1.5, color: l.last ? T.text : T.textSecondary, letterSpacing: "-0.13px" }}>
-                {l.text}{l.last && phase === "transcribing" && <span style={{ marginLeft: 2, opacity: 0.55, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
+                {l.text}{(l.partial || (l.last && phase === "transcribing")) && <span style={{ marginLeft: 2, opacity: 0.55, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
               </p>
             </div>
           ))}
         </div>
+
+        {/* Instant card — the best-matching cheatsheet story, shown before the
+            model's first token so there's something to say right away. */}
+        {story && (
+          <div style={{ marginTop: 14, background: "rgba(0,153,255,0.06)", border: `0.5px solid ${T.accent}44`, borderRadius: 12, padding: "10px 12px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <Icon name="brief" size={11} color={T.accent} sw={2} />
+              <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.accent }}>From your cheatsheet</span>
+            </div>
+            <p style={{ fontSize: 12.5, fontWeight: 600, color: T.text, lineHeight: 1.4 }}>{story.title}{story.metric ? ` · ${story.metric}` : ""}</p>
+            {(story.beats ?? []).slice(0, 3).map((b, i) => (
+              <p key={i} style={{ fontSize: 11.5, color: T.textSecondary, lineHeight: 1.45, marginTop: 3 }}>• {b}</p>
+            ))}
+          </div>
+        )}
 
         {/* Live answer — same data as the Answer tab, shown inline here so the
             user watches the question and the drafted reply in one place. */}
@@ -482,7 +555,7 @@ function CheatBody({ cheat, busy, jobLabel, onRefresh }: {
 
   // Refresh button — shared by every state.
   const refreshBtn = (
-    <button onClick={onRefresh} disabled={busy} title="Rebuild from your conversations, resume & company research"
+    <button onClick={onRefresh} disabled={busy} aria-label="Rebuild from your conversations, resume & company research"
       style={{ width: 30, height: 30, borderRadius: 9, border: `0.5px solid ${T.border}`, background: "rgba(255,255,255,0.05)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: busy ? 0.5 : 1, ...press }}>
       <Icon name="refresh" size={14} color={busy ? T.textTertiary : T.textSecondary} sw={busy ? 2 : 1.8} />
     </button>
@@ -529,6 +602,8 @@ function CheatBody({ cheat, busy, jobLabel, onRefresh }: {
           <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, background: "rgba(255,255,255,0.04)", border: `0.5px solid ${T.border}`, borderRadius: 11, padding: "7px 11px", minWidth: 0 }}>
             <Icon name="search" size={13} color={T.textTertiary} />
             <input value={query} onChange={(e) => setQuery(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
               onMouseDown={() => invoke("copilot_typing", { enabled: true }).catch(() => {})}
               onFocus={() => invoke("copilot_typing", { enabled: true }).catch(() => {})}
               onBlur={() => invoke("copilot_typing", { enabled: false }).catch(() => {})}
@@ -626,13 +701,13 @@ const SToggle = ({ on, c = T.green }: { on: boolean; c?: string }) => (
     <div style={{ width: 15, height: 15, borderRadius: "50%", background: "#fff", boxShadow: "0 1px 3px rgba(0,0,0,0.4)" }} />
   </div>
 );
-const SRow = ({ icon, title, sub, on, c, last }: { icon: IconName; title: string; sub: string; on: boolean; c?: string; last?: boolean }) => (
+const SRow = ({ icon, label, sub, on, c, last }: { icon: IconName; label: string; sub: string; on: boolean; c?: string; last?: boolean }) => (
   <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "11px 4px", borderBottom: last ? "none" : `1px solid ${T.glassEdge}` }}>
     <div style={{ width: 30, height: 30, borderRadius: 9, flexShrink: 0, background: "rgba(255,255,255,0.05)", display: "flex", alignItems: "center", justifyContent: "center" }}>
       <Icon name={icon} size={14} color={c ?? T.textSecondary} />
     </div>
     <div style={{ flex: 1, minWidth: 0 }}>
-      <p style={{ fontSize: 12.5, fontWeight: 600, color: T.text, letterSpacing: "-0.15px" }}>{title}</p>
+      <p style={{ fontSize: 12.5, fontWeight: 600, color: T.text, letterSpacing: "-0.15px" }}>{label}</p>
       <p style={{ fontSize: 10.5, color: T.textTertiary, lineHeight: 1.4, marginTop: 1 }}>{sub}</p>
     </div>
     <SToggle on={on} c={c} />
@@ -681,14 +756,14 @@ function SettingsBody({ cloak, opacity, onOpacity }: { cloak: CloakStatus; opaci
       )}
       <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary, paddingLeft: 2 }}>Capture</span>
       <div style={{ marginTop: 4 }}>
-        <SRow icon="mic" title="Your microphone" sub="Powers question capture when Rec is on" on c={T.accent} />
-        <SRow icon="camera" title="Screen capture" sub="Tap Capture to send a screenshot — never automatic" on={false} last />
+        <SRow icon="mic" label="Your microphone" sub="Powers question capture when Rec is on" on c={T.accent} />
+        <SRow icon="camera" label="Screen capture" sub="Tap Capture to send a screenshot — never automatic" on={false} last />
       </div>
       <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary, paddingLeft: 2, display: "block", marginTop: 14 }}>Privacy</span>
       <div style={{ marginTop: 4 }}>
-        <SRow icon="monitor" title="Hide from screen-share" sub={cloak.mode === "excluded" ? "Excluded from capture (SetWindowDisplayAffinity)" : cloak.mode === "monitor" ? "Black-box fallback (old Windows)" : "Not active — cloak failed"} on={hidden} c={hidden ? card.c : T.red} />
-        <SRow icon="monitor" title="Hidden from Alt+Tab" sub="Tool-window — not listed in the app switcher" on c={T.green} />
-        <SRow icon="lock" title="Process on-device" sub="Audio handled by the local sidecar" on c={T.green} last />
+        <SRow icon="monitor" label="Hide from screen-share" sub={cloak.mode === "excluded" ? "Excluded from capture (SetWindowDisplayAffinity)" : cloak.mode === "monitor" ? "Black-box fallback (old Windows)" : "Not active — cloak failed"} on={hidden} c={hidden ? card.c : T.red} />
+        <SRow icon="monitor" label="Hidden from Alt+Tab" sub="Tool-window — not listed in the app switcher" on c={T.green} />
+        <SRow icon="lock" label="Process on-device" sub="Audio handled by the local sidecar" on c={T.green} last />
       </div>
       <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "flex-start", padding: "9px 11px", borderRadius: 11, background: "rgba(255,255,255,0.03)", border: `0.5px solid ${T.border}` }}>
         <Icon name="shield" size={13} color={T.textTertiary} />
@@ -715,9 +790,13 @@ export default function Copilot() {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [answering, setAnswering] = useState(false);
-  const [lines, setLines] = useState<{ speaker: string; text: string; last: boolean }[]>([]);
+  const [lines, setLines] = useState<Line[]>([]);
+  const [story, setStory] = useState<CheatStory | null>(null);
+  const [speech, setSpeech] = useState("idle");
   const [cloak, setCloak] = useState<CloakStatus>({ mode: "unknown", remote: false });
   const [jobLabel, setJobLabel] = useState("");
+  const [route, setRoute] = useState<RouteInfo | null>(null);
+  const [routeOpen, setRouteOpen] = useState(false);
   const [cheat, setCheat] = useState<Cheatsheet | null>(null);
   const [cheatBusy, setCheatBusy] = useState(false);
   const [opacity, setOpacity] = useState<number>(() => {
@@ -725,7 +804,6 @@ export default function Copilot() {
     return v >= 0.3 && v <= 1 ? v : 1;
   });
 
-  const credsRef = useRef<Creds>({ llmProvider: "gemini" });
   // The active job's research context, mirrored from the main window via Rust.
   // Refreshed right before each stream so the answer is grounded on the job the
   // user has selected *now* — works whether the overlay was opened by button or
@@ -736,6 +814,14 @@ export default function Copilot() {
   const jobLabelRef = useRef<string>("");
   const activeStream = useRef<string | null>(null);
   const recordingRef = useRef(false);
+  // Rec is running the Rust live listener (copilot_listen.rs): capture never
+  // stops between questions and Rust starts each answer itself, so nothing
+  // here re-arms a capture or starts a stream for spoken questions. False =
+  // the legacy one-question-at-a-time loop (voice_listen_system).
+  const liveRef = useRef(false);
+  // Latest cheatsheet for the instant card (event handlers are registered once).
+  const cheatRef = useRef<Cheatsheet | null>(null);
+  useEffect(() => { cheatRef.current = cheat; }, [cheat]);
   const lastQARef = useRef<{ q: string; a: string }>({ q: "", a: "" });
   // Live capture level (RMS + pitch/ZCR), updated by the high-frequency
   // `voice:level` event. Held in a ref — the Wave meter reads it on a rAF loop
@@ -770,10 +856,12 @@ export default function Copilot() {
     html.style.background = T.glass;
     document.body.style.background = T.glass;
     if (root) root.style.background = T.glass;
-  }, []);
-
-  useEffect(() => {
-    invoke<Creds>("load_credentials").then((c) => { credsRef.current = c; }).catch(() => {});
+    // Stealth: the browser's right-click menu is its own popup window, outside
+    // the capture cloak. Rust also disables it in WebView2 settings
+    // (copilot.rs lock_down_webview); this covers the ~1.2s before that lands.
+    const noMenu = (e: MouseEvent) => e.preventDefault();
+    document.addEventListener("contextmenu", noMenu);
+    return () => document.removeEventListener("contextmenu", noMenu);
   }, []);
 
   // Pull the active job's research context + cheatsheet from Rust and fan it out
@@ -866,6 +954,21 @@ export default function Copilot() {
     invoke("voice_prepare", { engine: "piper", speaker: "", sttEngine: "whisper" }).catch(() => {});
   }, []);
 
+  // Recognizer readiness for the "Speech model loading" chip. Rust warms it when
+  // the sidecar starts; poll until it reports ready, then stop.
+  useEffect(() => {
+    let alive = true;
+    let timer: number | undefined;
+    const poll = () => {
+      invoke<{ stt_phase?: string }>("voice_status")
+        .then((s) => { if (alive) setSpeech(s.stt_phase ?? "idle"); return s.stt_phase; })
+        .catch(() => undefined)
+        .then((p) => { if (alive && p !== "ready") timer = window.setTimeout(poll, 1500); });
+    };
+    poll();
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, []);
+
   // Which source the current capture is from, so the transcript line is labelled
   // correctly: "system" = the interviewer's voice off the loopback (Rec button),
   // "mic" = the user speaking their own question (QuickAsk mic button).
@@ -881,6 +984,8 @@ export default function Copilot() {
     listenSourceRef.current = "system";
     invoke("voice_listen_system").catch(() => setListening(false));
   };
+  // Legacy loop only: after each answer/transcript, capture the next question.
+  const rearm = () => recordingRef.current && !liveRef.current;
 
   // Drain the buffered tokens into the answer in one render. Safe to call
   // directly (final drain on done/error) or via rAF (per-frame during stream).
@@ -917,7 +1022,11 @@ export default function Copilot() {
       activeStream.current = null;
       setAnswering(false);
       setPhase(recordingRef.current ? "listening" : "idle");
-      if (recordingRef.current) startSystemListen(); // re-arm for the next question
+      if (rearm()) startSystemListen(); // legacy loop: re-arm for the next question
+    });
+    reg<{ streamId: string; content: RouteInfo }>("chat:route", (p) => {
+      if (p.streamId !== activeStream.current) return;
+      setRoute(p.content);
     });
     reg<{ streamId: string; content: string }>("chat:error", (p) => {
       if (p.streamId !== activeStream.current) return;
@@ -926,7 +1035,7 @@ export default function Copilot() {
       setAnswering(false);
       setAnswer((a) => a || `Error: ${p.content}`);
       setPhase(recordingRef.current ? "listening" : "idle");
-      if (recordingRef.current) startSystemListen();
+      if (rearm()) startSystemListen();
     });
 
     reg<{ level: number; pitch: number }>("voice:level", (p) => {
@@ -938,12 +1047,73 @@ export default function Copilot() {
     reg<string>("voice:transcript", (text) => {
       setListening(false);
       const t = (text || "").trim();
-      if (!t) { setPhase(recordingRef.current ? "listening" : "idle"); if (recordingRef.current) startSystemListen(); return; }
+      if (!t) { setPhase(recordingRef.current ? "listening" : "idle"); if (rearm()) startSystemListen(); return; }
       const speaker = listenSourceRef.current === "system" ? "Interviewer" : "You";
       setLines((ls) => [...ls.map((l) => ({ ...l, last: false })), { speaker, text: t, last: true }]);
       ask(t);
     });
-    reg<unknown>("voice:error", () => { setListening(false); setPhase(recordingRef.current ? "listening" : "idle"); if (recordingRef.current) startSystemListen(); });
+    reg<unknown>("voice:error", () => { setListening(false); setPhase(recordingRef.current ? "listening" : "idle"); if (rearm()) startSystemListen(); });
+
+    // ── Rust live listener (copilot_listen.rs) ──
+    // Upsert the interviewer line for question `qid` (partial while they talk).
+    const upsertLine = (qid: number, text: string, partial: boolean) => setLines((ls) => {
+      const i = ls.findIndex((l) => l.qid === qid);
+      if (i >= 0) return ls.map((l, k) => (k === i ? { ...l, text: text || l.text, partial } : l));
+      return [...ls.map((l) => ({ ...l, last: false })), { speaker: "Interviewer", text: text || "…", last: true, qid, partial }];
+    });
+    reg<{ qid: number }>("copilot:speech", (p) => {
+      upsertLine(p.qid, "", true);
+      if (!activeStream.current) setPhase("listening");
+    });
+    reg<{ qid: number; text: string }>("copilot:partial", (p) => {
+      upsertLine(p.qid, p.text, true);
+      const s = matchStory(p.text, cheatRef.current);
+      if (s) setStory(s);
+    });
+    reg<{ qid: number; text: string; streamId: string }>("copilot:question", (p) => {
+      upsertLine(p.qid, p.text, false);
+      // The answer is already streaming from Rust; adopt it. A typed ask still
+      // running is superseded — stop it so it stops spending tokens.
+      if (activeStream.current && activeStream.current !== p.streamId) {
+        invoke("cancel_chat_stream", { streamId: activeStream.current }).catch(() => {});
+      }
+      activeStream.current = p.streamId;
+      if (tokRaf.current != null) { cancelAnimationFrame(tokRaf.current); tokRaf.current = null; }
+      tokBuf.current = "";
+      setStory(matchStory(p.text, cheatRef.current));
+      setRoute(null); setRouteOpen(false);
+      setQuestion(p.text);
+      lastQARef.current = { q: p.text, a: "" };
+      setAnswer("");
+      setAnswering(true);
+      setPhase("thinking");
+    });
+    reg<{ qid: number; streamId: string }>("copilot:resume", (p) => {
+      // They kept talking — the speculative answer was cancelled in Rust.
+      upsertLine(p.qid, "", true);
+      if (activeStream.current !== p.streamId) return;
+      activeStream.current = null;
+      tokBuf.current = "";
+      setAnswer("");
+      setAnswering(false);
+      setPhase("listening");
+    });
+    reg<{ qid: number; answered: boolean }>("copilot:commit", (p) => {
+      setLines((ls) => {
+        // A blip (cough, click) opened a line but never produced words: drop it.
+        const kept = ls.filter((l) => !(l.qid === p.qid && !p.answered && l.text === "…"));
+        return kept.map((l, i) => ({ ...l, partial: l.qid === p.qid ? false : l.partial, last: i === kept.length - 1 }));
+      });
+    });
+    reg<{ error: string | null }>("copilot:stopped", (p) => {
+      if (!p.error || !liveRef.current) return;
+      // The listener died (device/VAD failure): say so and drop out of Rec.
+      liveRef.current = false;
+      recordingRef.current = false;
+      setRecording(false);
+      setPhase("idle");
+      setLines((ls) => [...ls.map((l) => ({ ...l, last: false })), { speaker: "System", text: `Listening stopped: ${p.error}`, last: true }]);
+    });
 
     return () => { alive = false; unsubs.forEach((u) => u()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -953,6 +1123,8 @@ export default function Copilot() {
     if (activeStream.current) return;
     const sid = newStreamId();
     activeStream.current = sid;
+    setRoute(null);        // the badge describes one answer — clear it per stream
+    setRouteOpen(false);
     // Drop any tokens still buffered from a prior answer so they don't bleed in.
     if (tokRaf.current != null) { cancelAnimationFrame(tokRaf.current); tokRaf.current = null; }
     tokBuf.current = "";
@@ -968,8 +1140,10 @@ export default function Copilot() {
     await refreshContext();
     if (activeStream.current !== sid) return; // superseded/cancelled while awaiting
     invoke("start_chat_stream", {
-      message, jobContext: jobContextRef.current, history, mode: "coach",
-      llm: llmPayload(credsRef.current), documents: [], streamId: sid,
+      // "copilot" mode: backend's copilot prompt (headline + 3 spoken beats,
+      // plain text) on the lowest-latency model tier.
+      message, jobContext: jobContextRef.current, history, mode: "copilot",
+      documents: [], streamId: sid,
     }).catch((e) => {
       if (activeStream.current === sid) { activeStream.current = null; setAnswering(false); setAnswer(`Error: ${String(e)}`); }
     });
@@ -980,10 +1154,9 @@ export default function Copilot() {
     if (!t) return;
     setQuestion(t);
     lastQARef.current = { q: t, a: "" };
-    runStream(
-      `You are an interview copilot. Draft a strong, concise spoken answer (first person, ~4-6 sentences) to this interview question:\n\n"${t}"`,
-      [],
-    );
+    // The question goes in raw — the answer format lives in the backend's
+    // copilot system prompt, not in a per-message wrapper.
+    runStream(t, []);
   };
 
   const submit = () => { const t = input; setInput(""); ask(t); };
@@ -1002,12 +1175,25 @@ export default function Copilot() {
     // endpoints on silence, transcribes the question, and drafts an answer —
     // then re-arms for the next question (see the chat:done handler).
     if (next) {
-      setElapsed(0); setView("live"); setPhase("listening");
+      setElapsed(0); setView("live"); setPhase("listening"); setStory(null);
       // Re-fire the STT warmup (idempotent, ~instant when already warm) in case
       // the overlay sat open long enough for the sidecar to have restarted.
       invoke("voice_prepare", { engine: "piper", speaker: "", sttEngine: "whisper" }).catch(() => {});
-      startSystemListen();
-    } else { invoke("voice_stop_listening").catch(() => {}); setListening(false); setPhase("idle"); }
+      listenSourceRef.current = "system";
+      invoke("copilot_listen_start")
+        .then(() => { liveRef.current = true; setListening(true); })
+        .catch((e) => {
+          // VAD couldn't load — fall back to the one-question-at-a-time loop.
+          console.warn("copilot live listener unavailable, using legacy capture:", e);
+          liveRef.current = false;
+          if (recordingRef.current) startSystemListen();
+        });
+    } else {
+      if (liveRef.current) invoke("copilot_listen_stop").catch(() => {});
+      else invoke("voice_stop_listening").catch(() => {});
+      liveRef.current = false;
+      setListening(false); setPhase("idle");
+    }
   };
 
   const micOnce = () => { if (!listening) startListen(); };
@@ -1025,10 +1211,15 @@ export default function Copilot() {
     <div style={{ height: "100vh", width: "100vw", background: T.glass, color: T.text, fontFamily: T.fontBody, display: "flex", flexDirection: "column", overflow: "hidden", borderLeft: `2px solid ${T.accent}`, boxSizing: "border-box", position: "relative" }}>
       <div id="co-flash" style={{ position: "absolute", inset: 0, background: "#fff", opacity: 0, zIndex: 60, pointerEvents: "none" }} />
       <style>{`@keyframes co-flash{0%{opacity:0}12%{opacity:0.9}100%{opacity:0}}`}</style>
-      <DragBar state={phase === "idle" ? STATE_LABEL[view] : PHASE_UI[phase].label} job={jobLabel} cloak={cloak} onMin={() => win.minimize().catch(() => {})} onClose={() => win.close().catch(() => {})} />
+      <DragBar state={phase === "idle" ? STATE_LABEL[view] : PHASE_UI[phase].label} job={jobLabel} cloak={cloak} route={route} onRoute={() => setRouteOpen((o) => !o)} onMin={() => win.minimize().catch(() => {})} onClose={() => win.close().catch(() => {})} />
+      {route && routeOpen && (
+        <div style={{ flexShrink: 0, padding: "6px 12px", fontSize: 10.5, lineHeight: 1.45, color: "#e9c07a", background: "rgba(245,158,11,0.08)", borderBottom: `1px solid ${T.glassEdge}` }}>
+          {routeReason(route)}
+        </div>
+      )}
       <NavBar view={view} setView={setView} recording={recording} onToggleRec={toggleRec} onCapture={capture} time={fmt(elapsed)} />
       <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-        {view === "live" && <ListenBody phase={phase} time={fmt(elapsed)} lines={lines} levelRef={levelRef} question={question} answer={answer} answering={answering} onFinish={() => invoke("voice_finish_listening").catch(() => {})} />}
+        {view === "live" && <ListenBody phase={phase} time={fmt(elapsed)} lines={lines} levelRef={levelRef} question={question} answer={answer} answering={answering} story={story} speech={speech} onFinish={() => invoke("voice_finish_listening").catch(() => {})} />}
         {view === "answer" && <AnswerBody question={question} answer={answer} answering={answering} jobLabel={jobLabel} onRephrase={() => followUp("Rephrase that answer more concisely.")} onDeeper={() => followUp("Go deeper — expand that answer with a specific example and metrics.")} onCopy={() => navigator.clipboard.writeText(answer).catch(() => {})} />}
         {view === "cheat" && <CheatBody cheat={cheat} busy={cheatBusy} jobLabel={jobLabel} onRefresh={refreshCheatsheet} />}
         {view === "settings" && <SettingsBody cloak={cloak} opacity={opacity} onOpacity={applyOpacity} />}

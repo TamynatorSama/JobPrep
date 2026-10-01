@@ -154,6 +154,8 @@ interface ChatMsg {
   streamId?: string;
   /** Sent to the backend but not rendered (e.g. the Mock Interview kickoff). */
   hidden?: boolean;
+  /** Set when the reply came from a fallback / stand-in provider (badge). */
+  via?: RouteInfo;
 }
 
 /** Pre-start configuration for a Mock Interview thread. */
@@ -208,14 +210,9 @@ const EMPTY_CREDS: Credentials = {
   anthropicApiKey: "",
 };
 
-/** Snake_cased provider config attached to every backend request — mirrors
- *  the Python `LLMConfig` pydantic model. */
-const llmPayload = (c: Credentials) => ({
-  provider:          c.llmProvider || "gemini",
-  gemini_api_key:    c.geminiApiKey,
-  openai_api_key:    c.openaiApiKey,
-  anthropic_api_key: c.anthropicApiKey,
-});
+// AI calls carry no keys from here: Rust builds each request's LLM config from
+// the AI routing settings + Credential Manager (src-tauri/src/ai_routing.rs).
+// Credentials only live in this webview for the Settings → API Keys fields.
 
 interface Scorecard {
   verbatim_match_score?: number;
@@ -1582,6 +1579,35 @@ const StageEditor = ({ job, stageIdx, anchor, onSave, onClose }: StageEditorProp
   );
 };
 
+// ─── Fallback badge (above AI bubbles not answered by the chosen provider) ─
+
+/** The backend's `route` event (llm_provider.route_event): the reply came from
+ *  a fallback, or the provider picked in AI routing can't run this feature. */
+interface RouteInfo {
+  provider: string; providerLabel: string; model: string;
+  fallback: boolean; substitutedFrom: string; chosenLabel: string;
+}
+
+/** Small "via X · fallback" pill; click shows why (and which model). */
+const ViaBadge = ({ via }: { via: RouteInfo }) => {
+  const [open, setOpen] = useState(false);
+  const reason = via.fallback
+    ? `${via.chosenLabel} didn't answer, so ${via.providerLabel} (${via.model}) did.`
+    : `${via.chosenLabel} can't run this or isn't connected, so ${via.providerLabel} (${via.model}) answered.`;
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <button type="button" onClick={() => setOpen((o) => !o)} style={{
+        padding: "2px 9px", borderRadius: 100, cursor: "pointer",
+        border: "0.5px solid rgba(245,158,11,0.35)", background: "rgba(245,158,11,0.10)",
+        color: "#F59E0B", fontSize: 11, fontWeight: 600,
+      }}>
+        via {via.providerLabel} · fallback
+      </button>
+      {open && <div style={{ fontSize: 11.5, color: T.textSecondary, marginTop: 4 }}>{reason}</div>}
+    </div>
+  );
+};
+
 // ─── Thinking disclosure (above AI bubbles when agent emitted stage logs) ─
 
 interface ThinkingProps {
@@ -1920,6 +1946,7 @@ const ChatArea = ({ chat, job, onSendMessage, streamingChatIds, onOpenResumeDocx
                 {msg.logs && msg.logs.length > 0 && (
                   <Thinking logs={msg.logs} streaming={!!msg.streaming} />
                 )}
+                {msg.via && <ViaBadge via={msg.via} />}
                 <div style={{
                   padding: "12px 16px",
                   borderRadius: "6px 20px 20px 20px",
@@ -2614,6 +2641,7 @@ const SettingsModal = ({
     { id: "voice",         label: "Voice",          icon: "mic"       as IconName },
     { id: "notifications", label: "Notifications",  icon: "bell"      as IconName },
     { id: "data",          label: "Data & Privacy", icon: "briefcase" as IconName },
+    { id: "ai",            label: "AI routing",     icon: "sparkle"   as IconName },
     { id: "apiKeys",       label: "API Keys",       icon: "key"       as IconName },
     { id: "integrations",  label: "Integrations",   icon: "link"      as IconName },
   ];
@@ -2678,6 +2706,8 @@ const SettingsModal = ({
 
           {section === "apiKeys" ? (
             <CredentialsTab credentials={credentials} update={update} />
+          ) : section === "ai" ? (
+            <AiRoutingTab credentials={credentials} />
           ) : section === "integrations" ? (
             <IntegrationsTab />
           ) : section === "resume" ? (
@@ -2799,6 +2829,243 @@ const VoiceTab = ({ voxVoice, onVoxVoiceChange, panelSize, onPanelSizeChange, vo
   );
 };
 
+// ─── AI routing tab body ──────────────────────────────────────────────────
+//
+// Which provider + model powers each part of the app. "Same for everything"
+// (default) picks once; "Per feature" sets each feature on its own. Rust owns
+// the rules (ai_routing.rs) and returns what every feature actually resolves
+// to, so stand-ins and auto fallbacks shown here are the real outcome.
+
+interface AiRoute { provider: string; model: string; fallback: string }
+interface AiRouting { mode: "same" | "per_feature"; same: AiRoute; features: Record<string, AiRoute> }
+interface AiResolved { provider: string; model: string; fallbacks: string[]; substitutedFrom: string }
+interface ModelRegistry { tiers: Record<string, Record<string, string[]>>; feature_tiers: Record<string, string> }
+
+const AI_FEATURES: { id: string; label: string }[] = [
+  { id: "copilot",          label: "Copilot answers" },
+  { id: "coach",            label: "Coach chat" },
+  { id: "interview",        label: "Mock interview" },
+  { id: "resume_tailor",    label: "Resume tailor" },
+  { id: "cheatsheet",       label: "Cheatsheet" },
+  { id: "role_fit",         label: "Role-fit research" },
+  { id: "company_research", label: "Company research" },
+  { id: "extension",        label: "Browser extension" },
+  { id: "embeddings",       label: "Embeddings (RAG)" },
+];
+const PROVIDER_NAME: Record<string, string> = { gemini: "Gemini", openai: "OpenAI", chatgpt: "ChatGPT plan", anthropic: "Claude" };
+/** Which providers can run a feature (mirrors ai_routing.rs `supports`). */
+const providersFor = (feature?: string) =>
+  ["gemini", "openai", "chatgpt", "anthropic"].filter((p) =>
+    !(feature === "embeddings" && (p === "anthropic" || p === "chatgpt")) &&
+    !(feature === "company_research" && p === "chatgpt"));
+const EMPTY_ROUTE: AiRoute = { provider: "", model: "", fallback: "" };
+
+const AiRoutingTab = ({ credentials }: { credentials: Credentials }) => {
+  const [routing, setRouting] = useState<AiRouting | null>(null);
+  const [resolved, setResolved] = useState<Record<string, AiResolved>>({});
+  const [registry, setRegistry] = useState<ModelRegistry | null>(null);
+  const [models, setModels] = useState<Record<string, string[] | "loading" | { error: string }>>({});
+  const [tests, setTests] = useState<Record<string, string>>({});
+  const [err, setErr] = useState("");
+  const [chatgpt, setChatgpt] = useState(false);
+
+  const keyOf = (p: string) =>
+    p === "gemini" ? credentials.geminiApiKey : p === "openai" ? credentials.openaiApiKey : p === "anthropic" ? credentials.anthropicApiKey : "";
+  const connected = (p: string) => (p === "chatgpt" ? chatgpt : !!keyOf(p)?.trim());
+
+  useEffect(() => {
+    // Rust resolves against Credential Manager, so flush any keys typed this
+    // session first (they otherwise save on Settings close).
+    invoke("save_credentials", { credentials })
+      .catch(() => {})
+      .then(() => invoke<{ routing: AiRouting; resolved: Record<string, AiResolved> }>("get_ai_routing"))
+      .then((r) => { if (r) { setRouting(r.routing); setResolved(r.resolved); } })
+      .catch((e) => setErr(String(e)));
+    invoke<ModelRegistry>("ai_model_registry").then(setRegistry).catch(() => {});
+    invoke<{ signedIn: boolean }>("chatgpt_status").then((s) => setChatgpt(!!s.signedIn)).catch(() => {});
+    // Sign-in / sign-out changes what's connected → re-resolve every feature.
+    let unlisten: UnlistenFn | undefined;
+    listen<{ signedIn: boolean }>("chatgpt:status", (e) => {
+      setChatgpt(!!e.payload.signedIn);
+      invoke<{ routing: AiRouting; resolved: Record<string, AiResolved> }>("get_ai_routing")
+        .then((r) => { setRouting(r.routing); setResolved(r.resolved); })
+        .catch(() => {});
+    }).then((u) => { unlisten = u; });
+    return () => { unlisten?.(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const persist = (next: AiRouting) => {
+    setRouting(next);
+    invoke<{ routing: AiRouting; resolved: Record<string, AiResolved> }>("save_ai_routing", { routing: next })
+      .then((r) => { setResolved(r.resolved); setErr(""); })
+      .catch((e) => setErr(String(e)));
+  };
+
+  const loadModels = (p: string) => {
+    if (!p || !connected(p) || models[p]) return;
+    setModels((m) => ({ ...m, [p]: "loading" }));
+    invoke<{ models: string[]; error?: string }>("ai_list_models", { provider: p })
+      .then((r) => setModels((m) => ({ ...m, [p]: r.error ? { error: r.error } : r.models })))
+      .catch((e) => setModels((m) => ({ ...m, [p]: { error: String(e) } })));
+  };
+
+  const runTest = (feature: string, provider: string, model: string) => {
+    setTests((t) => ({ ...t, [feature]: "Testing…" }));
+    invoke<{ ok: boolean; model?: string; ttft_ms?: number; error?: string }>("ai_test_model", { feature, provider, model })
+      .then((r) => setTests((t) => ({ ...t, [feature]: r.ok ? `${r.ttft_ms} ms to first token · ${r.model}` : `Failed: ${r.error ?? "no reply"}` })))
+      .catch((e) => setTests((t) => ({ ...t, [feature]: `Failed: ${String(e)}` })));
+  };
+
+  if (!routing) {
+    return <p style={{ fontSize: 12, color: err ? "#EF4444" : T.textTertiary }}>{err || "Loading AI routing…"}</p>;
+  }
+
+  const autoLabel = (provider: string, feature?: string) => {
+    if (!feature || !registry) return "Auto";
+    const tier = registry.feature_tiers[feature];
+    const pick = tier ? registry.tiers[provider]?.[tier]?.[0] : undefined;
+    return pick ? `Auto (${pick})` : "Auto";
+  };
+
+  const sel: CSSProperties = {
+    padding: "7px 10px", borderRadius: 8, border: `0.5px solid ${T.border}`,
+    background: T.bg, color: T.text, fontSize: 12, fontFamily: T.fontBody,
+    outline: "none", cursor: "pointer", minWidth: 0, width: "100%",
+  };
+  const smallBtn: CSSProperties = {
+    padding: "6px 10px", borderRadius: 8, border: `0.5px solid ${T.border}`,
+    background: T.surface2, color: T.text, fontSize: 11.5, fontWeight: 600, cursor: "pointer",
+  };
+
+  // One provider / model / fallback editor. `inherit` adds the per-feature
+  // "Same as default" option.
+  // Plain render functions, not components: a component declared inside this
+  // one would be a new type every render, remounting the <select>s (closing an
+  // open dropdown the moment its model list finishes loading).
+  const routeEditor = (value: AiRoute, onChange: (r: AiRoute) => void, feature?: string, inherit?: boolean) => {
+    const embeddings = feature === "embeddings";
+    const providers = providersFor(feature);
+    const p = value.provider;
+    const list = p ? models[p] : undefined;
+    const modelOpts = Array.isArray(list) ? list : [];
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1.4fr 1fr", gap: 6 }}>
+        <select style={sel} value={p} onChange={(e) => onChange({ ...value, provider: e.target.value, model: "" })}>
+          {inherit && <option value="">Same as default</option>}
+          {!inherit && !p && <option value="">Choose…</option>}
+          {providers.map((id) => (
+            <option key={id} value={id}>{PROVIDER_NAME[id]}{connected(id) ? "" : id === "chatgpt" ? " (not signed in)" : " (no key)"}</option>
+          ))}
+        </select>
+        <select style={sel} value={value.model} disabled={!p || embeddings}
+          onFocus={() => loadModels(p)} onMouseDown={() => loadModels(p)}
+          onChange={(e) => onChange({ ...value, model: e.target.value })}>
+          <option value="">{p ? autoLabel(p, feature) : "Auto"}</option>
+          {value.model && !modelOpts.includes(value.model) && <option value={value.model}>{value.model}</option>}
+          {list === "loading" && <option disabled>Loading models…</option>}
+          {list && !Array.isArray(list) && list !== "loading" && <option disabled>{list.error.slice(0, 60)}</option>}
+          {modelOpts.map((m) => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <select style={sel} value={value.fallback} disabled={inherit && !p}
+          onChange={(e) => onChange({ ...value, fallback: e.target.value })}>
+          <option value="">Fallback: auto</option>
+          <option value="none">Fallback: none</option>
+          {providers.filter((id) => id !== p).map((id) => (
+            <option key={id} value={id}>Fallback: {PROVIDER_NAME[id]}{connected(id) ? "" : " (no key)"}</option>
+          ))}
+        </select>
+      </div>
+    );
+  };
+
+  // What a feature resolves to right now, from Rust.
+  const outcome = (feature: string) => {
+    const r = resolved[feature];
+    if (!r) return null;
+    const model = r.model || autoLabel(r.provider, feature);
+    const fb = r.fallbacks.length ? `, fallback ${r.fallbacks.map((f) => PROVIDER_NAME[f] ?? f).join(", ")}` : ", no fallback";
+    return (
+      <div style={{ fontSize: 11, color: T.textTertiary, marginTop: 4 }}>
+        → {PROVIDER_NAME[r.provider] ?? r.provider} · {model}{feature === "embeddings" ? "" : fb}
+        {r.substitutedFrom && (
+          <span style={{ color: "#F59E0B" }}> · stands in for {PROVIDER_NAME[r.substitutedFrom] ?? r.substitutedFrom} (no key or can't run this)</span>
+        )}
+      </div>
+    );
+  };
+
+  const testFor = (feature: string) => {
+    const r = resolved[feature];
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+        <button type="button" style={smallBtn} disabled={!r} onClick={() => r && runTest(feature, r.provider, r.model)}>
+          Test speed
+        </button>
+        {tests[feature] && <span style={{ fontSize: 11, color: tests[feature].startsWith("Failed") ? "#EF4444" : T.textSecondary }}>{tests[feature]}</span>}
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <Card>
+        <CardTitle>Mode</CardTitle>
+        <CardDesc>One provider for everything, or a provider, model and fallback per feature. If a choice has no key or can't run a feature, the next connected provider stands in — answers from a stand-in or fallback show a small "via … · fallback" badge.</CardDesc>
+        <div style={{ display: "flex", gap: 6 }}>
+          {([["same", "Same for everything"], ["per_feature", "Per feature"]] as const).map(([id, label]) => (
+            <button key={id} type="button" onClick={() => persist({ ...routing, mode: id })}
+              aria-pressed={routing.mode === id}
+              style={{
+                padding: "6px 14px", borderRadius: 8, cursor: "pointer", border: `0.5px solid ${T.border}`,
+                background: routing.mode === id ? T.accent : T.surface2,
+                color: routing.mode === id ? "#fff" : T.text, fontSize: 12, fontWeight: 600,
+              }}>
+              {label}
+            </button>
+          ))}
+        </div>
+        {err && <CardHint><span style={{ color: "#EF4444" }}>{err}</span></CardHint>}
+      </Card>
+
+      {routing.mode === "same" ? (
+        <Card>
+          <CardTitle>Everything uses</CardTitle>
+          {routeEditor(
+            // First run has no explicit choice yet: show the legacy toggle's.
+            { ...routing.same, provider: routing.same.provider || credentials.llmProvider || "gemini" },
+            (r) => persist({ ...routing, same: r }),
+          )}
+          <div style={{ marginTop: 10 }}>
+            {AI_FEATURES.map((f) => (
+              <div key={f.id} style={{ fontSize: 11.5, color: T.textSecondary, marginTop: 6 }}>
+                <span style={{ color: T.text }}>{f.label}</span>
+                {outcome(f.id)}
+              </div>
+            ))}
+          </div>
+          {testFor("copilot")}
+          <CardHint>"Auto" picks the right model per feature: the fastest for the copilot, the strongest for resume tailoring.</CardHint>
+        </Card>
+      ) : (
+        AI_FEATURES.map((f) => (
+          <Card key={f.id}>
+            <CardTitle>{f.label}</CardTitle>
+            {routeEditor(
+              routing.features[f.id] ?? EMPTY_ROUTE,
+              (r) => persist({ ...routing, features: { ...routing.features, [f.id]: r } }),
+              f.id,
+              true,
+            )}
+            {outcome(f.id)}
+            {f.id !== "embeddings" && testFor(f.id)}
+          </Card>
+        ))
+      )}
+    </div>
+  );
+};
+
 // ─── API Keys tab body ────────────────────────────────────────────────────
 
 interface CredentialsTabProps {
@@ -2825,44 +3092,21 @@ const KEY_CARDS: {
 ];
 
 const CredentialsTab = ({ credentials, update }: CredentialsTabProps) => {
-  const active = (credentials.llmProvider || "gemini") as LlmProvider;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <Card>
-        <CardTitle>AI Provider</CardTitle>
+        <CardTitle>Connections</CardTitle>
         <CardDesc>
-          Pick which model powers chat, mock interviews, resume tailoring and
-          research. Keys you enter for the other providers are kept and used as
-          fallbacks by company research.
+          Add a key for each provider you want available. Which provider and
+          model each part of the app uses — and its fallback — is set in
+          Settings → AI routing.
         </CardDesc>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {LLM_PROVIDERS.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              onClick={() => update({ llmProvider: p.id })}
-              aria-pressed={active === p.id}
-              style={{
-                padding: "6px 14px", borderRadius: 8, cursor: "pointer",
-                border: `0.5px solid ${T.border}`,
-                background: active === p.id ? T.accent : T.surface2,
-                color: active === p.id ? "#fff" : T.text,
-                fontSize: 12, fontWeight: 600,
-              }}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
         <CardHint>Stored in Windows Credential Manager — encrypted with your user account.</CardHint>
       </Card>
 
       {KEY_CARDS.map((card) => (
         <Card key={card.id}>
-          <CardTitle>
-            {card.title}
-            {active === card.id ? " · Active" : ""}
-          </CardTitle>
+          <CardTitle>{card.title}</CardTitle>
           <CardDesc>{card.desc}</CardDesc>
           <SecretField
             value={credentials[card.field]}
@@ -2871,7 +3115,91 @@ const CredentialsTab = ({ credentials, update }: CredentialsTabProps) => {
           />
         </Card>
       ))}
+      <ChatGptCard />
     </div>
+  );
+};
+
+/** Sign in with ChatGPT: use a ChatGPT plan (e.g. Plus) instead of an OpenAI
+ *  API key. The whole OAuth flow runs in Rust (chatgpt_auth.rs) — this card
+ *  only ever sees `{ signedIn, email }`, never a token. */
+const ChatGptCard = () => {
+  const [status, setStatus] = useState<{ signedIn: boolean; email: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [applied, setApplied] = useState("");
+  useEffect(() => {
+    const refresh = () => invoke<{ signedIn: boolean; email: string }>("chatgpt_status").then(setStatus).catch(() => {});
+    refresh();
+    // Rust broadcasts the outcome, so the card updates even if the invoke that
+    // started sign-in was lost (e.g. Settings was closed and reopened while the
+    // browser was up). Also re-check when the window regains focus — that's the
+    // moment the user comes back from the browser.
+    let unlisten: UnlistenFn | undefined;
+    listen<{ signedIn: boolean; email: string }>("chatgpt:status", (e) => { setStatus(e.payload); setBusy(false); })
+      .then((u) => { unlisten = u; });
+    window.addEventListener("focus", refresh);
+    return () => { unlisten?.(); window.removeEventListener("focus", refresh); };
+  }, []);
+  const run = (cmd: "chatgpt_sign_in" | "chatgpt_sign_out") => {
+    setBusy(true); setErr(""); setApplied("");
+    invoke<{ signedIn: boolean; email: string }>(cmd)
+      .then(setStatus)
+      .catch((e) => setErr(String(e)))
+      .finally(() => setBusy(false));
+  };
+  // One-click routing presets after sign-in. Measured 2026-10-01: Plus
+  // (gpt-5.6-luna) took ~1.5-3.9s to first word vs ~0.5s on Gemini Flash-Lite,
+  // so the recommended preset keeps the live copilot on Gemini.
+  const usePlan = (exceptCopilot: boolean) => {
+    invoke<{ routing: { features: Record<string, unknown> } }>("get_ai_routing")
+      .then((r) => invoke("save_ai_routing", {
+        routing: exceptCopilot
+          ? { mode: "per_feature", same: { provider: "chatgpt", model: "", fallback: "" },
+              features: { ...r.routing.features, copilot: { provider: "gemini", model: "", fallback: "chatgpt" } } }
+          : { mode: "same", same: { provider: "chatgpt", model: "", fallback: "" }, features: r.routing.features },
+      }))
+      .then(() => setApplied(exceptCopilot
+        ? "Done — ChatGPT plan for everything, copilot on Gemini (falls back to the plan). Adjust in AI routing."
+        : "Done — ChatGPT plan for everything it can run; Gemini covers research and embeddings."))
+      .catch((e) => setErr(String(e)));
+  };
+  const btn: CSSProperties = {
+    padding: "7px 14px", borderRadius: 8, border: `0.5px solid ${T.border}`, cursor: busy ? "default" : "pointer",
+    background: T.surface2, color: T.text, fontSize: 12, fontWeight: 600, opacity: busy ? 0.6 : 1,
+  };
+  return (
+    <Card>
+      <CardTitle>ChatGPT plan{status?.signedIn ? " · Signed in" : ""}</CardTitle>
+      <CardDesc>
+        Use your ChatGPT subscription (Plus, Pro, Team) instead of an OpenAI API key, for every
+        feature except company research and embeddings. Plus shares a 5-hour usage limit across
+        apps — pick a fallback in AI routing so answers keep coming when it runs out.
+      </CardDesc>
+      {status?.signedIn ? (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 12, color: T.textSecondary }}>{status.email || "Signed in"}</span>
+            <button type="button" style={btn} disabled={busy} onClick={() => run("chatgpt_sign_out")}>
+              {busy ? "Signing out…" : "Sign out"}
+            </button>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+            <button type="button" style={{ ...btn, background: T.accent, color: "#fff", border: "none" }} onClick={() => usePlan(true)}>
+              Use it for everything except copilot (recommended)
+            </button>
+            <button type="button" style={btn} onClick={() => usePlan(false)}>Use it for everything</button>
+          </div>
+          <CardHint>The live copilot answers about 3× faster on Gemini Flash-Lite than on the plan, so the recommended setup keeps it there.</CardHint>
+          {applied && <CardHint><span style={{ color: "#22C55E" }}>{applied}</span></CardHint>}
+        </>
+      ) : (
+        <button type="button" style={btn} disabled={busy} onClick={() => run("chatgpt_sign_in")}>
+          {busy ? "Finish signing in in your browser…" : "Sign in with ChatGPT"}
+        </button>
+      )}
+      {err && <CardHint><span style={{ color: "#EF4444" }}>{err}</span></CardHint>}
+    </Card>
   );
 };
 
@@ -3559,6 +3887,10 @@ const App = () => {
       appendToStream(e.payload.streamId, (m) => ({ ...m, logs: [...(m.logs ?? []), e.payload.content] }));
     });
 
+    register<{ streamId: string; content: RouteInfo }>("chat:route", (e) => {
+      appendToStream(e.payload.streamId, (m) => ({ ...m, via: e.payload.content }));
+    });
+
     register<{ streamId: string; content: Scorecard }>("chat:scorecard", (e) => {
       const target = streamsRef.current.get(e.payload.streamId);
       if (!target) return;
@@ -3888,7 +4220,6 @@ const App = () => {
         company_research: companyResearch,
         documents,
         previous_markdown: job.cheatsheet?.markdown ?? "",
-        llm: llmPayload(credentialsRef.current),
       },
     })
       .then((cs) => {
@@ -4085,7 +4416,6 @@ const App = () => {
       jobContext,
       history,
       mode,
-      llm: llmPayload(credentials),
       documents: ragDocs,
       streamId,
     }).catch((e) => {
@@ -4163,7 +4493,6 @@ const App = () => {
   /// Application-Prep thread finishes. Creates the Research thread lazily so
   /// it only exists after Prep succeeds.
   const startCompanyResearchFor = (job: Job, tailoredResume: string) => {
-    const creds = credentialsRef.current;
     const researchThreadId = `c-research-${job.id}`;
     // Seed the placeholder with a first log line so the user sees activity
     // immediately. Playwright cold-start + supervisor's first hop can take
@@ -4203,7 +4532,6 @@ const App = () => {
       location:       job.location,
       jobDescription: job.jobDescription ?? "",
       tailoredResume,
-      llm:            llmPayload(creds),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);
@@ -4309,7 +4637,6 @@ const App = () => {
       location:       job.location,
       jobDescription: job.jobDescription ?? "",
       tailoredResume: resume,
-      llm:            llmPayload(credentialsRef.current),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);
@@ -4394,7 +4721,6 @@ const App = () => {
       location:       newJob.location,
       jobDescription: jd,
       masterResumes,
-      llm:            llmPayload(credentials),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);
@@ -4454,7 +4780,6 @@ const App = () => {
       location:       job.location,
       jobDescription: job.jobDescription ?? "",
       masterResumes,
-      llm:            llmPayload(credentialsRef.current),
       streamId,
     }).catch((e) => {
       const errMsg = String(e);

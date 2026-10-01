@@ -1,13 +1,17 @@
 //! InterPrep — Tauri runtime entry point.
 
+mod ai_routing;
 mod backend_client;
+mod chatgpt_auth;
 mod copilot;
+pub mod copilot_listen;
 mod credentials;
 mod jobs_store;
 mod recorder;
 mod resume_store;
 mod sidecar;
 mod types;
+pub mod vad;
 mod voice_audio;
 
 use std::path::PathBuf;
@@ -177,7 +181,7 @@ fn reseed_backend_key(state: State<SidecarState>) -> Result<(), String> {
             _ => return Err("Backend is not ready yet".to_string()),
         }
     };
-    let llm = Credentials::load().llm_json();
+    let llm = ai_routing::llm_for("extension");
     backend_client::seed_config(&url, &token, &llm)
 }
 
@@ -242,11 +246,13 @@ fn start_chat_stream(
     job_context: String,
     history: Vec<(String, String)>,
     mode: String,
-    llm: serde_json::Value,
     documents: Vec<backend_client::RagDocPayload>,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
+    // LLM config is built here, never taken from the webview: AI routing for
+    // this feature + keys from Credential Manager (see ai_routing.rs).
+    let llm = ai_routing::llm_for(ai_routing::chat_feature(&mode));
     backend_client::stream_chat(app, url, message, job_context, history, mode, llm, documents, stream_id);
     Ok(())
 }
@@ -258,10 +264,10 @@ fn start_research_stream(
     company: String,
     role: String,
     job_description: String,
-    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
+    let llm = ai_routing::llm_for("role_fit");
     backend_client::stream_research(app, url, company, role, job_description, llm, stream_id);
     Ok(())
 }
@@ -276,10 +282,10 @@ fn start_company_research_stream(
     location: String,
     job_description: String,
     tailored_resume: String,
-    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
+    let llm = ai_routing::llm_for("company_research");
     backend_client::stream_company_research(
         app,
         url,
@@ -304,10 +310,10 @@ fn start_application_tailor_stream(
     location: String,
     job_description: String,
     master_resumes: Vec<backend_client::MasterResumePayload>,
-    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
+    let llm = ai_routing::llm_for("resume_tailor");
     backend_client::stream_application_tailor(
         app,
         url,
@@ -332,10 +338,10 @@ fn start_knockout_screen_stream(
     location: String,
     job_description: String,
     tailored_resume: String,
-    llm: serde_json::Value,
     stream_id: String,
 ) -> Result<(), String> {
     let url = require_url(&state)?;
+    let llm = ai_routing::llm_for("resume_tailor");
     backend_client::stream_knockout_screen(
         app,
         url,
@@ -354,15 +360,130 @@ fn start_knockout_screen_stream(
 
 /// Build/refresh a job's interview cheatsheet from its aggregated context
 /// (`payload` carries company/role/JD + resume + research dossier +
-/// conversation docs + the previous cheatsheet markdown + the LLM config).
+/// conversation docs + the previous cheatsheet markdown). The LLM config is
+/// set here from AI routing — any `llm` the webview sent is overwritten.
 /// Returns the structured cheatsheet JSON for the frontend to store on the Job.
 #[tauri::command]
 fn generate_cheatsheet(
     state: State<SidecarState>,
-    payload: serde_json::Value,
+    mut payload: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let url = require_url(&state)?;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("llm".into(), ai_routing::llm_for("cheatsheet"));
+    }
     backend_client::build_cheatsheet(&url, payload)
+}
+
+// ─── Sign in with ChatGPT ───────────────────────────────────────────────────
+
+/// Re-push the extension's LLM config (it holds a copy of the plan token).
+fn reseed_extension(app: &AppHandle) {
+    let state = app.state::<SidecarState>();
+    if let Ok((url, token)) = bridge_url_token(&state) {
+        let _ = backend_client::seed_config(&url, &token, &ai_routing::llm_for("extension"));
+    }
+}
+
+/// `{ signedIn, email }` — never exposes a token to the webview.
+#[tauri::command]
+fn chatgpt_status() -> serde_json::Value {
+    chatgpt_auth::status()
+}
+
+/// Open the browser sign-in and wait (up to 5 min) for it to finish.
+#[tauri::command]
+async fn chatgpt_sign_in(app: AppHandle) -> Result<serde_json::Value, String> {
+    let result = tauri::async_runtime::spawn_blocking(chatgpt_auth::sign_in)
+        .await
+        .map_err(|e| e.to_string())?;
+    match &result {
+        Ok(_) => eprintln!("[chatgpt] signed in"),
+        Err(e) => eprintln!("[chatgpt] sign-in failed: {e}"),
+    }
+    let status = result?;
+    // Broadcast too: the Settings card that started this may have unmounted
+    // (modal closed while the browser was up), and other views (AI routing,
+    // the overlay) need to know without polling.
+    let _ = app.emit("chatgpt:status", &status);
+    reseed_extension(&app);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn chatgpt_sign_out(app: AppHandle) -> Result<serde_json::Value, String> {
+    let status = tauri::async_runtime::spawn_blocking(chatgpt_auth::sign_out)
+        .await
+        .map_err(|e| e.to_string())??;
+    let _ = app.emit("chatgpt:status", &status);
+    reseed_extension(&app);
+    Ok(status)
+}
+
+// ─── AI routing (Settings → AI) ─────────────────────────────────────────────
+
+/// The saved routing plus what each feature resolves to right now (stand-ins,
+/// auto fallbacks), so the Settings card shows the real outcome.
+#[tauri::command]
+fn get_ai_routing() -> serde_json::Value {
+    let routing = ai_routing::load();
+    let creds = Credentials::load();
+    let conn = ai_routing::Conn { creds: &creds, chatgpt: chatgpt_auth::is_signed_in() };
+    let resolved = ai_routing::resolve_all(&routing, &conn);
+    serde_json::json!({ "routing": routing, "resolved": resolved })
+}
+
+/// Save the routing and push the extension's config so it applies at once.
+#[tauri::command]
+fn save_ai_routing(
+    state: State<SidecarState>,
+    routing: ai_routing::AiRouting,
+) -> Result<serde_json::Value, String> {
+    ai_routing::save(&routing)?;
+    if let Ok((url, token)) = bridge_url_token(&state) {
+        let _ = backend_client::seed_config(&url, &token, &ai_routing::llm_for("extension"));
+    }
+    Ok(get_ai_routing())
+}
+
+/// The backend's model registry (per provider + tier) and each feature's tier,
+/// so the picker can label what "Auto" means.
+#[tauri::command]
+fn ai_model_registry(state: State<SidecarState>) -> Result<serde_json::Value, String> {
+    let url = require_url(&state)?;
+    backend_client::get_json(&url, "/models/registry", 10)
+}
+
+/// Models the user's key can call for `provider` (cached a day by the backend).
+#[tauri::command]
+async fn ai_list_models(
+    state: State<'_, SidecarState>,
+    provider: String,
+) -> Result<serde_json::Value, String> {
+    let url = require_url(&state)?;
+    let body = serde_json::json!({ "provider": provider, "llm": ai_routing::llm_with_plan_token("coach") });
+    tauri::async_runtime::spawn_blocking(move || backend_client::post_json(&url, "/models/list", &body, 30))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// One tiny request through `feature`'s real settings on `provider`/`model`
+/// ("" = Auto); returns time-to-first-token for the Test button.
+#[tauri::command]
+async fn ai_test_model(
+    state: State<'_, SidecarState>,
+    feature: String,
+    provider: String,
+    model: String,
+) -> Result<serde_json::Value, String> {
+    let url = require_url(&state)?;
+    let body = serde_json::json!({
+        "feature": feature, "provider": provider, "model": model,
+        "llm": ai_routing::llm_with_plan_token(&feature),
+    });
+    tauri::async_runtime::spawn_blocking(move || backend_client::post_json(&url, "/models/test", &body, 60))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Persist the cheatsheet markdown as the job's living `.md` file at
@@ -975,7 +1096,7 @@ fn voice_listen_system(
                     // missing terminal punctuation must NOT trigger the ~2.8s
                     // continuation wait on every complete question — only a cut
                     // that ends on a comma or a clause-opening word does.
-                    if !looks_unfinished(&full_text) {
+                    if !copilot_listen::looks_unfinished(&full_text) {
                         break;
                     }
                     eprintln!("[voice] transcript looks unfinished — listening for the rest");
@@ -1000,6 +1121,58 @@ fn voice_listen_system(
     Ok(())
 }
 
+/// The copilot's continuous Rec session (see copilot_listen.rs).
+#[derive(Default)]
+struct CopilotListenState {
+    inner: Mutex<Option<copilot_listen::Listener>>,
+}
+
+/// Start the copilot's live listener on the system audio: Silero VAD in Rust,
+/// streaming Whisper in the sidecar, and the answer started from Rust as soon
+/// as the question ends (events: `copilot:*`, answer as `chat:*`). Errors if
+/// the VAD can't load — the overlay then falls back to `voice_listen_system`.
+#[tauri::command]
+fn copilot_listen_start(
+    app: AppHandle,
+    sidecar: State<SidecarState>,
+    listen: State<CopilotListenState>,
+    voice: State<VoiceState>,
+) -> Result<(), String> {
+    let url = require_url(&sidecar)?;
+    if let Some(old) = listen.inner.lock().unwrap().take() {
+        old.stop();
+    }
+    let app_lvl = app.clone();
+    let mut last = Instant::now() - Duration::from_millis(100);
+    let on_level = move |rms: f32, zcr: f32| {
+        let now = Instant::now();
+        if now.duration_since(last) >= Duration::from_millis(45) {
+            last = now;
+            let _ = app_lvl.emit("voice:level", serde_json::json!({ "level": rms, "pitch": zcr, "mode": "listening" }));
+        }
+    };
+    let sink = copilot_listen::AppSink::new(app.clone(), url.clone());
+    let listener = copilot_listen::spawn_system_listener(sink, url, on_level)?;
+    // Ctrl+` and the overlay's "answer now" button trip this flag.
+    *voice.listen_finish.lock().unwrap() = Some(Arc::clone(&listener.force));
+    *listen.inner.lock().unwrap() = Some(listener);
+    Ok(())
+}
+
+#[tauri::command]
+fn copilot_listen_stop(listen: State<CopilotListenState>) {
+    if let Some(l) = listen.inner.lock().unwrap().take() {
+        l.stop();
+    }
+}
+
+/// Stop reading a chat stream (the sidecar stops generating once the
+/// connection drops). Used when a newer question supersedes an answer.
+#[tauri::command]
+fn cancel_chat_stream(stream_id: String) {
+    backend_client::cancel_stream(&stream_id);
+}
+
 /// Force-end mic capture early (user pressed stop / disabled voice). The audio
 /// captured so far is DISCARDED — use `voice_finish_listening` to end + transcribe.
 #[tauri::command]
@@ -1016,64 +1189,6 @@ fn voice_stop_listening(voice: State<VoiceState>) {
 fn voice_finish_listening(voice: State<VoiceState>) {
     if let Some(flag) = voice.listen_finish.lock().unwrap().as_ref() {
         flag.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Strong "the speaker was cut off mid-sentence" heuristic for the semantic
-/// continuation listen. Deliberately conservative: false positives cost ~2.8s
-/// on every question, false negatives just mean one question gets answered
-/// from its first clause — so only a trailing comma or an obviously
-/// clause-opening final word counts.
-fn looks_unfinished(text: &str) -> bool {
-    let t = text.trim_end();
-    if t.is_empty() {
-        return false;
-    }
-    // Trust explicit terminal punctuation before inspecting the last word.
-    // Without this guard, complete questions such as "What are you passionate
-    // about?" matched the clause-opening word list below and paid an unnecessary
-    // Q_CONTINUATION_TIMEOUT_S re-listen on every turn.
-    if t.ends_with('.') || t.ends_with('?') || t.ends_with('!') {
-        return false;
-    }
-    if t.ends_with(',') || t.ends_with(';') || t.ends_with(':') || t.ends_with('-') {
-        return true;
-    }
-    let last_word = t
-        .rsplit(|c: char| !c.is_alphanumeric() && c != '\'')
-        .find(|w| !w.is_empty())
-        .unwrap_or("")
-        .to_lowercase();
-    matches!(
-        last_word.as_str(),
-        "and" | "or" | "but" | "so" | "because" | "if" | "when" | "while"
-            | "with" | "to" | "of" | "for" | "about" | "the" | "a" | "an"
-            | "your" | "how" | "what" | "which" | "that" | "into" | "on" | "in"
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::looks_unfinished;
-
-    #[test]
-    fn terminal_punctuation_never_requests_continuation() {
-        assert!(!looks_unfinished("What are you passionate about?"));
-        assert!(!looks_unfinished("Tell me about your last role."));
-        assert!(!looks_unfinished("Why this company!"));
-    }
-
-    #[test]
-    fn clause_openers_without_terminal_punctuation_request_continuation() {
-        assert!(looks_unfinished("Tell me about"));
-        assert!(looks_unfinished("What would you do if"));
-        assert!(looks_unfinished("The main reason is,"));
-    }
-
-    #[test]
-    fn complete_plain_text_does_not_request_continuation() {
-        assert!(!looks_unfinished("Describe your most successful project"));
-        assert!(!looks_unfinished("How did you measure success"));
     }
 }
 
@@ -1125,8 +1240,15 @@ pub fn run() {
         .manage(SidecarState::default())
         .manage(RecorderState::default())
         .manage(VoiceState::default())
+        .manage(CopilotListenState::default())
         .manage(copilot::CopilotContextState::default())
         .setup(|app| {
+            // Keep the ChatGPT plan token fresh in the background (no-op while
+            // signed out) and re-seed the extension's copy after each refresh.
+            {
+                let handle = app.handle().clone();
+                chatgpt_auth::start_refresher(move || reseed_extension(&handle));
+            }
             // Register Ctrl+\ to toggle the stealth copilot overlay. Best-effort:
             // if another app already owns the chord, log and carry on rather than
             // failing app startup.
@@ -1164,7 +1286,7 @@ pub fn run() {
                         // sidecar answers. Best-effort: a failure just means the
                         // extension endpoints run on the env-seeded default
                         // until the user next saves Settings.
-                        let _ = backend_client::seed_config(&url, &token, &creds.llm_json());
+                        let _ = backend_client::seed_config(&url, &token, &ai_routing::llm_for("extension"));
                         {
                             let mut inner = state.inner.lock().unwrap();
                             inner.base_url = Some(url.clone());
@@ -1173,7 +1295,11 @@ pub fn run() {
                             inner.sidecar  = Some(sidecar);
                             inner.last_err = None;
                         }
-                        let _ = handle.emit("sidecar:ready", url);
+                        let _ = handle.emit("sidecar:ready", url.clone());
+                        // Load + warm speech recognition now (background, in the
+                        // sidecar) so the copilot never meets a cold recognizer:
+                        // a cold first load is ~1 min of DLL loading on this box.
+                        let _ = backend_client::speech_warm(&url);
                     }
                     Err(e) => {
                         {
@@ -1206,6 +1332,14 @@ pub fn run() {
             start_application_tailor_stream,
             start_knockout_screen_stream,
             generate_cheatsheet,
+            get_ai_routing,
+            save_ai_routing,
+            ai_model_registry,
+            ai_list_models,
+            ai_test_model,
+            chatgpt_status,
+            chatgpt_sign_in,
+            chatgpt_sign_out,
             save_cheatsheet_md,
             save_resume_docx,
             open_path,
@@ -1224,6 +1358,9 @@ pub fn run() {
             voice_listen_system,
             voice_stop_listening,
             voice_finish_listening,
+            copilot_listen_start,
+            copilot_listen_stop,
+            cancel_chat_stream,
             copilot::open_copilot,
             copilot::close_copilot,
             copilot::toggle_copilot,

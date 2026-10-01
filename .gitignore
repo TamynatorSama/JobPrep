@@ -12,6 +12,13 @@ backend/**/*.pyc
 # research_scraper's on-disk cache (scraped pages + SQLite db) — machine state,
 # churns on every research run; never belongs in the repo.
 backend/.cache/
+# Latency/token harness output (machine-specific timings + sidecar logs).
+backend/bench/results/
+# Stray run artifacts (some are already tracked — untrack with `git rm --cached`).
+.td.*.log
+backend/_boot_err.txt
+backend/test_outputs/
+backend/.claude/
 
 # Build / install caches
 .pytest_cache/

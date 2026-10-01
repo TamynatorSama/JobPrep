@@ -1,13 +1,15 @@
 import asyncio
 import json
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
 import llm_provider as llm_factory
 from models import ResearchRequest
-from agents.workflow import build_research_workflow
-from agents.state import ResearchState
+
+if TYPE_CHECKING:  # agents.state pulls in langgraph (~4s) — type-only here
+    from agents.state import ResearchState
 
 router = APIRouter()
 
@@ -34,6 +36,8 @@ async def research_stream(req: ResearchRequest):
             return
 
         try:
+            # Lazy: langgraph is ~5s of cold import — keep it off sidecar boot.
+            from agents.workflow import build_research_workflow
             workflow = build_research_workflow(req.llm)
 
             initial_state: ResearchState = {

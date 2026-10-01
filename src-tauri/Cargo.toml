@@ -39,6 +39,14 @@ base64 = "0.22"
 dirs = "5"
 opener = "0.7"
 getrandom = "0.2"          # OS CSPRNG for the bridge pairing token
+# Sign in with ChatGPT (chatgpt_auth.rs): PKCE S256 challenge + RS256 ID-token
+# verification against OpenAI's published JWKS.
+sha2 = "0.10"
+jsonwebtoken = "9"
+# Silero VAD for the copilot's live endpointing (vad.rs), in-process on the CPU:
+# ~0.1 ms per 32 ms frame. download-binaries fetches a prebuilt ONNX Runtime at
+# build time.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs"] }
 
 # Win32 — SetWindowDisplayAffinity for the stealth copilot overlay (cloaks the
 # window from screen capture). Windows-only; the app is Windows-only anyway.
@@ -47,6 +55,12 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# WebView2 settings on the copilot overlay (no context menu / autofill / status
+# bar / browser accelerator popups — each is its own window outside the capture
+# cloak). Versions MUST match what wry pins (webview2-com 0.38 → windows-core
+# 0.61), since PlatformWebview::controller() hands us wry's own interface types.
+webview2-com = "0.38"
+windows-core-61 = { package = "windows-core", version = "0.61" }
 
 [profile.release]
 opt-level = "s"

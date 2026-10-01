@@ -10,6 +10,11 @@ def make_llm(cfg: LLMConfig):
     return llm_factory.make_chat_model(cfg, tier="fast")
 
 
+def llm_model_name(llm) -> str:
+    """Model id of a LangChain chat model, for the token meter."""
+    return str(getattr(llm, "model", "") or getattr(llm, "model_name", "") or "unknown")
+
+
 async def extract_requirements(state: ResearchState, cfg: LLMConfig) -> ResearchState:
     llm = make_llm(cfg)
     prompt = f"""Extract the key requirements from this job posting. Format your response as:
@@ -26,7 +31,8 @@ Job Description:
 {state['job_description'][:3000]}"""
 
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    return {**state, "requirements": response.content}
+    llm_factory.record_usage(llm_model_name(llm), getattr(response, "usage_metadata", None))
+    return {**state, "requirements": llm_factory.content_text(response)}
 
 
 async def generate_questions(state: ResearchState, cfg: LLMConfig) -> ResearchState:
@@ -43,9 +49,12 @@ Role: {state['role']} at {state['company']}
 Number each question. Be specific to this role, not generic."""
 
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    lines = response.content.split("\n")
+    llm_factory.record_usage(llm_model_name(llm), getattr(response, "usage_metadata", None))
+    # content_text: Gemini 3.x / Claude can return a list of content blocks.
+    text = llm_factory.content_text(response)
+    lines = text.split("\n")
     questions = [l.strip() for l in lines if l.strip() and l.strip()[0].isdigit()]
-    return {**state, "questions": questions or [response.content]}
+    return {**state, "questions": questions or [text]}
 
 
 async def create_prep_tips(state: ResearchState, cfg: LLMConfig) -> ResearchState:
@@ -70,4 +79,5 @@ Provide:
 Keep it specific and actionable."""
 
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    return {**state, "prep_tips": response.content}
+    llm_factory.record_usage(llm_model_name(llm), getattr(response, "usage_metadata", None))
+    return {**state, "prep_tips": llm_factory.content_text(response)}

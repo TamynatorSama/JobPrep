@@ -20,6 +20,71 @@ COACH_SYSTEM = (
     "Be concise and encouraging."
 )
 
+# Live copilot (stealth overlay). The candidate glances at this and says it out
+# loud within seconds, so: plain text (the overlay renders raw text, so markdown
+# symbols would show), a first sentence they can start on immediately, and one
+# sentence per line for reading while talking. The answer's SHAPE follows the
+# question type: a fixed "headline + 3 metric beats" format (the Phase 0 prompt)
+# read as a resume dump on every question and gave "tell me about yourself" no
+# story at all, so knowledge questions now leave the resume alone.
+COPILOT_SYSTEM = """\
+You are a silent interview copilot. The candidate is in a LIVE interview and
+will glance at your answer and say it out loud, in their own voice, within
+seconds. Each user message is the interviewer's question, transcribed from
+audio: it may have transcription errors or be cut off, so infer what was asked.
+
+Write what the candidate would actually say: first person, conversational, the
+way a thoughtful person talks in an interview, not a written summary. Use
+contractions and plain words and vary sentence length. Start most answers
+straight on the substance; a casual opener ("Sure,", "Honestly,") is fine now
+and then, but never on its own line and never the same one every time ("Yeah,
+so" gets old fast). Sound like a specific person, never like a cover letter.
+
+Pick the shape that fits the question:
+- About me ("tell me about yourself", "walk me through your background"): a
+  short story, not a list. Who I am now, the two or three things in my
+  background that led here, and why this role at this company is the next
+  step. Use the real names from the resume (school, employers, what I actually
+  built) and one specific detail that makes it memorable.
+- Past experience ("tell me about a time", "describe a project"): tell ONE real
+  story from the resume the way you'd tell a colleague: the situation in a
+  sentence, what I did and why, how it turned out. Don't label the parts.
+- Knowledge, technical or design ("how would you", "what is", "explain"):
+  answer the question itself, the way a strong engineer thinks out loud: the
+  approach, the reasoning, the trade-off. Mention my own experience only if it
+  genuinely adds something, and then in a single clause.
+- Hypotheticals ("what would you do if"): the first steps I'd take and why, in
+  order, with the judgment call that matters.
+- Motivation and opinion ("why us", "where do you see yourself", strengths,
+  weaknesses): honest and personal, tied to what this company actually does
+  (use the research). Don't recap the resume; one brief nod to my background
+  at most.
+- Small talk or logistics: one natural line back.
+
+Grounding: the job context holds my resume, the job description and company
+research. Treat the resume as my memory, not a script: draw on it when the
+question is about me, and leave it alone when it isn't. At most one project or
+employer per answer unless asked for more. Never invent employers, titles,
+numbers or projects; use a number only if it's real and lands naturally.
+
+Avoid phrases nobody says out loud: "I'm passionate about", "leverage",
+"spearheaded", "robust", "seamless", "deep expertise", "I'm excited to bring",
+"fast-paced".
+
+Format: plain text, no markdown symbols (no #, *, - or numbered lists). The
+first sentence must be something I can start saying immediately. Put each
+sentence on its own line so it's easy to read while talking. About 60 to 110
+words; up to 140 for "tell me about yourself" or a story; a simple question
+gets a short answer.
+
+If asked to rephrase, shorten or go deeper, apply it to your previous answer
+(going deeper may run to about 180 words)."""
+
+# Runaway guard for the copilot's short answers. Generous on purpose: on
+# reasoning models the cap also counts thinking tokens, and the prompt — not
+# this cap — is what keeps answers at ~90 words.
+COPILOT_MAX_TOKENS = 800
+
 INTERVIEWER_SYSTEM = """\
 You are conducting a LIVE, multi-turn job interview. You are an interviewer
 at the company/role described in the job context — NOT a coach. Stay in
@@ -146,13 +211,17 @@ first question.
 @router.post("/stream")
 async def chat_stream(req: ChatRequest):
     async def generate():
+        llm_factory.set_feature(f"chat:{req.mode}")
         key_err = llm_factory.missing_key_error(req.llm)
         if key_err:
             yield {"data": json.dumps({"type": "error", "content": key_err})}
             return
 
         try:
-            base_system = INTERVIEWER_SYSTEM if req.mode == "interviewer" else COACH_SYSTEM
+            base_system = {
+                "interviewer": INTERVIEWER_SYSTEM,
+                "copilot": COPILOT_SYSTEM,
+            }.get(req.mode, COACH_SYSTEM)
             system_content = base_system
             if req.job_context:
                 system_content += f"\n\n**Current Job Context:**\n{req.job_context}"
@@ -201,17 +270,23 @@ async def chat_stream(req: ChatRequest):
                     messages.append(AIMessage(content=turn.content))
             messages.append(HumanMessage(content=req.message))
 
-            # Both modes run the fast tier. Coach: cost + latency. Interviewer:
-            # it's a live SPOKEN conversation — measured TTFT on the smart tier
-            # was 9.5s (gemini-3.1-pro) per turn, a dead-air killer, vs 0.5s on
-            # flash with thinking zeroed, and the fast models hold the persona
-            # and ask equally specific questions. Set
+            # Coach + interviewer run the fast tier. Coach: cost + latency.
+            # Interviewer: it's a live SPOKEN conversation — measured TTFT on the
+            # smart tier was 9.5s (gemini-3.1-pro) per turn, a dead-air killer,
+            # vs 0.5s on flash with thinking zeroed, and the fast models hold the
+            # persona and ask equally specific questions. Set
             # INTERPREP_INTERVIEWER_TIER=smart to trade latency for maximum
-            # persona depth. Falling back only happens BEFORE the first token —
-            # once we've streamed output we can't switch models.
-            tier = (
-                os.environ.get("INTERPREP_INTERVIEWER_TIER", "fast").strip() or "fast"
-            ) if req.mode == "interviewer" else "fast"
+            # persona depth. The copilot runs the "instant" tier (lite models,
+            # minimal thinking) — it answers a live interviewer, so time-to-
+            # first-word is the whole game. Falling back only happens BEFORE the
+            # first token — once we've streamed output we can't switch models.
+            if req.mode == "interviewer":
+                tier = os.environ.get("INTERPREP_INTERVIEWER_TIER", "fast").strip() or "fast"
+            elif req.mode == "copilot":
+                tier = "instant"
+            else:
+                tier = "fast"
+            max_tokens = COPILOT_MAX_TOKENS if req.mode == "copilot" else None
             # Cap time-to-first-token. A slow/unavailable candidate must NOT hang
             # the whole stream — the Rust SSE client waits up to 300s, so a dead
             # first candidate would stall the answer for minutes. If no token
@@ -219,11 +294,20 @@ async def chat_stream(req: ChatRequest):
             # next. Once tokens flow, there's no cap (a long answer is fine).
             ttft_timeout = float(os.environ.get("INTERPREP_TTFT_TIMEOUT", "12"))
             last_err: Exception | None = None
-            for model_name in llm_factory.candidate_models(req.llm, tier):
+            dead: set[str] = set()   # providers whose key was rejected
+            # Walk the chosen provider's models, then the fallback providers'
+            # (AI routing). Rejected keys skip the rest of that provider only.
+            for provider, model_name in llm_factory.routes_for(req.llm, tier):
+                if provider in dead:
+                    continue
                 started = False
+                usage = None
                 t0 = time.monotonic()
                 try:
-                    model = llm_factory.make_chat_model(req.llm, model_name, tier=tier)
+                    model = llm_factory.make_chat_model(
+                        req.llm, model_name, tier=tier, max_tokens=max_tokens,
+                        provider=provider,
+                    )
                     agen = model.astream(messages).__aiter__()
                     while True:
                         try:
@@ -247,14 +331,23 @@ async def chat_stream(req: ChatRequest):
                                 chunk = fut.result()
                         except StopAsyncIteration:
                             break
+                        usage = llm_factory.merge_usage(usage, chunk)
                         text = llm_factory.content_text(chunk)
                         if text:
                             if not started:
                                 print(f"[chat] {model_name} TTFT="
                                       f"{time.monotonic() - t0:.2f}s", flush=True)
+                                # Badge the answer when it isn't coming from
+                                # the provider the user chose (fallback /
+                                # stand-in) — only once tokens actually flow,
+                                # so failed attempts never flash a badge.
+                                route = llm_factory.route_event(req.llm, provider, model_name)
+                                if route:
+                                    yield {"data": json.dumps(route)}
                             started = True
                             yield {"data": json.dumps({"type": "token", "content": text})}
                             await asyncio.sleep(0)
+                    llm_factory.record_usage(model_name, usage)
                     yield {"data": json.dumps({"type": "done"})}
                     return
                 except asyncio.TimeoutError:
@@ -268,14 +361,13 @@ async def chat_stream(req: ChatRequest):
                         # Already mid-answer — surface the error, don't restart.
                         yield {"data": json.dumps({"type": "error", "content": str(exc)})}
                         return
-                    if llm_factory.is_auth_error(exc):
-                        # Bad key fails every candidate identically — stop now
-                        # with an actionable message instead of walking the list.
-                        yield {"data": json.dumps({
-                            "type": "error",
-                            "content": llm_factory.auth_error_message(req.llm),
-                        })}
-                        return
+                    if llm_factory.provider_down(exc):
+                        # A bad key / exhausted plan fails every model of this
+                        # provider the same way — skip them, but still try
+                        # fallback providers.
+                        dead.add(provider)
+                        last_err = RuntimeError(llm_factory.provider_down_message(req.llm, provider, exc))
+                        continue
                     # Model unavailable before any token — try the next one.
                     continue
 

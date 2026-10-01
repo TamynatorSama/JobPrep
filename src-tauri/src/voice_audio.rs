@@ -33,6 +33,11 @@ use wasapi::{
 
 const BUFFER_DURATION_HNS: i64 = 200_000;
 const POLL_MS: u32 = 100;
+// Gap filling (`capture_system_continuous`): wake every GAP_POLL_MS without
+// packets, and once the device is more than GAP_FILL_MS behind the wall clock,
+// feed the missing time as silence.
+const GAP_POLL_MS: u32 = 20;
+const GAP_FILL_MS: u64 = 60;
 
 // Streaming-TTS pre-roll: how many seconds of audio to buffer before playback
 // starts. A slower-than-real-time engine (e.g. VibeVoice on CPU) drains
@@ -676,10 +681,29 @@ enum CaptureSource {
     System,
 }
 
+/// Continuous system-audio capture for the copilot listener: like the question
+/// capture, but runs until `stop` (or `cb` returns `false`) and fills gaps with
+/// silence. Shared-mode loopback delivers NO packets while nothing is playing
+/// (a paused video, some meeting apps between speakers), so without the fill
+/// the trailing silence after a question would never reach the VAD.
+pub fn capture_system_continuous<F>(stop: &Arc<AtomicBool>, cb: F) -> Result<()>
+where
+    F: FnMut(&[f32], u32, f64) -> bool,
+{
+    capture_run(CaptureSource::System, stop, f64::INFINITY, true, cb)
+}
+
 /// Open the requested endpoint and feed mono f32 blocks to `cb` until it returns
 /// `false`, `stop` trips, or `max_secs` elapses. `cb(samples, sample_rate,
-/// block_ms)`.
-fn capture_run<F>(source: CaptureSource, stop: &Arc<AtomicBool>, max_secs: f64, mut cb: F) -> Result<()>
+/// block_ms)`. `fill_gaps`: when the device goes quiet without sending packets,
+/// feed zeros so `cb` sees wall-clock time pass.
+fn capture_run<F>(
+    source: CaptureSource,
+    stop: &Arc<AtomicBool>,
+    max_secs: f64,
+    fill_gaps: bool,
+    mut cb: F,
+) -> Result<()>
 where
     F: FnMut(&[f32], u32, f64) -> bool,
 {
@@ -715,14 +739,32 @@ where
 
     client.start_stream().context("failed to start capture stream")?;
     let start = Instant::now();
+    // Frames handed to `cb` so far, real or filled — compared against the wall
+    // clock to detect a packet drought.
+    let mut delivered: u64 = 0;
+    let gap_frames = (sample_rate as u64 * GAP_FILL_MS / 1000).max(1);
 
     'outer: loop {
         if stop.load(Ordering::SeqCst) || start.elapsed().as_secs_f64() > max_secs {
             break;
         }
-        match event.wait_for_event(POLL_MS) {
+        let wait_ms = if fill_gaps { GAP_POLL_MS } else { POLL_MS };
+        match event.wait_for_event(wait_ms) {
             Ok(()) => {}
-            Err(WasapiError::EventTimeout) => continue,
+            Err(WasapiError::EventTimeout) => {
+                if fill_gaps && sample_rate > 0 {
+                    let due = (start.elapsed().as_secs_f64() * sample_rate as f64) as u64;
+                    if due > delivered + gap_frames {
+                        let n = (due - delivered) as usize;
+                        let zeros = vec![0.0f32; n];
+                        delivered += n as u64;
+                        if !cb(&zeros, sample_rate, n as f64 / sample_rate as f64 * 1000.0) {
+                            break 'outer;
+                        }
+                    }
+                }
+                continue;
+            }
             Err(e) => return Err(e).context("capture event wait failed"),
         }
         loop {
@@ -742,6 +784,7 @@ where
                 .context("failed to read mic data")?;
             let used = frames as usize * block_align;
             let mono = packet_to_mono_f32(&scratch[..used], stype, bits, channels, info.flags.silent);
+            delivered += frames as u64;
             let block_ms = if sample_rate > 0 { frames as f64 / sample_rate as f64 * 1000.0 } else { 0.0 };
             if !cb(&mono, sample_rate, block_ms) {
                 break 'outer;
@@ -763,7 +806,7 @@ fn rms(samples: &[f32]) -> f32 {
 
 /// Loudness (RMS) + a cheap pitch proxy (zero-crossing rate, ~0..1). Drives the
 /// orb: RMS → size, ZCR → hue/morph. No FFT needed.
-fn level_of(samples: &[f32]) -> (f32, f32) {
+pub fn level_of(samples: &[f32]) -> (f32, f32) {
     if samples.is_empty() {
         return (0.0, 0.0);
     }
@@ -786,7 +829,7 @@ fn level_of(samples: &[f32]) -> (f32, f32) {
 /// speech for `BARGE_SPEECH_MS`. Stops when `stop` is set.
 pub fn wait_for_speech(stop: &Arc<AtomicBool>, detected: &Arc<AtomicBool>) -> Result<()> {
     let mut voiced_ms = 0.0;
-    capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, |mono, _sr, block_ms| {
+    capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, false, |mono, _sr, block_ms| {
         if rms(mono) >= SPEECH_RMS {
             voiced_ms += block_ms;
             if voiced_ms >= BARGE_SPEECH_MS {
@@ -824,7 +867,7 @@ pub fn record_answer(
     let mut moonshine_buf: Vec<f32> = Vec::new();
     let mut last_moonshine_submit_ms = 0.0f64;
 
-    capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, |mono, sample_rate, block_ms| {
+    capture_run(CaptureSource::Mic, stop, MAX_ANSWER_S, false, |mono, sample_rate, block_ms| {
         // Manual "transcribe now" (button / hotkey): end capture immediately and
         // keep what we have — unlike `stop`, which the caller treats as cancel.
         if finish.load(Ordering::SeqCst) {
@@ -985,7 +1028,7 @@ pub fn record_question(
         }
     }
 
-    capture_run(CaptureSource::System, stop, Q_MAX_QUESTION_S, |mono, sample_rate, block_ms| {
+    capture_run(CaptureSource::System, stop, Q_MAX_QUESTION_S, false, |mono, sample_rate, block_ms| {
         // Manual "transcribe now" (button / hotkey): end capture immediately,
         // bypassing the silence detector the user is overriding.
         if finish.load(Ordering::SeqCst) {

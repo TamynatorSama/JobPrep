@@ -52,6 +52,7 @@ const EV_ERROR:           &str = "chat:error";
 const EV_SCORECARD:       &str = "chat:scorecard";       // application-tailor ATS scorecard JSON
 const EV_RESUME_DOCX:     &str = "chat:resume_docx";     // base64-encoded .docx bytes
 const EV_TAILORED_RESUME: &str = "chat:tailored_resume"; // plain-text tailored resume
+const EV_ROUTE:           &str = "chat:route";           // answer came from a fallback / stand-in provider (badge)
 
 /// Emit one stream event to the frontend, tagged with the originating
 /// `stream_id` so several concurrent streams can be told apart. Payload:
@@ -62,8 +63,8 @@ fn emit_ev(app: &AppHandle, event: &str, stream_id: &str, content: Value) -> tau
 
 /// Sends a chat message and forwards the resulting SSE stream to the
 /// frontend. Runs on its own thread so the Tauri command returns instantly.
-/// `llm` is the provider config (Settings toggle + per-provider keys) built
-/// by `Credentials::llm_json`.
+/// `llm` is the provider config for the calling feature, built by
+/// `ai_routing::llm_for` (AI routing + per-provider keys).
 #[allow(clippy::too_many_arguments)]
 pub fn stream_chat(
     app: AppHandle,
@@ -284,6 +285,28 @@ pub fn timeline_ack(base_url: &str, token: &str, ids: Vec<String>) -> Result<(),
 /// POST /cheatsheet/build — aggregate a job's context into a structured
 /// interview cheatsheet (+ maintained markdown). Non-streaming JSON; the LLM
 /// call can be slow on the smart tier, so allow a generous timeout.
+/// GET a sidecar JSON endpoint (`path` starts with "/").
+pub fn get_json(base_url: &str, path: &str, timeout_s: u64) -> Result<Value, String> {
+    reqwest::blocking::Client::new()
+        .get(format!("{base_url}{path}"))
+        .timeout(std::time::Duration::from_secs(timeout_s))
+        .send()
+        .and_then(|r| r.json::<Value>())
+        .map_err(|e| e.to_string())
+}
+
+/// POST JSON to a sidecar endpoint and return its JSON reply. An `error` field
+/// in the reply is left for the caller (Settings shows it inline).
+pub fn post_json(base_url: &str, path: &str, body: &Value, timeout_s: u64) -> Result<Value, String> {
+    reqwest::blocking::Client::new()
+        .post(format!("{base_url}{path}"))
+        .json(body)
+        .timeout(std::time::Duration::from_secs(timeout_s))
+        .send()
+        .and_then(|r| r.json::<Value>())
+        .map_err(|e| e.to_string())
+}
+
 pub fn build_cheatsheet(base_url: &str, payload: Value) -> Result<Value, String> {
     let client = reqwest::blocking::Client::new();
     let resp: Value = client
@@ -451,6 +474,17 @@ impl VoiceSttStreamClient {
     }
 }
 
+/// POST /voice/asr/warm — load + warm faster-whisper in the sidecar's
+/// background. Returns immediately; progress is `stt_phase` in /voice/status.
+pub fn speech_warm(base_url: &str) -> Result<(), String> {
+    reqwest::blocking::Client::new()
+        .post(format!("{base_url}/voice/asr/warm"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// POST /voice/warm — kick the engine's cold-start warmup. Returns once the
 /// request is accepted; the warmup proceeds on the sidecar in the background.
 pub fn voice_warm(base_url: &str, engine: &str, speaker: &str) -> Result<(), String> {
@@ -490,14 +524,37 @@ pub fn voice_prepare(
         .map_err(|e| e.to_string())
 }
 
+/// Stream ids whose reader should stop. Checked after every SSE line, so a
+/// cancelled stream closes its connection (the sidecar then stops generating)
+/// as soon as its next event arrives — typically within one token.
+static CANCELLED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn cancelled() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    CANCELLED.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Stop a running `spawn_stream` without emitting `done`/`error` for it. No-op
+/// for a stream that already finished.
+pub fn cancel_stream(stream_id: &str) {
+    cancelled().insert(stream_id.to_string());
+}
+
 fn spawn_stream(app: AppHandle, url: String, body: Value, stream_id: String) {
     std::thread::spawn(move || {
-        let sid = stream_id.as_str();
+        run_stream(&app, &url, &body, &stream_id);
+        // Forget a cancel that arrived for this id, whether or not it landed.
+        cancelled().remove(&stream_id);
+    });
+}
+
+fn run_stream(app: &AppHandle, url: &str, body: &Value, sid: &str) {
+    {
         eprintln!("[stream {sid}] POST {url}");
         let client = reqwest::blocking::Client::new();
         let resp = match client
-            .post(&url)
-            .json(&body)
+            .post(url)
+            .json(body)
             .timeout(std::time::Duration::from_secs(300))
             .send()
         {
@@ -526,6 +583,10 @@ fn spawn_stream(app: AppHandle, url: String, body: Value, stream_id: String) {
                     return;
                 }
             };
+            if cancelled().contains(sid) {
+                eprintln!("[stream {sid}] cancelled");
+                return; // dropping the response closes the connection
+            }
             if line.is_empty() {
                 continue;
             }
@@ -569,6 +630,10 @@ fn spawn_stream(app: AppHandle, url: String, body: Value, stream_id: String) {
                     // Forward the JSON object as-is so the frontend can format it.
                     let _ = emit_ev(&app, EV_SCORECARD, sid, val["content"].clone());
                 }
+                Some("route") => {
+                    // {provider, providerLabel, model, fallback, substitutedFrom, feature}
+                    let _ = emit_ev(&app, EV_ROUTE, sid, val["content"].clone());
+                }
                 Some("resume_docx") => {
                     if let Some(b64) = val["content"].as_str() {
                         let _ = emit_ev(&app, EV_RESUME_DOCX, sid, Value::String(b64.to_string()));
@@ -594,5 +659,5 @@ fn spawn_stream(app: AppHandle, url: String, body: Value, stream_id: String) {
 
         // Server closed the stream without an explicit `done`.
         let _ = emit_ev(&app, EV_DONE, sid, Value::Null);
-    });
+    }
 }

@@ -22,32 +22,32 @@ from sse_starlette.sse import EventSourceResponse
 
 import llm_provider as llm_factory
 from models import CompanyResearchRequest, LLMConfig
-from research_scraper import research_events
+
+# The research engine (research_scraper + its LangGraph graph) costs ~2s+ of
+# cold import, so it loads on the first research request, not at sidecar boot.
 # research_scraper installs its modules top-level (editable install); `runtime`
 # is its per-request override contextvar — the same module the engine reads,
 # so wrapping the stream in `overrides(...)` configures the LLM router lanes.
-from runtime import overrides as engine_overrides
 
 router = APIRouter()
 
 # Selected provider → the OpenAI-compatible "custom" lane of the engine's
-# router (base_url, key getter, default model). Anthropic rides its official
-# OpenAI-compatibility endpoint because the engine only speaks that protocol.
+# router (base_url, key getter). The lane's model is the registry's fast-tier
+# pick (llm_provider._MODELS), so a model refresh there reaches research too.
+# Anthropic rides its official OpenAI-compatibility endpoint because the engine
+# only speaks that protocol.
 _CUSTOM_LANES = {
     "gemini": (
         "https://generativelanguage.googleapis.com/v1beta/openai",
         lambda c: c.gemini_api_key,
-        "gemini-2.5-flash",
     ),
     "openai": (
         "https://api.openai.com/v1",
         lambda c: c.openai_api_key,
-        "gpt-4o-mini",
     ),
     "anthropic": (
         "https://api.anthropic.com/v1",
         lambda c: c.anthropic_api_key,
-        "claude-haiku-4-5",
     ),
 }
 
@@ -58,12 +58,12 @@ def _engine_overrides(cfg: LLMConfig) -> dict:
     p = llm_factory.provider_of(cfg)
 
     if p in _CUSTOM_LANES:
-        base_url, key_of, default_model = _CUSTOM_LANES[p]
+        base_url, key_of = _CUSTOM_LANES[p]
         key = key_of(cfg)
         if key:
             kw["llm_base_url"] = base_url
             kw["llm_api_key"] = key
-            kw["llm_model"] = cfg.model.strip() or default_model
+            kw["llm_model"] = cfg.model.strip() or llm_factory.default_model(p, "fast")
 
     # The spare gemini key becomes a fallback lane and also powers the
     # Google Search grounding source.
@@ -95,6 +95,8 @@ async def company_research_stream(req: CompanyResearchRequest):
             return
 
         try:
+            from research_scraper import research_events
+            from runtime import overrides as engine_overrides
             with engine_overrides(**_engine_overrides(cfg)):
                 async for ev in research_events(
                     req.company,

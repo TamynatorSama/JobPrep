@@ -67,6 +67,14 @@ pub struct CopilotContextState {
     inner: std::sync::Mutex<CopilotContext>,
 }
 
+impl CopilotContextState {
+    /// The system-prompt block for the active job (what the overlay sends as
+    /// `jobContext`), for answers started from Rust.
+    pub fn context(&self) -> String {
+        self.inner.lock().unwrap().context.clone()
+    }
+}
+
 /// Mirror the active job's research context + cheatsheet from the main window.
 /// Called whenever the selected job (or its research / resume / cheatsheet)
 /// changes.
@@ -210,6 +218,7 @@ fn harden_new(window: &tauri::WebviewWindow) {
     let hwnd = HWND(raw.0 as _);
     set_overlay_styles(hwnd);
     let ptr = hwnd.0 as isize;
+    let win = window.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let h = HWND(ptr as _);
@@ -218,7 +227,41 @@ fn harden_new(window: &tauri::WebviewWindow) {
         if mode != "excluded" {
             eprintln!("[copilot] cloak degraded: mode={mode}");
         }
+        // After first paint too: settings changes don't touch the compositing
+        // path, but there's no reason to race WebView2's init with them.
+        lock_down_webview(&win);
     });
+}
+
+/// Turn off every browser-drawn popup on the overlay. Native tooltips, the
+/// right-click menu, autofill/password dropdowns, the link status bubble, and
+/// accelerator UIs (Ctrl+F find bar, Ctrl+P print dialog) are each their own
+/// top-level window — NOT children of the cloaked HWND — so display affinity
+/// doesn't hide them and they would show on a screen share. Settings persist
+/// for the webview's lifetime, so this runs once per window. Editing keys
+/// (Ctrl+C/V/A/Z) are not browser accelerators and keep working. Best-effort.
+#[cfg(windows)]
+fn lock_down_webview(window: &tauri::WebviewWindow) {
+    let res = window.with_webview(|wv| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2Settings3, ICoreWebView2Settings4,
+        };
+        use windows_core_61::Interface;
+        let Ok(core) = wv.controller().CoreWebView2() else { return };
+        let Ok(settings) = core.Settings() else { return };
+        let _ = settings.SetAreDefaultContextMenusEnabled(false);
+        let _ = settings.SetIsStatusBarEnabled(false);
+        if let Ok(s3) = settings.cast::<ICoreWebView2Settings3>() {
+            let _ = s3.SetAreBrowserAcceleratorKeysEnabled(false);
+        }
+        if let Ok(s4) = settings.cast::<ICoreWebView2Settings4>() {
+            let _ = s4.SetIsGeneralAutofillEnabled(false);
+            let _ = s4.SetIsPasswordAutosaveEnabled(false);
+        }
+    });
+    if let Err(e) = res {
+        eprintln!("[copilot] webview lock-down failed: {e}");
+    }
 }
 
 /// Re-cloak an EXISTING overlay on re-show. It has already completed its first

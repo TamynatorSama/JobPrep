@@ -8,17 +8,35 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class FallbackRoute(BaseModel):
+    """A provider to try when the primary one fails before its first token.
+    `model` empty = that provider's registry models for the request's tier."""
+    provider: str
+    model: str = ""
+
+
 class LLMConfig(BaseModel):
     """Which LLM powers a request, plus the keys for every provider the user
-    has configured. The Rust shell builds this from Windows Credential Manager
-    and attaches it to every request; `provider` is the Settings toggle.
-    Spare keys ride along so company research can use them as fallback lanes
-    and RAG can pick an embeddings-capable provider."""
+    has configured. The Rust shell builds this per request from Windows
+    Credential Manager + the AI routing settings (ai_routing.rs `llm_for`), for
+    the app feature making the call. Spare keys ride along so fallbacks and
+    company research's extra lanes can use them, and RAG can pick an
+    embeddings-capable provider."""
     provider: str = "gemini"      # gemini | openai | anthropic
     model: str = ""               # optional model override for the selected provider
     gemini_api_key: str = ""
     openai_api_key: str = ""
     anthropic_api_key: str = ""
+    # ── AI routing (Phase 0b) ─────────────────────────────────────────────
+    feature: str = ""             # copilot | coach | interview | resume_tailor | ...
+    fallbacks: List[FallbackRoute] = []
+    # The provider the user picked when it can't serve this feature (not
+    # connected / unsupported) and `provider` is a stand-in — the UI badges it.
+    substituted_from: str = ""
+    embeddings_provider: str = "" # "" = auto, else gemini | openai
+    # Sign in with ChatGPT: a 1-hour access token for the user's ChatGPT plan
+    # (provider "chatgpt"), minted/refreshed by Rust. Empty when not in use.
+    chatgpt_access_token: str = ""
 
 
 class RagDoc(BaseModel):
@@ -35,8 +53,10 @@ class ChatRequest(BaseModel):
     llm: LLMConfig = LLMConfig()
     # Prior conversation turns, oldest first. Empty for the first message.
     history: List[ChatMessage] = []
-    # "coach" (default, friendly assistant) or "interviewer" (in-character live interview).
-    mode: Literal["coach", "interviewer"] = "coach"
+    # "coach" (default, friendly assistant), "interviewer" (in-character live
+    # interview), or "copilot" (stealth overlay: short, speakable, plain-text
+    # answers on the lowest-latency model tier).
+    mode: Literal["coach", "interviewer", "copilot"] = "coach"
     # The job's corpus (resume, company research, sibling chats) for RAG. The
     # backend embeds + retrieves the most relevant chunks per message. Empty
     # disables retrieval.

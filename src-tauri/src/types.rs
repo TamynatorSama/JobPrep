@@ -48,6 +48,11 @@ pub struct ChatMsg {
     /// Sent to the backend but not rendered (e.g. the Mock Interview kickoff).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden: Option<bool>,
+    /// Set when the reply came from a provider other than the one picked in
+    /// AI routing (fallback / stand-in) — the backend's `route` event, shown as
+    /// a "via X · fallback" badge. Opaque here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -38,9 +38,15 @@ async def _warm_llm_channel() -> None:
     _warmed = True
     try:
         import time
+        from routes.chat import COPILOT_MAX_TOKENS
+        llm_factory.set_feature("warmup")
         t0 = time.time()
+        # Same tier/temperature/max_tokens as a copilot answer, so this builds
+        # and caches the EXACT client the first live question will reuse (the
+        # factory caches models by those params) — connection already open.
         await llm_factory.generate_raw(cfg, "Reply with the single word: ok",
-                                       tier="fast", temperature=0.0)
+                                       tier="instant", temperature=None,
+                                       max_tokens=COPILOT_MAX_TOKENS)
         print(f"[bridge] LLM channel warmed in {time.time() - t0:.1f}s", flush=True)
     except Exception as exc:  # warmup is best-effort, never a failure surface
         _warmed = False

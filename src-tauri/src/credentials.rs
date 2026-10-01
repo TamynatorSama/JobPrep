@@ -62,21 +62,8 @@ impl Credentials {
         Ok(())
     }
 
-    /// The `llm` payload attached to every backend request (snake_case to
-    /// match the Python `LLMConfig` pydantic model).
-    pub fn llm_json(&self) -> serde_json::Value {
-        let provider = if self.llm_provider.trim().is_empty() {
-            "gemini"
-        } else {
-            self.llm_provider.trim()
-        };
-        serde_json::json!({
-            "provider":          provider,
-            "gemini_api_key":    self.gemini_api_key,
-            "openai_api_key":    self.openai_api_key,
-            "anthropic_api_key": self.anthropic_api_key,
-        })
-    }
+    // The per-request `llm` payload is built by `ai_routing::llm_for(feature)`,
+    // which layers the AI routing settings over these keys.
 }
 
 fn entry(field: &str) -> Option<keyring::Entry> {
@@ -89,7 +76,7 @@ fn entry(field: &str) -> Option<keyring::Entry> {
     }
 }
 
-fn get(field: &str) -> String {
+pub(crate) fn get(field: &str) -> String {
     let Some(entry) = entry(field) else { return String::new(); };
     match entry.get_password() {
         Ok(value) => value,
@@ -101,7 +88,7 @@ fn get(field: &str) -> String {
     }
 }
 
-fn set(field: &str, value: &str) -> Result<(), String> {
+pub(crate) fn set(field: &str, value: &str) -> Result<(), String> {
     let Some(entry) = entry(field) else {
         return Err(format!("cannot open keyring entry for {field}"));
     };

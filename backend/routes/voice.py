@@ -127,6 +127,22 @@ class SttStreamSessionRequest(BaseModel):
     session_id: str
 
 
+class AsrChunkRequest(BaseModel):
+    session_id: str
+    # RAW little-endian mono PCM16 at 16 kHz (Rust resamples). May be empty
+    # when the call only carries `decode`.
+    audio_b64: str = ""
+    # Rust's VAD saw a pause: decode everything received so far right away.
+    decode: bool = False
+
+
+class AsrSnapshotRequest(BaseModel):
+    session_id: str
+    # Samples (16 kHz, from session start) up to the last voiced frame; any
+    # decode covering at least this much audio is reused.
+    upto_samples: int = 0
+
+
 # ── lazy singletons ──────────────────────────────────────────────────────────
 _lock = threading.Lock()
 # Serializes VibeVoice synth. One model on one GPU can't run two generate() calls
@@ -137,6 +153,9 @@ _synth_lock = threading.Lock()
 # Serializes prepare() — see its docstring. Distinct from _lock (model loads)
 # and _synth_lock (vibe synth) so a long warm doesn't block unrelated paths.
 _prepare_lock = threading.Lock()
+# One faster-whisper decode at a time: the warmup, /voice/stt and the copilot's
+# streaming sessions all share one WhisperModel.
+_stt_infer_lock = threading.Lock()
 _state = {
     "device": None,         # "cuda" | "cpu"
     "piper": None,          # PiperVoice (fast default engine)
@@ -144,6 +163,9 @@ _state = {
     "stt": None,            # faster-whisper WhisperModel
     "moonshine": None,      # shared Moonshine Transcriber (per-turn streams)
     "moonshine_warm": False,
+    # faster-whisper readiness for /voice/status (the copilot overlay shows it):
+    # "idle" → "loading" → "warming" → "ready", or "error".
+    "stt_phase": "idle",
     "import_error": None,   # str if torch/models can't be imported
     "vibe_model": None,     # VibeVoiceStreamingForConditionalGenerationInference
     "vibe_proc": None,      # VibeVoiceStreamingProcessor
@@ -461,13 +483,24 @@ def _pin_torch_cudnn() -> None:
     mid-synth ("Could not load symbol cudnnGetLibConfig. Error code 127" —
     kills the whole sidecar, observed 2026-07-07). Loading torch's complete
     cuDNN set first makes the loader dedupe by module name so both libraries
-    share the good copies. Best-effort no-op when torch isn't installed."""
+    share the good copies. Best-effort no-op when torch isn't installed.
+
+    Finds torch's lib dir WITHOUT importing torch: the import costs tens of
+    seconds on a cold boot and the copilot's speech path never needs it."""
     try:
         import ctypes
         import glob as _glob
+        import importlib.util
         import os as _os
-        import torch
-        lib = _os.path.join(_os.path.dirname(torch.__file__), "lib")
+        spec = importlib.util.find_spec("torch")
+        if spec is None or not spec.submodule_search_locations:
+            return
+        lib = _os.path.join(list(spec.submodule_search_locations)[0], "lib")
+        if not _os.path.isdir(lib):
+            return
+        # Same search path torch registers on import, so the cuDNN DLLs'
+        # own dependencies (cuBLAS etc.) resolve from torch's copies too.
+        _state["torch_dll_dir"] = _os.add_dll_directory(lib)
         for dll in sorted(_glob.glob(_os.path.join(lib, "cudnn*.dll"))):
             try:
                 ctypes.WinDLL(dll)
@@ -477,6 +510,17 @@ def _pin_torch_cudnn() -> None:
         pass
 
 
+def _stt_device() -> str:
+    """CUDA when CTranslate2 (faster-whisper's backend) sees a GPU. Asked of
+    CTranslate2 rather than torch (`_device`) so loading speech recognition
+    never imports torch."""
+    try:
+        import ctranslate2
+        return "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+    except Exception:
+        return "cpu"
+
+
 def _get_stt():
     """Load faster-whisper once, on the auto-detected device."""
     if _state["stt"] is not None:
@@ -484,33 +528,41 @@ def _get_stt():
     with _lock:
         if _state["stt"] is None:
             import os
-            _pin_torch_cudnn()  # MUST precede the ctranslate2 import below
-            from faster_whisper import WhisperModel
-            # STT runs on the GPU when one exists — ~4× faster decode, which is
-            # the biggest chunk of question→answer latency on CPU (~3s for a
-            # long question vs <1s on GPU). Historical note: this used to
-            # default to CPU because loading whisper alongside VibeVoice
-            # "froze the app" — that freeze was actually the cuDNN DLL clash
-            # fixed in _pin_torch_cudnn (both stacks now verified coexisting on
-            # one GPU), and in practice the capture→STT→LLM→TTS cycle is
-            # sequential so they don't contend per-turn anyway. Force with
-            # INTERPREP_STT_DEVICE=cpu|cuda if a specific box misbehaves.
-            device = os.environ.get("INTERPREP_STT_DEVICE", "auto").strip().lower()
-            if device not in ("cpu", "cuda"):
-                device = _device()  # auto: cuda when available
-            if device == "cuda" and _device() != "cuda":
-                device = "cpu"
-            compute = "float16" if device == "cuda" else "int8"
-            # English-only "base.en" — faster AND more accurate than multilingual
-            # "base" for English interviews. Override with INTERPREP_STT_MODEL
-            # (e.g. "tiny.en" for max speed, "small.en" if transcripts are weak).
-            model_name = os.environ.get("INTERPREP_STT_MODEL", "base.en")
+            _state["stt_phase"] = "loading"
             t0 = time.time()
-            _state["stt"] = WhisperModel(
-                model_name, device=device, compute_type=compute, cpu_threads=0,
-            )
+            try:
+                _pin_torch_cudnn()  # MUST precede the ctranslate2 import below
+                from faster_whisper import WhisperModel
+                # STT runs on the GPU when one exists — ~4× faster decode, which is
+                # the biggest chunk of question→answer latency on CPU (~3s for a
+                # long question vs <1s on GPU). Historical note: this used to
+                # default to CPU because loading whisper alongside VibeVoice
+                # "froze the app" — that freeze was actually the cuDNN DLL clash
+                # fixed in _pin_torch_cudnn (both stacks now verified coexisting on
+                # one GPU), and in practice the capture→STT→LLM→TTS cycle is
+                # sequential so they don't contend per-turn anyway. Force with
+                # INTERPREP_STT_DEVICE=cpu|cuda if a specific box misbehaves.
+                device = os.environ.get("INTERPREP_STT_DEVICE", "auto").strip().lower()
+                if device not in ("cpu", "cuda"):
+                    device = _stt_device()  # auto: cuda when available
+                if device == "cuda" and _stt_device() != "cuda":
+                    device = "cpu"
+                compute = "float16" if device == "cuda" else "int8"
+                # English-only "base.en" — faster AND more accurate than multilingual
+                # "base" for English interviews. Override with INTERPREP_STT_MODEL
+                # (e.g. "tiny.en" for max speed, "small.en" if transcripts are weak).
+                model_name = os.environ.get("INTERPREP_STT_MODEL", "base.en")
+                _state["stt"] = WhisperModel(
+                    model_name, device=device, compute_type=compute, cpu_threads=0,
+                )
+            except Exception:
+                _state["stt_phase"] = "error"
+                raise
+            _state["stt_device"] = device
+            if not _state.get("stt_warm"):
+                _state["stt_phase"] = "loaded"
             print(f"[voice] STT loaded: model={model_name} device={device} "
-                  f"({time.time() - t0:.1f}s)", flush=True)
+                  f"({time.time() - t0:.1f}s incl. imports)", flush=True)
     return _state["stt"]
 
 
@@ -679,6 +731,140 @@ def _moonshine_finish(session_id: str, cancel: bool = False) -> str:
     return session.finish()
 
 
+# ── Copilot streaming ASR (faster-whisper sessions) ──────────────────────────
+# The copilot's Rust capture loop streams the interviewer's audio here as raw
+# 16 kHz PCM16 while they talk (Rust runs Silero VAD, so a session only ever
+# holds one question). Whisper re-decodes the growing buffer in the background
+# for live partials, and again the moment Rust reports a pause — so when the
+# endpoint fires ~150 ms later the transcript is usually already decoded and
+# `snapshot` returns it without touching the GPU. A warm base.en decode is
+# ~60 ms on a laptop GPU; the old batch path (WAV + PyAV decode + HTTP) was
+# ~375 ms of dead air after every question.
+ASR_SR = 16000
+ASR_PARTIAL_EVERY_S = 0.7   # new audio between background partial decodes
+ASR_MIN_DECODE_S = 0.4      # too little audio to be worth a partial
+ASR_MAX_S = 45.0            # Rust caps a question at 28 s; slack for preroll
+ASR_SESSION_TTL_S = 120.0
+_asr_pool = None            # one worker = one GPU decode at a time, FIFO
+_asr_pool_lock = threading.Lock()
+_asr_sessions_lock = threading.Lock()
+_asr_sessions: dict[str, "_AsrSession"] = {}
+
+
+def _asr_executor():
+    global _asr_pool
+    with _asr_pool_lock:
+        if _asr_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _asr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
+        return _asr_pool
+
+
+def _decode_pcm(audio) -> str:
+    """One greedy decode of 16 kHz float32 audio (same settings as
+    `_transcribe`, minus WAV parsing and timestamps)."""
+    model = _get_stt()
+    with _stt_infer_lock:
+        segments, _info = model.transcribe(
+            audio, beam_size=1, vad_filter=True, language="en",
+            condition_on_previous_text=False, temperature=0.0,
+            without_timestamps=True,
+        )
+        return "".join(seg.text for seg in segments).strip()
+
+
+class _AsrSession:
+    """One interviewer question. `partial` is the newest finished decode and
+    `partial_samples` how much audio it covered; decodes run on the shared
+    one-thread pool, newest-wins."""
+
+    def __init__(self):
+        import numpy as np
+        self.lock = threading.Lock()
+        self.audio = np.zeros(0, dtype=np.float32)
+        self.partial = ""
+        self.partial_samples = 0
+        self.pending = None          # Future of the newest scheduled decode
+        self.pending_samples = 0
+        self.touched = time.monotonic()
+
+    def append(self, pcm: bytes) -> None:
+        import numpy as np
+        if not pcm:
+            return
+        chunk = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        with self.lock:
+            room = int(ASR_MAX_S * ASR_SR) - self.audio.size
+            if room > 0:
+                self.audio = np.concatenate([self.audio, chunk[:room]])
+            self.touched = time.monotonic()
+
+    def _busy(self) -> bool:
+        return self.pending is not None and not self.pending.done()
+
+    def _schedule(self):
+        """Queue a decode of everything received so far. Caller holds lock."""
+        audio, n = self.audio, self.audio.size   # arrays are only ever replaced
+        fut = _asr_executor().submit(self._run, audio, n)
+        self.pending, self.pending_samples = fut, n
+        return fut
+
+    def _run(self, audio, n: int) -> str:
+        text = _decode_pcm(audio)
+        with self.lock:
+            if n >= self.partial_samples:
+                self.partial, self.partial_samples = text, n
+        return text
+
+    def poke(self, force: bool) -> None:
+        """`force` (Rust saw a pause) decodes now unless a decode already
+        covers every sample; otherwise refresh the partial every
+        ASR_PARTIAL_EVERY_S of new audio, never stacking background decodes."""
+        with self.lock:
+            n = self.audio.size
+            if n < ASR_MIN_DECODE_S * ASR_SR:
+                return
+            if force:
+                if not (self._busy() and self.pending_samples >= n) and self.partial_samples < n:
+                    self._schedule()
+                return
+            if not self._busy() and n - self.partial_samples >= ASR_PARTIAL_EVERY_S * ASR_SR:
+                self._schedule()
+
+    def state(self) -> dict:
+        with self.lock:
+            return {"partial": self.partial, "partial_samples": self.partial_samples,
+                    "samples": int(self.audio.size)}
+
+    def snapshot(self, upto: int) -> tuple[str, bool]:
+        """Transcript covering at least `upto` samples (the last voiced sample
+        Rust saw). Reuses a finished or in-flight decode when one covers it."""
+        with self.lock:
+            upto = min(max(upto, 1), self.audio.size)
+            if self.partial_samples >= upto:
+                return self.partial, True
+            if self.pending is not None and self.pending_samples >= upto:
+                fut, reused = self.pending, True
+            else:
+                fut, reused = self._schedule(), False
+        return fut.result(timeout=30), reused
+
+
+def _asr_session(session_id: str) -> _AsrSession:
+    with _asr_sessions_lock:
+        session = _asr_sessions.get(session_id)
+    if session is None:
+        raise ValueError("unknown or expired ASR session")
+    return session
+
+
+def _evict_stale_asr_sessions() -> None:
+    cutoff = time.monotonic() - ASR_SESSION_TTL_S
+    with _asr_sessions_lock:
+        for sid in [s for s, sess in _asr_sessions.items() if sess.touched < cutoff]:
+            _asr_sessions.pop(sid, None)
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     """Wrap raw 16-bit mono PCM bytes in a WAV container."""
@@ -744,12 +930,13 @@ def _transcribe(wav_bytes: bytes) -> str:
     # (observed 6.7s for one question). A single greedy pass on interview speech
     # is accurate enough, and latency here is user-facing dead air.
     t0 = time.time()
-    segments, _info = model.transcribe(
-        io.BytesIO(wav_bytes), beam_size=1, vad_filter=True,
-        language="en", condition_on_previous_text=False,
-        temperature=0.0,
-    )
-    text = "".join(seg.text for seg in segments).strip()
+    with _stt_infer_lock:
+        segments, _info = model.transcribe(
+            io.BytesIO(wav_bytes), beam_size=1, vad_filter=True,
+            language="en", condition_on_previous_text=False,
+            temperature=0.0,
+        )
+        text = "".join(seg.text for seg in segments).strip()
     print(f"[voice] STT transcribe: {time.time() - t0:.2f}s, {len(text)} chars", flush=True)
     return text
 
@@ -762,24 +949,34 @@ def _warm_stt() -> None:
     vad=True then loads the silero VAD model real transcribes use. Raises on
     failure so the caller can report it."""
     import numpy as np
-    model = _get_stt()
+    try:
+        model = _get_stt()
+    except Exception:
+        _state["stt_phase"] = "error"
+        raise
     if _state.get("stt_warm"):
         return
+    _state["stt_phase"] = "warming"
     t0 = time.time()
     warm = (np.random.randn(16000 * 2).astype(np.float32) * 0.02).clip(-1, 1)
     warm_wav = _pcm16_to_wav((warm * 32767.0).astype("<i2").tobytes(), 16000)
-    list(model.transcribe(io.BytesIO(warm_wav), beam_size=1)[0])
-    list(model.transcribe(io.BytesIO(warm_wav), beam_size=1, vad_filter=True)[0])
-    # ALSO warm on a long buffer: on CUDA the kernels are shape-tuned on first
-    # use, so a warmup that only ever saw a 2s clip leaves the FIRST real long
-    # question (30-60s captures are common) paying several seconds of one-time
-    # autotune right when the user is waiting. ~40s of low noise covers the
-    # long-shape path; vad_filter skips most of the decode so this stays cheap.
-    warm_long = (np.random.randn(16000 * 40).astype(np.float32) * 0.02).clip(-1, 1)
-    long_wav = _pcm16_to_wav((warm_long * 32767.0).astype("<i2").tobytes(), 16000)
-    list(model.transcribe(io.BytesIO(long_wav), beam_size=1, vad_filter=True,
-                          language="en", condition_on_previous_text=False)[0])
+    with _stt_infer_lock:
+        list(model.transcribe(io.BytesIO(warm_wav), beam_size=1)[0])
+        list(model.transcribe(io.BytesIO(warm_wav), beam_size=1, vad_filter=True)[0])
+        # The copilot's streaming path: raw float32 in, no timestamps.
+        list(model.transcribe(warm, beam_size=1, language="en",
+                              without_timestamps=True)[0])
+        # ALSO warm on a long buffer: on CUDA the kernels are shape-tuned on first
+        # use, so a warmup that only ever saw a 2s clip leaves the FIRST real long
+        # question (30-60s captures are common) paying several seconds of one-time
+        # autotune right when the user is waiting. ~40s of low noise covers the
+        # long-shape path; vad_filter skips most of the decode so this stays cheap.
+        warm_long = (np.random.randn(16000 * 40).astype(np.float32) * 0.02).clip(-1, 1)
+        long_wav = _pcm16_to_wav((warm_long * 32767.0).astype("<i2").tobytes(), 16000)
+        list(model.transcribe(io.BytesIO(long_wav), beam_size=1, vad_filter=True,
+                              language="en", condition_on_previous_text=False)[0])
     _state["stt_warm"] = True
+    _state["stt_phase"] = "ready"
     print(f"[voice] STT warmed in {time.time() - t0:.1f}s", flush=True)
 
 
@@ -897,7 +1094,10 @@ async def status():
     VibeVoice voice can be toggled on. `voices` lists the panelist presets the UI
     can assign. The UI shows device so the user knows if they're on GPU (live) or
     CPU (laggy)."""
-    device = _device()
+    # Prefer what's already known; detecting via torch (`_device`) would block
+    # the event loop on a cold torch import every time the overlay polls.
+    device = _state["device"] or _state.get("stt_device") \
+        or await asyncio.to_thread(_stt_device)
     detail = _state["import_error"]
     try:
         import importlib.util
@@ -930,6 +1130,8 @@ async def status():
         "default_speaker": VIBE_DEFAULT_SPEAKER,
         "tts_loaded": (_state["piper"] is not None) or (_state["vibe_model"] is not None),
         "stt_loaded": _state["stt"] is not None,
+        "stt_phase": _state["stt_phase"],
+        "stt_device": _state.get("stt_device"),
         "moonshine_loaded": _state["moonshine"] is not None,
         "detail": detail,
     }
@@ -1056,6 +1258,67 @@ async def stt_stream_cancel(req: SttStreamSessionRequest):
     except Exception:
         pass
     return {"cancelled": True}
+
+
+@router.post("/asr/warm")
+async def asr_warm():
+    """Load + warm faster-whisper in the background (Rust calls this once the
+    sidecar is up, so the copilot never meets a cold recognizer). Progress is
+    `stt_phase` in /voice/status."""
+    if not _state.get("stt_warm") and _state["stt_phase"] not in ("loading", "warming"):
+        def run():
+            try:
+                with _prepare_lock:
+                    _warm_stt()
+            except Exception as exc:
+                print(f"[voice] STT warm failed: {exc}", flush=True)
+        threading.Thread(target=run, daemon=True).start()
+    return {"stt_phase": _state["stt_phase"]}
+
+
+@router.post("/asr/start")
+async def asr_start():
+    """Open a streaming-transcription session for one copilot question."""
+    _evict_stale_asr_sessions()
+    session_id = uuid.uuid4().hex
+    with _asr_sessions_lock:
+        _asr_sessions[session_id] = _AsrSession()
+    return {"session_id": session_id, "engine": "whisper"}
+
+
+@router.post("/asr/chunk")
+async def asr_chunk(req: AsrChunkRequest):
+    """Append audio; maybe start a background decode. Returns the newest
+    partial transcript without waiting for any decode."""
+    try:
+        session = _asr_session(req.session_id)
+        session.append(base64.b64decode(req.audio_b64) if req.audio_b64 else b"")
+        session.poke(force=req.decode)
+        return session.state()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.post("/asr/snapshot")
+async def asr_snapshot(req: AsrSnapshotRequest):
+    """Transcript of the question so far (blocks only if no decode covers the
+    last voiced sample yet)."""
+    try:
+        session = _asr_session(req.session_id)
+        t0 = time.perf_counter()
+        text, reused = await asyncio.to_thread(session.snapshot, req.upto_samples)
+        return {"text": text, "reused": reused,
+                "wait_ms": round((time.perf_counter() - t0) * 1000)}
+    except Exception as exc:
+        print(f"[voice] ASR snapshot failed: {exc}", flush=True)
+        return {"error": str(exc)}
+
+
+@router.post("/asr/close")
+async def asr_close(req: SttStreamSessionRequest):
+    with _asr_sessions_lock:
+        _asr_sessions.pop(req.session_id, None)
+    return {"closed": True}
 
 
 @router.post("/stt")

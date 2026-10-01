@@ -16,6 +16,43 @@ from routes.bridge import router as bridge_router
 from routes.store import router as store_router
 from routes.autofill import router as autofill_router
 from routes.inbox import router as inbox_router
+from routes.metrics import router as metrics_router
+from routes.model_catalog import router as models_router
+
+import llm_provider as llm_factory
+
+# Path prefix → app feature, for the token meter (llm_provider.record_usage).
+# Longest prefix first. Routes may refine it (chat sets "chat:<mode>").
+_FEATURES = (
+    ("/application/knockout-screen", "recruiter-screen"),
+    ("/application", "resume-tailor"),
+    ("/company-research", "company-research"),
+    ("/research", "role-fit-research"),
+    ("/cheatsheet", "cheatsheet"),
+    ("/autofill", "extension:autofill"),
+    ("/inbox", "extension:jd-extract"),
+    ("/config", "warmup"),
+    ("/chat", "chat"),
+)
+
+
+class FeatureTagMiddleware:
+    """Tag every LLM call with the feature whose request made it.
+
+    Pure ASGI (not BaseHTTPMiddleware) on purpose: the contextvar is set in the
+    request's own task before the app runs, and the SSE responses' generator
+    tasks are spawned from inside it, so they inherit the tag."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            llm_factory.set_feature(
+                next((name for prefix, name in _FEATURES if path.startswith(prefix)), "other")
+            )
+        await self.app(scope, receive, send)
 
 
 def _preimport_llm_packages() -> None:
@@ -30,6 +67,14 @@ def _preimport_llm_packages() -> None:
             __import__(pkg)
         except Exception:
             pass  # missing optional provider — the factory reports it per-request
+    # Then the heavy modules the routes import lazily (kept off the boot path so
+    # /health answers fast): langgraph for role-fit research, the company-research
+    # engine, and python-docx for resume rendering.
+    for mod in ("agents.workflow", "research_scraper", "resume_docx", "routes.docx_editor"):
+        try:
+            __import__(mod)
+        except Exception:
+            pass  # surfaces as a clear error on the request that needs it
 
 
 @asynccontextmanager
@@ -66,6 +111,9 @@ app.include_router(bridge_router, prefix="/config")
 app.include_router(store_router, prefix="/store")
 app.include_router(autofill_router, prefix="/autofill")
 app.include_router(inbox_router, prefix="/inbox")
+app.include_router(metrics_router, prefix="/metrics")
+app.include_router(models_router, prefix="/models")
+app.add_middleware(FeatureTagMiddleware)
 
 
 @app.get("/health")
