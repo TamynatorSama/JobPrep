@@ -504,12 +504,14 @@ pub fn voice_warm(base_url: &str, engine: &str, speaker: &str) -> Result<(), Str
 /// POST /voice/prepare — warm STT + the chosen TTS engine and BLOCK until ready,
 /// returning the readiness report. Unlike `voice_warm` (fire-and-forget), this
 /// waits for completion so the "Preparing engine…" modal can dismiss only once
-/// the interview engine is actually ready. vibe-rt's first synth is ~30s on a
-/// laptop GPU, so the timeout is generous.
+/// the interview engine is actually ready. `speakers` = every panel voice, so
+/// all of them load now. A cold GPU voice (torch import + model load + first
+/// synth) has taken minutes on a laptop, so the timeout is generous.
 pub fn voice_prepare(
     base_url: &str,
     engine: &str,
     speaker: &str,
+    speakers: &[String],
     stt_engine: &str,
 ) -> Result<Value, String> {
     let client = reqwest::blocking::Client::new();
@@ -519,9 +521,10 @@ pub fn voice_prepare(
             "text": "",
             "engine": engine,
             "speaker": speaker,
+            "speakers": speakers,
             "stt_engine": stt_engine,
         }))
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(600))
         .send()
         .and_then(|r| r.json::<Value>())
         .map_err(|e| e.to_string())

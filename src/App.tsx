@@ -2653,18 +2653,18 @@ interface SettingsModalProps {
   onCredentialsChange: (c: Credentials) => void;
   resumes: Resume[];
   onResumesChange: (r: Resume[]) => void;
-  voxVoice: boolean;
-  onVoxVoiceChange: (v: boolean) => void;
+  ttsEngine: TtsEngineName | "";
+  onTtsEngineChange: (e: TtsEngineName) => void;
   panelSize: number;
   onPanelSizeChange: (n: number) => void;
-  voiceStatus: { available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string } | null;
+  voiceStatus: VoiceStatus | null;
   onClose: () => void;
 }
 
 const SettingsModal = ({
   credentials, onCredentialsChange,
   resumes, onResumesChange,
-  voxVoice, onVoxVoiceChange, panelSize, onPanelSizeChange, voiceStatus,
+  ttsEngine, onTtsEngineChange, panelSize, onPanelSizeChange, voiceStatus,
   onClose,
 }: SettingsModalProps) => {
   const [section, setSection] = useState("resume");
@@ -2747,7 +2747,7 @@ const SettingsModal = ({
           ) : section === "resume" ? (
             <ResumeTab resumes={resumes} onChange={onResumesChange} />
           ) : section === "voice" ? (
-            <VoiceTab voxVoice={voxVoice} onVoxVoiceChange={onVoxVoiceChange} panelSize={panelSize} onPanelSizeChange={onPanelSizeChange} voiceStatus={voiceStatus} />
+            <VoiceTab ttsEngine={ttsEngine} onTtsEngineChange={onTtsEngineChange} panelSize={panelSize} onPanelSizeChange={onPanelSizeChange} voiceStatus={voiceStatus} />
           ) : (
             <p style={{ fontSize: 12, color: T.textTertiary, letterSpacing: "-0.12px" }}>
               Settings for this section coming soon.
@@ -2761,74 +2761,122 @@ const SettingsModal = ({
 
 // ─── Voice tab ──────────────────────────────────────────────────────────
 
-interface VoiceTabProps {
-  voxVoice: boolean;
-  onVoxVoiceChange: (v: boolean) => void;
-  panelSize: number;
-  onPanelSizeChange: (n: number) => void;
-  voiceStatus: { available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string } | null;
+/// Interviewer voice engines, in Settings order (the sidecar's TTS registry).
+type TtsEngineName = "kokoro" | "piper" | "vibe-rt";
+const TTS_ENGINES: { id: TtsEngineName; name: string; desc: string }[] = [
+  { id: "kokoro",  name: "Kokoro",    desc: "Natural voice that starts as fast as Piper on a GPU, with several interviewer voices." },
+  { id: "piper",   name: "Piper",     desc: "Lightest and fastest, runs on any CPU; sounds more synthetic." },
+  { id: "vibe-rt", name: "VibeVoice", desc: "Most humanlike, but slower to start each reply and needs a GPU." },
+];
+
+interface TtsEngineInfo {
+  label: string;
+  available: boolean;
+  loaded: boolean;
+  device?: string | null;
+  voices: string[];
+  default_speaker: string;
+  error?: string | null;
 }
 
-const VoiceTab = ({ voxVoice, onVoxVoiceChange, panelSize, onPanelSizeChange, voiceStatus }: VoiceTabProps) => {
-  // Only block enabling VibeVoice when we positively know it's unavailable
-  // (status reported it missing). If status hasn't loaded, allow the toggle.
-  const vibeInstalled = voiceStatus?.vibe_available !== false;
-  const blocked = !voxVoice && !vibeInstalled;
-  const toggle = () => { if (!blocked) onVoxVoiceChange(!voxVoice); };
-  // How many distinct preset voices VibeVoice ships (caps the panel size). When
-  // status hasn't loaded (undefined) assume the full 4; a known-empty list means
-  // no presets, but keep at least one button so the control still renders.
-  const maxPanel = Math.min(4, voiceStatus?.voices?.length ?? 4) || 1;
+/// GET /voice/status (see routes/voice.py `status`).
+interface VoiceStatus {
+  available: boolean;
+  device?: string;
+  detail?: string;
+  /// The engine an engine-less request gets: Kokoro with a GPU, else Piper.
+  default_engine?: TtsEngineName;
+  tts_engines?: Partial<Record<TtsEngineName, TtsEngineInfo>>;
+  // Legacy VibeVoice-only fields.
+  vibe_available?: boolean;
+  voices?: string[];
+  default_speaker?: string;
+}
+
+/// The engine that will speak: the user's pick, else the sidecar's default.
+const effectiveTtsEngine = (choice: TtsEngineName | "", status: VoiceStatus | null): TtsEngineName =>
+  choice || status?.default_engine || "piper";
+
+interface VoiceTabProps {
+  ttsEngine: TtsEngineName | "";
+  onTtsEngineChange: (e: TtsEngineName) => void;
+  panelSize: number;
+  onPanelSizeChange: (n: number) => void;
+  voiceStatus: VoiceStatus | null;
+}
+
+const VoiceTab = ({ ttsEngine, onTtsEngineChange, panelSize, onPanelSizeChange, voiceStatus }: VoiceTabProps) => {
+  const engine = effectiveTtsEngine(ttsEngine, voiceStatus);
+  const info = voiceStatus?.tts_engines?.[engine];
+  // Only block an engine when status positively reports it missing; before
+  // status loads, every option stays clickable.
+  const installed = (id: TtsEngineName) => voiceStatus?.tts_engines?.[id]?.available !== false;
+  const voices = info?.voices ?? [];
+  // A panel needs distinct preset voices; Piper has one. Cap at 4.
+  const maxPanel = Math.min(4, voices.length);
+  const device = info?.device ?? (engine === "piper" ? "cpu" : voiceStatus?.device);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <Card>
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
-          <div style={{ flex: 1 }}>
-            <CardTitle>Humanlike voice (VibeVoice)</CardTitle>
-            <CardDesc>
-              Off uses Piper — a fast voice that starts speaking almost instantly.
-              On uses Microsoft VibeVoice for a warmer, more humanlike interviewer,
-              at the cost of slower replies (noticeably slower without a GPU).
-            </CardDesc>
-          </div>
-          <button
-            type="button"
-            onClick={toggle}
-            aria-pressed={voxVoice}
-            disabled={blocked}
-            style={{
-              flexShrink: 0, marginTop: 2, position: "relative",
-              width: 36, height: 20, borderRadius: 100, border: "none",
-              background: voxVoice ? T.accent : T.surface2,
-              cursor: blocked ? "not-allowed" : "pointer",
-              opacity: blocked ? 0.5 : 1, transition: "background 0.15s",
-            }}
-          >
-            <div style={{
-              position: "absolute", top: 2, left: voxVoice ? 18 : 2,
-              width: 16, height: 16, borderRadius: "50%", background: "#fff",
-              transition: "left 0.15s",
-            }} />
-          </button>
+        <CardTitle>Interviewer voice</CardTitle>
+        <CardDesc>The voice that asks the questions in a spoken mock interview.</CardDesc>
+        <div role="radiogroup" aria-label="Interviewer voice" style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10 }}>
+          {TTS_ENGINES.map((e) => {
+            const on = engine === e.id;
+            const ok = installed(e.id);
+            return (
+              <button
+                key={e.id}
+                type="button"
+                role="radio"
+                aria-checked={on}
+                disabled={!ok}
+                onClick={() => onTtsEngineChange(e.id)}
+                style={{
+                  display: "flex", alignItems: "flex-start", gap: 10, textAlign: "left",
+                  padding: "9px 11px", borderRadius: 10, cursor: ok ? "pointer" : "not-allowed",
+                  border: `0.5px solid ${on ? T.accent : T.border}`,
+                  background: on ? T.accentSoft : T.surface2,
+                  opacity: ok ? 1 : 0.5, color: T.text,
+                }}
+              >
+                <div style={{
+                  width: 14, height: 14, borderRadius: "50%", flexShrink: 0, marginTop: 2,
+                  border: `1.5px solid ${on ? T.accent : T.border}`,
+                  background: on ? `radial-gradient(${T.accent} 45%, transparent 50%)` : "transparent",
+                }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>
+                    {e.name}
+                    {voiceStatus?.default_engine === e.id && <span style={{ fontWeight: 400, color: T.textSecondary }}> · default</span>}
+                  </div>
+                  <div style={{ fontSize: 12, color: T.textSecondary, marginTop: 2 }}>
+                    {ok ? e.desc : "Not installed — run backend\\setup.ps1 -Voice."}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
         </div>
-        {voiceStatus?.device && (
-          <CardHint>Running on {voiceStatus.device === "cuda" ? "GPU (fast)" : "CPU"}.</CardHint>
-        )}
-        {!vibeInstalled && (
+        {device && (
           <CardHint>
-            VibeVoice isn't installed — run <code>backend\setup.ps1 -Voice</code> to enable the humanlike voice.
+            {info?.label ?? "Voice"} runs on {device === "cuda" ? "the GPU (fast)" : "the CPU"}{info?.loaded ? "" : " once loaded"}.
+            {engine !== "piper" && device === "cpu" && " Expect a pause of a second or more before each reply — Piper is quicker without a GPU."}
           </CardHint>
+        )}
+        {info?.error && (
+          <CardHint>{info.label} failed to load, so Piper is speaking instead: {info.error}</CardHint>
         )}
       </Card>
 
-      {voxVoice && (
+      {maxPanel > 1 && (
         <Card>
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
             <div style={{ flex: 1 }}>
               <CardTitle>Interviewer panel</CardTitle>
               <CardDesc>
                 Simulate a panel: each question is asked by a different voice,
-                rotating through this many of VibeVoice's preset interviewers.
+                rotating through this many of {info?.label ?? "the engine"}'s preset interviewers.
                 Set to 1 for a single interviewer.
               </CardDesc>
             </div>
@@ -2852,11 +2900,9 @@ const VoiceTab = ({ voxVoice, onVoxVoiceChange, panelSize, onPanelSizeChange, vo
               ))}
             </div>
           </div>
-          {voiceStatus?.voices?.length ? (
-            <CardHint>
-              Panel voices: {voiceStatus.voices.slice(0, panelSize).join(", ")}.
-            </CardHint>
-          ) : null}
+          <CardHint>
+            {panelSize > 1 ? "Panel voices" : "Voice"}: {voices.slice(0, Math.min(panelSize, maxPanel)).join(", ")}.
+          </CardHint>
         </Card>
       )}
     </div>
@@ -3571,19 +3617,23 @@ const App = () => {
   /// Voice-mode UI state for the interview (spoken Q&A + barge-in).
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
-  const [voiceStatus, setVoiceStatus] = useState<{ available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string } | null>(null);
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
   const [voiceOverlayOpen, setVoiceOverlayOpen] = useState(false);
   const [voicePhase, setVoicePhase] = useState<string>("idle");
   /// Barge-in (talk over the AI). Off by default — only safe with headphones.
   const [bargeEnabled, setBargeEnabled] = useState(false);
-  /// TTS engine: false = Piper (fast default), true = VibeVoice ("vibe-rt",
-  /// humanlike). Persisted in localStorage; pushed to Rust on load + toggle.
-  const [voxVoice, setVoxVoice] = useState(() => {
-    try { return localStorage.getItem("interprep.voxVoice") === "1"; }
-    catch { return false; }
+  /// Interviewer voice engine, or "" = the sidecar's default (Kokoro with a
+  /// GPU, else Piper). Persisted in localStorage; pushed to Rust on load
+  /// + change. The old VibeVoice toggle ("interprep.voxVoice" = "1") migrates.
+  const [ttsEngine, setTtsEngine] = useState<TtsEngineName | "">(() => {
+    try {
+      const v = localStorage.getItem("interprep.ttsEngine");
+      if (v === "kokoro" || v === "piper" || v === "vibe-rt") return v;
+      return localStorage.getItem("interprep.voxVoice") === "1" ? "vibe-rt" : "";
+    } catch { return ""; }
   });
-  /// Interviewer panel size (1–4). With VibeVoice on, each interviewer turn
-  /// rotates through this many distinct preset voices, simulating a panel.
+  /// Interviewer panel size (1–4). With a multi-voice engine (Kokoro,
+  /// VibeVoice), each interviewer turn rotates through this many presets.
   const [panelSize, setPanelSize] = useState(() => {
     try { return Math.min(4, Math.max(1, parseInt(localStorage.getItem("interprep.panelSize") || "1", 10))); }
     catch { return 1; }
@@ -4073,20 +4123,34 @@ const App = () => {
 
   // Persist the voice-engine choice and push it to the Rust voice state. The
   // command only mutates in-process state (no sidecar round-trip), so it's safe
-  // to call on mount before the backend is ready. Runs on mount + every toggle.
+  // to call on mount before the backend is ready. Runs on mount + every change.
+  // "" lets the sidecar pick its default engine.
   useEffect(() => {
-    try { localStorage.setItem("interprep.voxVoice", voxVoice ? "1" : "0"); } catch { /* ignore */ }
-    invoke("voice_set_engine", { engine: voxVoice ? "vibe-rt" : "piper" }).catch(() => {});
-    // No warmup here. VibeVoice's brutal cold start (~30s: model load + first-
-    // synth JIT on a laptop GPU) is paid in the "Preparing engine…" step when the
-    // user starts a mock interview (voice_prepare), NOT at app startup — warming
-    // at boot froze the app.
-  }, [voxVoice]);
+    try { if (ttsEngine) localStorage.setItem("interprep.ttsEngine", ttsEngine); } catch { /* ignore */ }
+    invoke("voice_set_engine", { engine: ttsEngine }).catch(() => {});
+    // No warmup here. The GPU voices' cold start (Kokoro / VibeVoice: model
+    // load + first-synth kernel setup) is paid in the "Preparing engine…" step
+    // when the user starts a mock interview (voice_prepare), NOT at app
+    // startup — warming at boot froze the app.
+  }, [ttsEngine]);
 
   // Persist the panel size so it survives restarts.
   useEffect(() => {
     try { localStorage.setItem("interprep.panelSize", String(panelSize)); } catch { /* ignore */ }
   }, [panelSize]);
+
+  // Head start on the voice's cold start (a GPU voice spends ~1 min importing
+  // torch + loading): begin warming it the moment the mock-interview setup
+  // modal opens, so the "Preparing engine…" wait after Start mostly joins a
+  // warm-up already in flight. Fire-and-forget; voice_prepare still gates.
+  const mockModalOpen = mockConfigForJob !== null;
+  useEffect(() => {
+    if (!mockModalOpen) return;
+    const info = voiceStatus?.tts_engines?.[effectiveTtsEngine(ttsEngine, voiceStatus)];
+    invoke("voice_warm", { engine: ttsEngine, speaker: info?.voices?.[0] ?? "" }).catch(() => {});
+    // Only on open — the latest engine choice is read then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mockModalOpen]);
 
   // Fetch voice capability once the sidecar is up so the Settings → Voice tab
   // knows whether VibeVoice is actually installed BEFORE the user toggles it.
@@ -4098,7 +4162,7 @@ const App = () => {
     let cancelled = false;
     let tries = 0;
     const fetchStatus = () => {
-      invoke<{ available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string }>("voice_status")
+      invoke<VoiceStatus>("voice_status")
         .then((s) => { if (!cancelled) setVoiceStatus(s); })
         .catch(() => { if (!cancelled && tries++ < 15) setTimeout(fetchStatus, 2000); });
     };
@@ -4332,17 +4396,15 @@ const App = () => {
     voiceSpeakBufferRef.current = "";
     voiceUtteranceTextRef.current = "";
     voiceSkipRef.current = false;
-    // Pick the panelist voice for the upcoming interviewer reply. With VibeVoice
-    // on and a panel of 2+, round-robin across the first `panelSize` presets so
-    // each question sounds like a different interviewer. Otherwise use the
-    // single default voice (empty string → backend default).
+    // Pick the panelist voice for the upcoming interviewer reply. With a
+    // multi-voice engine and a panel of 2+, round-robin across the first
+    // `panelSize` presets so each question sounds like a different interviewer.
+    // Otherwise use the engine's default voice (empty string → backend default).
     {
-      const voices = voiceStatus?.voices ?? [];
+      const info = voiceStatus?.tts_engines?.[effectiveTtsEngine(ttsEngine, voiceStatus)];
+      const voices = info?.voices ?? [];
       const n = Math.max(1, Math.min(panelSize, voices.length || 1));
-      voiceSpeakerRef.current =
-        voxVoice && n > 1 && voices.length
-          ? voices[voiceTurnRef.current % n]
-          : (voxVoice ? (voiceStatus?.default_speaker ?? "") : "");
+      voiceSpeakerRef.current = n > 1 ? voices[voiceTurnRef.current % n] : (info?.default_speaker ?? "");
       voiceTurnRef.current += 1;
     }
     let chatId = opts?.chatId ?? selectedChatId;
@@ -4587,7 +4649,7 @@ const App = () => {
   const enableVoice = () => {
     setVoiceEnabled(true);
     voiceEnabledRef.current = true;
-    invoke<{ available: boolean; device?: string; detail?: string; vibe_available?: boolean; voices?: string[]; default_speaker?: string }>("voice_status")
+    invoke<VoiceStatus>("voice_status")
       .then((s) => {
         setVoiceStatus(s);
         if (!s.available) {
@@ -4960,13 +5022,25 @@ const App = () => {
             const j = mockConfigForJob;
             if (!j) return;
             // Warm the interview engine BEFORE the thread starts so the cold start
-            // (STT + the selected TTS engine — vibe-rt is ~30s on a laptop GPU)
-            // lands here, behind the modal's "Preparing engine…" state, not at
-            // app startup or on the first question. Best-effort: a warm failure
-            // (e.g. voice stack not installed) must not block a text interview.
-            const engine = voxVoice ? "vibe-rt" : "piper";
-            const speaker = voxVoice ? (voiceStatus?.default_speaker ?? "") : "";
-            try { await invoke("voice_prepare", { engine, speaker }); }
+            // (STT + the selected TTS engine and every panel voice — the GPU
+            // voices take tens of seconds cold) lands here, behind the modal's
+            // "Preparing engine…" state, not at app startup or on the first
+            // question. Best-effort: a warm failure (e.g. voice stack not
+            // installed) must not block a text interview.
+            const info = voiceStatus?.tts_engines?.[effectiveTtsEngine(ttsEngine, voiceStatus)];
+            const speakers = (info?.voices ?? []).slice(0, Math.max(1, panelSize));
+            try {
+              const rep = await invoke<{ engine?: string; tts_fallback?: string; tts_error?: string }>(
+                "voice_prepare", { engine: ttsEngine, speaker: speakers[0] ?? "", speakers });
+              // The chosen voice couldn't load and Piper will speak instead — say
+              // so (it used to be silent), and refresh status so Settings → Voice
+              // shows the error.
+              if (rep?.tts_fallback) {
+                invoke<VoiceStatus>("voice_status").then(setVoiceStatus).catch(() => {});
+                const name = TTS_ENGINES.find((e) => e.id === rep.tts_fallback)?.name ?? rep.tts_fallback;
+                alert(`${name} couldn't load, so Piper will be the interviewer's voice this time.\n\n${rep.tts_error ?? ""}`);
+              }
+            }
             catch (e) { console.warn("voice_prepare failed; starting interview anyway", e); }
             setMockConfigForJob(null);
             startMockInterview(j, config);
@@ -4991,8 +5065,8 @@ const App = () => {
           onCredentialsChange={setCredentials}
           resumes={resumes}
           onResumesChange={setResumes}
-          voxVoice={voxVoice}
-          onVoxVoiceChange={setVoxVoice}
+          ttsEngine={ttsEngine}
+          onTtsEngineChange={setTtsEngine}
           panelSize={panelSize}
           onPanelSizeChange={setPanelSize}
           voiceStatus={voiceStatus}

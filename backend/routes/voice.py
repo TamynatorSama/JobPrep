@@ -1,29 +1,37 @@
-"""Voice services for the live mock interview.
+"""Voice services for the live mock interview and the copilot.
 
-  POST /voice/tts    {text,engine,speaker} -> {audio_b64, sample_rate}   (piper | vibe-rt)
-  POST /voice/stt    {audio_b64}           -> {text}                     (faster-whisper fallback)
-  POST /voice/stt-stream/{start|chunk|finish|cancel}                       (Moonshine)
+  POST /voice/tts_stream {text,engine,speaker} -> raw PCM16 stream          (any TTS engine)
+  POST /voice/tts    {text,engine,speaker} -> {audio_b64, sample_rate}
+  POST /voice/stt    {audio_b64}           -> {text}                     (faster-whisper batch)
+  POST /voice/asr/{start|chunk|snapshot|finish|close}                    (any recognizer)
+  POST /voice/stt-stream/{start|chunk|finish|cancel}                       (Moonshine, legacy)
   GET  /voice/status                       -> capability + device report
 
-Two TTS engines:
-  * "piper" (default) — fast neural TTS via onnxruntime. Runs faster than
-    real-time on CPU, no GPU needed, ~60MB voice model. The interview voice
-    unless the user opts into "vibe-rt".
-  * "vibe-rt" — Microsoft VibeVoice-Realtime-0.5B, far more humanlike. Ships
-    several fixed preset voices, so a *panel* of distinct interviewers is
-    possible by picking a different `speaker` per turn (see VIBE_VOICES).
-    torch-based; wants a GPU to keep up. Opt-in via the Settings toggle.
+One engine layer (see "TTS engine registry" and "Recognizer registry"): every
+voice exposes `stream(text, speaker)` → PCM16 frames, every recognizer exposes
+`start / push / finish`, Settings picks the voice, and /voice/status reports
+what is installed and loaded. The Phase 6 Mac speech server serves the same
+contract. Three TTS engines:
+  * "kokoro" (default with a GPU) — Kokoro-82M, natural-sounding and ~25×
+    real time on the GPU (0.6–1.9 s a sentence on the CPU, hence not the
+    default there); several preset voices, so a panel works.
+  * "piper" — fast neural TTS via onnxruntime on the CPU, ~60MB voice model.
+    The fallback whenever another engine is missing or fails to load.
+  * "vibe-rt" — Microsoft VibeVoice-Realtime-0.5B, the most humanlike. Six
+    preset voices (VIBE_VOICES); torch-based, wants a GPU, slow cold start.
 
-Everything is lazy-loaded and degrades to a clear error instead of crashing the
-sidecar at import time. Device is chosen automatically — CUDA when available,
-else CPU — and surfaced via /voice/status so the UI can tell the user what's in
-use. Only the chosen engine is loaded; "vibe-rt" never loads unless toggled on.
+Everything is lazy-loaded and degrades to a clear error (or to Piper) instead of
+crashing the sidecar at import time. Device is chosen automatically — CUDA when
+available, else CPU — and surfaced via /voice/status. Only the chosen engine is
+loaded.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import io
+import os
+import sys
 import threading
 import time
 import uuid
@@ -35,9 +43,29 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-# Default engine when a request doesn't specify one. "piper" is fast; "vibe-rt"
-# is the humanlike VibeVoice voice the user opts into.
-DEFAULT_ENGINE = "piper"
+# Engine names, in Settings order. A request naming none of these (or "") gets
+# `_default_engine()`: Kokoro with a GPU, else Piper.
+TTS_ENGINES = ("kokoro", "piper", "vibe-rt")
+FALLBACK_ENGINE = "piper"
+
+# ── Kokoro-82M ───────────────────────────────────────────────────────────────
+# Weights (~330MB) + one ~0.5MB style vector per voice come from the HF repo on
+# first use (pre-fetched by setup.ps1). misaki's English G2P needs spaCy's
+# en_core_web_sm, which it pip-installs itself if missing.
+KOKORO_REPO = "hexgrad/Kokoro-82M"
+KOKORO_SR = 24000
+# Panel presets, American English (lang "a"): display name -> voice id. Ordered
+# so a panel of N alternates female/male, best-graded first (the repo's
+# VOICES.md grades af_heart A, af_bella A-, the others C+).
+KOKORO_VOICES = {
+    "Heart": "af_heart",
+    "Michael": "am_michael",
+    "Bella": "af_bella",
+    "Fenrir": "am_fenrir",
+    "Sarah": "af_sarah",
+    "Puck": "am_puck",
+}
+KOKORO_DEFAULT_SPEAKER = "Heart"
 
 # Piper voice to use. The .onnx + matching .onnx.json are fetched from the
 # rhasspy/piper-voices HF repo on first use (or pre-fetched by setup.ps1).
@@ -73,31 +101,40 @@ VIBE_VOICES_BASE_URL = (
 
 
 def _norm_engine(engine: str | None) -> str:
-    """Only "vibe-rt" (or the legacy "vox") selects VibeVoice; else Piper."""
+    """Canonical engine name; "" or unknown = the default engine. ("vox" and
+    "vibe" are legacy spellings of "vibe-rt".)"""
     e = (engine or "").strip().lower()
-    return "vibe-rt" if e in ("vibe-rt", "vibe", "vox") else "piper"
+    if e in ("vibe-rt", "vibe", "vox"):
+        return "vibe-rt"
+    return e if e in TTS_ENGINES else _default_engine()
+
+
+def _pick_speaker(speaker: str | None, voices: dict, default: str) -> str:
+    """Resolve a panelist name against one engine's presets (case-insensitive),
+    falling back to that engine's default voice."""
+    s = (speaker or "").strip().lower()
+    for name in voices:
+        if name.lower() == s:
+            return name
+    return default
 
 
 def _norm_speaker(speaker: str | None) -> str:
-    """Resolve a panelist name to a known preset, falling back to the default."""
-    s = (speaker or "").strip()
-    if s in VIBE_VOICES:
-        return s
-    # Case-insensitive match so the frontend can be loose about casing.
-    for name in VIBE_VOICES:
-        if name.lower() == s.lower():
-            return name
-    return VIBE_DEFAULT_SPEAKER
+    """VibeVoice preset for a panelist name."""
+    return _pick_speaker(speaker, VIBE_VOICES, VIBE_DEFAULT_SPEAKER)
 
 
 # ── request models ───────────────────────────────────────────────────────────
 class TtsRequest(BaseModel):
     text: str
-    # "piper" (fast, default) or "vibe-rt" (VibeVoice, humanlike).
+    # "kokoro" | "piper" | "vibe-rt"; omitted/"" = the default engine.
     engine: str | None = None
-    # Which panelist voice to use (vibe-rt only). One of VIBE_VOICES; ignored by
-    # Piper. Lets the interview pick a different voice per panelist per turn.
+    # Which panelist voice to use: a preset name of the chosen engine
+    # (KOKORO_VOICES / VIBE_VOICES); ignored by Piper. Lets the interview pick
+    # a different voice per panelist per turn.
     speaker: str | None = None
+    # /prepare only: every panel voice, so all of them load behind the modal.
+    speakers: list[str] | None = None
     # "moonshine" for the mock-interview candidate stream; omitted by the
     # copilot, which still warms faster-whisper for system-audio transcription.
     stt_engine: str | None = None
@@ -127,13 +164,21 @@ class SttStreamSessionRequest(BaseModel):
     session_id: str
 
 
+class AsrStartRequest(BaseModel):
+    # A recognizer in _ASR ("whisper" | "moonshine"); omitted = "whisper".
+    engine: str | None = None
+
+
 class AsrChunkRequest(BaseModel):
     session_id: str
-    # RAW little-endian mono PCM16 at 16 kHz (Rust resamples). May be empty
-    # when the call only carries `decode`.
+    # RAW little-endian mono PCM16 (Whisper: 16 kHz, Rust resamples). May be
+    # empty when the call only carries `decode`.
     audio_b64: str = ""
-    # Rust's VAD saw a pause: decode everything received so far right away.
+    # Whisper: Rust's VAD saw a pause — decode everything received so far.
     decode: bool = False
+    # Moonshine: the chunk's rate and the stream clock at its end.
+    sample_rate: int = 16000
+    elapsed_ms: float = 0.0
 
 
 class AsrSnapshotRequest(BaseModel):
@@ -156,10 +201,25 @@ _prepare_lock = threading.Lock()
 # One faster-whisper decode at a time: the warmup, /voice/stt and the copilot's
 # streaming sessions all share one WhisperModel.
 _stt_infer_lock = threading.Lock()
+# Kokoro's load, and one synth chunk at a time (G2P + model share state).
+_kokoro_lock = threading.Lock()
+_kokoro_synth_lock = threading.Lock()
+# One-time cuDNN pinning (see _pin_torch_cudnn) — before ANY ctranslate2 import.
+_pin_lock = threading.Lock()
+# Builds of torch TTS models, one at a time. transformers' from_pretrained
+# (VibeVoice) puts torch in "init on the meta device" mode PROCESS-WIDE while it
+# runs, so a Kokoro KModel built at the same moment on another thread came out
+# with empty meta weights and failed to load ("v_in is on meta") — Piper then
+# spoke in its place (observed 2026-10-02, switching voices before an interview).
+_torch_build_lock = threading.Lock()
 _state = {
     "device": None,         # "cuda" | "cpu"
-    "piper": None,          # PiperVoice (fast default engine)
+    "piper": None,          # PiperVoice (fast fallback engine)
     "piper_sr": 22050,      # Piper voice output sample rate
+    "kokoro": None,         # kokoro.KPipeline (model + misaki G2P)
+    "kokoro_device": None,
+    "kokoro_warm": False,
+    "tts_errors": {},       # engine -> load/warm error; such engines fall back to Piper
     "stt": None,            # faster-whisper WhisperModel
     "moonshine": None,      # shared Moonshine Transcriber (per-turn streams)
     "moonshine_warm": False,
@@ -171,7 +231,6 @@ _state = {
     "vibe_proc": None,      # VibeVoiceStreamingProcessor
     "vibe_presets": {},     # speaker name -> prefilled-output tensor (cached)
     "vibe_warm": False,     # True once a throwaway synth has JIT-compiled kernels
-    "vibe_warming": False,  # guards against overlapping warm requests
 }
 
 # Moonshine streams are stateful and receive ordered chunks from one Rust
@@ -183,8 +242,6 @@ _moonshine_lock = threading.Lock()
 # operations single-flight until concurrent Windows inference is explicitly
 # validated; HTTP/session bookkeeping remains concurrent around this lock.
 _moonshine_inference_lock = threading.Lock()
-_moonshine_sessions_lock = threading.Lock()
-_moonshine_sessions: dict[str, "_MoonshineSession"] = {}
 MOONSHINE_SESSION_TTL_S = 180.0
 # The library recommends 500ms. Smaller values repeatedly invoke the decoder
 # faster than this Windows CPU can keep up, creating a backlog that defeats
@@ -247,9 +304,10 @@ def _get_vibe():
             # Use sdpa, not flash_attention_2: flash-attn isn't installed (no
             # prebuilt Windows wheels), and asking for it makes from_pretrained
             # raise/retry — wasted work. sdpa is built into torch and fast enough.
-            model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-                VIBE_MODEL_ID, torch_dtype=dtype, attn_implementation="sdpa",
-            )
+            with _torch_build_lock:
+                model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+                    VIBE_MODEL_ID, torch_dtype=dtype, attn_implementation="sdpa",
+                )
             model = model.to(device)
             model.eval()
             proc = VibeVoiceStreamingProcessor.from_pretrained(VIBE_MODEL_ID)
@@ -434,11 +492,13 @@ def _get_piper():
             # a missing provider sent ORT through a ~80s probe-and-fallback at
             # load (observed in the field, blocking the "Preparing engine…"
             # modal) — and Piper is faster than real-time on CPU regardless.
+            # Provider check first: `_device()` imports torch (~36s cold), which
+            # the CPU-only wheel never needs.
             use_cuda = False
             try:
                 import onnxruntime
-                use_cuda = (_device() == "cuda"
-                            and "CUDAExecutionProvider" in onnxruntime.get_available_providers())
+                use_cuda = ("CUDAExecutionProvider" in onnxruntime.get_available_providers()
+                            and _device() == "cuda")
             except Exception:
                 pass
             t0 = time.time()
@@ -473,6 +533,66 @@ def _piper_pcm_iter(voice, text: str):
         yield bytes(data)
 
 
+# ── Kokoro loading ───────────────────────────────────────────────────────────
+def _get_kokoro():
+    """Load Kokoro-82M once, on CUDA when torch sees a GPU
+    (INTERPREP_TTS_DEVICE=cpu|cuda overrides). One KPipeline holds the model
+    and misaki's English G2P; voices load into it on first use."""
+    if _state["kokoro"] is not None:
+        return _state["kokoro"]
+    with _kokoro_lock:
+        if _state["kokoro"] is None:
+            t0 = time.time()
+            from kokoro import KModel, KPipeline  # imports torch + spaCy: heavy, lazy
+            device = os.environ.get("INTERPREP_TTS_DEVICE", "").strip().lower()
+            if device not in ("cpu", "cuda") or (device == "cuda" and _device() != "cuda"):
+                device = _device()
+            config, weights = _kokoro_file("config.json"), _kokoro_file("kokoro-v1_0.pth")
+            with _torch_build_lock:
+                model = KModel(repo_id=KOKORO_REPO, config=config, model=weights)
+            model = model.to(device).eval()
+            _state["kokoro"] = KPipeline(lang_code="a", repo_id=KOKORO_REPO, model=model)
+            _state["kokoro_device"] = device
+            print(f"[voice] kokoro loaded on {device} in {time.time() - t0:.1f}s", flush=True)
+    return _state["kokoro"]
+
+
+def _kokoro_file(filename: str) -> str:
+    """Local path of a file in the Kokoro repo: straight from the HF cache when
+    it's there (no network round-trip, works offline), else downloaded."""
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+    hit = try_to_load_from_cache(KOKORO_REPO, filename)
+    return hit if isinstance(hit, str) else hf_hub_download(KOKORO_REPO, filename)
+
+
+def _kokoro_voice(speaker: str | None) -> str:
+    """Local .pt path of a panelist's voice (KPipeline caches it by path)."""
+    vid = KOKORO_VOICES[_pick_speaker(speaker, KOKORO_VOICES, KOKORO_DEFAULT_SPEAKER)]
+    paths = _state.setdefault("kokoro_voice_paths", {})
+    if vid not in paths:
+        paths[vid] = _kokoro_file(f"voices/{vid}.pt")
+    return paths[vid]
+
+
+def _kokoro_stream(text: str, speaker: str):
+    """PCM16 frames for one line. Kokoro isn't autoregressive: each chunk
+    (a whole sentence; misaki only splits past 510 phonemes) arrives at once.
+    The lock covers only the synthesis step, never a yield, so a stalled
+    consumer can't block the next line."""
+    import numpy as np
+    pipe = _get_kokoro()
+    results = pipe(text.strip(), voice=_kokoro_voice(speaker), split_pattern=None)
+    while True:
+        with _kokoro_synth_lock:
+            result = next(results, None)
+        if result is None:
+            return
+        if result.audio is None:
+            continue
+        arr = np.clip(result.audio.detach().float().cpu().numpy().reshape(-1), -1.0, 1.0)
+        yield (arr * 32767.0).astype("<i2").tobytes()
+
+
 def _pin_torch_cudnn() -> None:
     """Preload torch's bundled cuDNN DLLs before ctranslate2 can load its own.
 
@@ -486,39 +606,52 @@ def _pin_torch_cudnn() -> None:
     share the good copies. Best-effort no-op when torch isn't installed.
 
     Finds torch's lib dir WITHOUT importing torch: the import costs tens of
-    seconds on a cold boot and the copilot's speech path never needs it."""
-    try:
-        import ctypes
-        import glob as _glob
-        import importlib.util
-        import os as _os
-        spec = importlib.util.find_spec("torch")
-        if spec is None or not spec.submodule_search_locations:
+    seconds on a cold boot and the copilot's speech path never needs it.
+
+    EVERY path that imports ctranslate2 / faster_whisper calls this first
+    (`_stt_device`, `_get_stt`, `_vad_tail`): a /voice/status poll importing
+    ctranslate2 while the Whisper warm-up was still pinning let ctranslate2's
+    copy win, and Kokoro's first synth then killed the sidecar with the error
+    above (2026-10-01). Once per process; callers block until it's done."""
+    with _pin_lock:
+        if _state.get("cudnn_pinned"):
             return
-        lib = _os.path.join(list(spec.submodule_search_locations)[0], "lib")
-        if not _os.path.isdir(lib):
-            return
-        # Same search path torch registers on import, so the cuDNN DLLs'
-        # own dependencies (cuBLAS etc.) resolve from torch's copies too.
-        _state["torch_dll_dir"] = _os.add_dll_directory(lib)
-        for dll in sorted(_glob.glob(_os.path.join(lib, "cudnn*.dll"))):
-            try:
-                ctypes.WinDLL(dll)
-            except OSError:
-                pass
-    except Exception:
-        pass
+        _state["cudnn_pinned"] = True
+        try:
+            import ctypes
+            import glob as _glob
+            import importlib.util
+            spec = importlib.util.find_spec("torch")
+            if spec is None or not spec.submodule_search_locations:
+                return
+            lib = os.path.join(list(spec.submodule_search_locations)[0], "lib")
+            if not os.path.isdir(lib):
+                return
+            # Same search path torch registers on import, so the cuDNN DLLs'
+            # own dependencies (cuBLAS etc.) resolve from torch's copies too.
+            _state["torch_dll_dir"] = os.add_dll_directory(lib)
+            for dll in sorted(_glob.glob(os.path.join(lib, "cudnn*.dll"))):
+                try:
+                    ctypes.WinDLL(dll)
+                except OSError:
+                    pass
+        except Exception:
+            pass
 
 
 def _stt_device() -> str:
     """CUDA when CTranslate2 (faster-whisper's backend) sees a GPU. Asked of
     CTranslate2 rather than torch (`_device`) so loading speech recognition
     never imports torch."""
+    if _state.get("ct2_device"):
+        return _state["ct2_device"]
+    _pin_torch_cudnn()  # MUST precede any ctranslate2 import
     try:
         import ctranslate2
-        return "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        _state["ct2_device"] = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
     except Exception:
-        return "cpu"
+        _state["ct2_device"] = "cpu"
+    return _state["ct2_device"]
 
 
 def _get_stt():
@@ -684,20 +817,7 @@ class _MoonshineSession:
                     self.stream.close()
 
 
-def _evict_stale_moonshine_sessions() -> None:
-    cutoff = time.monotonic() - MOONSHINE_SESSION_TTL_S
-    with _moonshine_sessions_lock:
-        stale = [
-            sid for sid, session in _moonshine_sessions.items()
-            if session.touched < cutoff
-        ]
-        sessions = [_moonshine_sessions.pop(sid) for sid in stale]
-    for session in sessions:
-        session.cancel()
-
-
-def _moonshine_start() -> str:
-    _evict_stale_moonshine_sessions()
+def _moonshine_open() -> _MoonshineSession:
     transcriber = _get_moonshine()
     with _moonshine_inference_lock:
         stream = transcriber.create_stream(
@@ -706,29 +826,7 @@ def _moonshine_start() -> str:
     session = _MoonshineSession(stream)
     with _moonshine_inference_lock:
         stream.start()
-    session_id = uuid.uuid4().hex
-    with _moonshine_sessions_lock:
-        _moonshine_sessions[session_id] = session
-    return session_id
-
-
-def _moonshine_session(session_id: str) -> _MoonshineSession:
-    with _moonshine_sessions_lock:
-        session = _moonshine_sessions.get(session_id)
-    if session is None:
-        raise ValueError("unknown or expired Moonshine session")
     return session
-
-
-def _moonshine_finish(session_id: str, cancel: bool = False) -> str:
-    with _moonshine_sessions_lock:
-        session = _moonshine_sessions.pop(session_id, None)
-    if session is None:
-        raise ValueError("unknown or expired Moonshine session")
-    if cancel:
-        session.cancel()
-        return ""
-    return session.finish()
 
 
 # ── Copilot streaming ASR (faster-whisper sessions) ──────────────────────────
@@ -747,8 +845,6 @@ ASR_MAX_S = 45.0            # Rust caps a question at 28 s; slack for preroll
 ASR_SESSION_TTL_S = 120.0
 _asr_pool = None            # one worker = one GPU decode at a time, FIFO
 _asr_pool_lock = threading.Lock()
-_asr_sessions_lock = threading.Lock()
-_asr_sessions: dict[str, "_AsrSession"] = {}
 
 
 def _asr_executor():
@@ -850,19 +946,136 @@ class _AsrSession:
         return fut.result(timeout=30), reused
 
 
-def _asr_session(session_id: str) -> _AsrSession:
+# ── Recognizer registry ──────────────────────────────────────────────────────
+# Every recognizer exposes one session contract, shared with the Phase 6 Mac
+# speech server: open() → session, push(session, pcm16, …) → live state,
+# finish(session) → final text, cancel(session). Sessions of every engine live
+# in one table, so /voice/asr/* serves any engine; /voice/stt-stream/* stays as
+# the Moonshine spelling the mock-interview mic already speaks.
+_have_cache: dict[str, bool] = {}
+
+
+def _have(module: str) -> bool:
+    """Is `module` installed? Checked once per process without importing it
+    (every TTS request resolves its engine through this)."""
+    if module not in _have_cache:
+        import importlib.util
+        try:
+            _have_cache[module] = importlib.util.find_spec(module) is not None
+        except Exception:
+            _have_cache[module] = False
+    return _have_cache[module]
+
+
+class _WhisperAsr:
+    """faster-whisper streaming sessions (copilot system audio). PCM must be
+    16 kHz; `decode=True` (Rust's pause hint) decodes everything so far."""
+    name = "whisper"
+    ttl_s = ASR_SESSION_TTL_S
+
+    def available(self) -> bool:
+        return _have("faster_whisper")
+
+    def loaded(self) -> bool:
+        return _state["stt"] is not None
+
+    def device(self) -> str | None:
+        return _state.get("stt_device")
+
+    def open(self) -> _AsrSession:
+        return _AsrSession()
+
+    def push(self, s: _AsrSession, pcm: bytes, sample_rate: int = ASR_SR,
+             elapsed_ms: float = 0.0, decode: bool = False) -> dict:
+        s.append(pcm)
+        s.poke(force=decode)
+        return s.state()
+
+    def finish(self, s: _AsrSession) -> str:
+        return s.snapshot(s.state()["samples"])[0]
+
+    def cancel(self, s: _AsrSession) -> None:
+        pass
+
+
+class _MoonshineAsr:
+    """Moonshine Tiny streaming on the CPU (mock-interview mic). Accepts any
+    sample rate; reports phrase completions the mic's endpointing uses."""
+    name = "moonshine"
+    ttl_s = MOONSHINE_SESSION_TTL_S
+
+    def available(self) -> bool:
+        return _have("moonshine_voice")
+
+    def loaded(self) -> bool:
+        return _state["moonshine"] is not None
+
+    def device(self) -> str | None:
+        return "cpu"
+
+    def open(self) -> _MoonshineSession:
+        return _moonshine_open()
+
+    def push(self, s: _MoonshineSession, pcm: bytes, sample_rate: int = ASR_SR,
+             elapsed_ms: float = 0.0, decode: bool = False) -> dict:
+        return s.add_pcm16(pcm, sample_rate, elapsed_ms)
+
+    def finish(self, s: _MoonshineSession) -> str:
+        return s.finish()
+
+    def cancel(self, s: _MoonshineSession) -> None:
+        s.cancel()
+
+
+_ASR = {e.name: e for e in (_WhisperAsr(), _MoonshineAsr())}
+_asr_sessions_lock = threading.Lock()
+_asr_sessions: dict[str, tuple] = {}   # session id -> (engine, session)
+
+
+def _asr_evict_stale() -> None:
+    now = time.monotonic()
     with _asr_sessions_lock:
-        session = _asr_sessions.get(session_id)
-    if session is None:
+        stale = [sid for sid, (eng, s) in _asr_sessions.items()
+                 if now - s.touched > eng.ttl_s]
+        dropped = [_asr_sessions.pop(sid) for sid in stale]
+    for eng, s in dropped:
+        try:
+            eng.cancel(s)
+        except Exception:
+            pass
+
+
+def _asr_open(engine: str) -> str:
+    eng = _ASR.get(engine)
+    if eng is None:
+        raise ValueError(f"unknown recognizer {engine!r}")
+    _asr_evict_stale()
+    session = eng.open()
+    session_id = uuid.uuid4().hex
+    with _asr_sessions_lock:
+        _asr_sessions[session_id] = (eng, session)
+    return session_id
+
+
+def _asr_get(session_id: str) -> tuple:
+    with _asr_sessions_lock:
+        entry = _asr_sessions.get(session_id)
+    if entry is None:
         raise ValueError("unknown or expired ASR session")
-    return session
+    return entry
 
 
-def _evict_stale_asr_sessions() -> None:
-    cutoff = time.monotonic() - ASR_SESSION_TTL_S
+def _asr_end(session_id: str, cancel: bool = False) -> str:
+    """Finish (or cancel) and forget a session; returns the final text."""
     with _asr_sessions_lock:
-        for sid in [s for s, sess in _asr_sessions.items() if sess.touched < cutoff]:
-            _asr_sessions.pop(sid, None)
+        entry = _asr_sessions.pop(session_id, None)
+    if entry is None:
+        raise ValueError("unknown or expired ASR session")
+    eng, session = entry
+    if cancel:
+        eng.cancel(session)
+        return ""
+    return eng.finish(session)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -886,34 +1099,168 @@ def _voice_dir():
     return d
 
 
-def _prepare(engine: str, speaker: str) -> int:
-    """Load the engine's model (and preset, for vibe-rt) and return its sample
-    rate. Called before streaming so the rate is known up front."""
-    if engine == "vibe-rt":
+# ── TTS engine registry ──────────────────────────────────────────────────────
+# Every interviewer voice implements one contract, shared with the Phase 6 Mac
+# speech server:
+#   available()        deps installed (find_spec only — never imports them)
+#   load(speakers)     model + the panel's voices, blocking, idempotent;
+#                      returns the output sample rate
+#   warm(speakers)     load + one throwaway line, so the first real one is warm
+#   stream(text, spk)  little-endian PCM16 mono frames as they're synthesized
+# An engine that's missing or failed to load/warm falls back to Piper
+# (`_resolve_engine`), so a broken install never silences the interviewer.
+class _PiperTts:
+    name, label = "piper", "Piper"
+    voices: dict = {}
+    default_speaker = ""
+
+    def available(self) -> bool:
+        return _have("piper")
+
+    def loaded(self) -> bool:
+        return _state["piper"] is not None
+
+    def warmed(self) -> bool:
+        return self.loaded()
+
+    def device(self) -> str:
+        return "cpu"
+
+    def load(self, speakers=()) -> int:
+        _get_piper()
+        return int(_state["piper_sr"])
+
+    def warm(self, speakers=()) -> None:
+        self.load()
+
+    def stream(self, text: str, speaker: str = ""):
+        yield from _piper_pcm_iter(_get_piper(), text)
+
+
+class _KokoroTts:
+    name, label = "kokoro", "Kokoro"
+    voices = KOKORO_VOICES
+    default_speaker = KOKORO_DEFAULT_SPEAKER
+
+    def available(self) -> bool:
+        return _have("kokoro") and _have("misaki") and _have("torch")
+
+    def loaded(self) -> bool:
+        return _state["kokoro"] is not None
+
+    def warmed(self) -> bool:
+        return bool(_state["kokoro_warm"])
+
+    def device(self) -> str | None:
+        return _state["kokoro_device"]
+
+    def load(self, speakers=()) -> int:
+        pipe = _get_kokoro()
+        for spk in speakers or (self.default_speaker,):
+            path = _kokoro_voice(spk)
+            with _kokoro_synth_lock:
+                pipe.load_single_voice(path)
+        return KOKORO_SR
+
+    def warm(self, speakers=()) -> None:
+        self.load(speakers)
+        # Waits out a warm already in flight (the modal-open head start), so
+        # /prepare never reports ready while the first synth is still cold.
+        with _warm_locks[self.name]:
+            if _state["kokoro_warm"]:
+                return
+            t0 = time.time()
+            # Three lengths: the first CUDA synth pays one-time setup (~1.5s),
+            # each new input length a little more (~0.1s).
+            for line in ("Hello.",
+                         "Thanks for joining me today, let's get started.",
+                         "To begin, could you walk me through your background and the "
+                         "projects that best prepared you for this role?"):
+                for _ in _kokoro_stream(line, speakers[0] if speakers else ""):
+                    pass
+            _state["kokoro_warm"] = True
+            print(f"[voice] kokoro warmed in {time.time() - t0:.1f}s", flush=True)
+
+    def stream(self, text: str, speaker: str = ""):
+        yield from _kokoro_stream(text, speaker)
+
+
+class _VibeTts:
+    name, label = "vibe-rt", "VibeVoice"
+    voices = VIBE_VOICES
+    default_speaker = VIBE_DEFAULT_SPEAKER
+
+    def available(self) -> bool:
+        return _have("torch") and _have("vibevoice")
+
+    def loaded(self) -> bool:
+        return _state["vibe_model"] is not None
+
+    def warmed(self) -> bool:
+        return bool(_state["vibe_warm"])
+
+    def device(self) -> str | None:
+        return _state["device"] if self.loaded() else None
+
+    def load(self, speakers=()) -> int:
         _get_vibe()
-        _vibe_prefilled(speaker)
+        for spk in speakers or (self.default_speaker,):
+            _vibe_prefilled(_norm_speaker(spk))
         return VIBE_SR
-    _get_piper()
-    return int(_state["piper_sr"])
+
+    def warm(self, speakers=()) -> None:
+        # vibe-rt's cold start is brutal on a laptop GPU: the one-time model
+        # load is slow AND the first synth is ~20× real time while CUDA kernels
+        # JIT-compile (a warm synth is ~0.3s to first audio). Single-flight; a
+        # second caller waits for the first instead of returning cold.
+        self.load(speakers)
+        with _warm_locks[self.name]:
+            if _state["vibe_warm"]:
+                return
+            for _ in _vibe_synth_stream("Hello.", _norm_speaker(speakers[0] if speakers else "")):
+                pass
+            _state["vibe_warm"] = True
+
+    def stream(self, text: str, speaker: str = ""):
+        yield from _vibe_synth_stream(text, _norm_speaker(speaker))
 
 
-def _synthesize(text: str, engine: str, speaker: str) -> tuple[bytes, int]:
-    if engine == "vibe-rt":
-        pcm = b"".join(_vibe_synth_stream(text, speaker))
-        return _pcm16_to_wav(pcm, VIBE_SR), VIBE_SR
-    voice = _get_piper()
-    sr = int(_state["piper_sr"])
-    pcm = b"".join(_piper_pcm_iter(voice, text))
-    return _pcm16_to_wav(pcm, sr), sr
+_TTS = {e.name: e for e in (_KokoroTts(), _PiperTts(), _VibeTts())}
+_warm_locks = {name: threading.Lock() for name in _TTS}
 
 
-def _synth_stream(text: str, engine: str, speaker: str):
-    """Yield raw 16-bit mono PCM frames for the chosen engine as they decode."""
-    if engine == "vibe-rt":
-        yield from _vibe_synth_stream(text, speaker)
-        return
-    voice = _get_piper()
-    yield from _piper_pcm_iter(voice, text)
+def _default_engine() -> str:
+    """Kokoro when installed, not broken, and a GPU is present, else Piper.
+    On this laptop's CPU Kokoro needs 0.6–1.9 s per sentence (RTF ~0.3) vs
+    Piper's ~0.15 s; on the RTX 4050 it beats Piper (p50 114 vs 156 ms)."""
+    k = _TTS["kokoro"]
+    if k.available() and k.name not in _state["tts_errors"] and _stt_device() == "cuda":
+        return "kokoro"
+    return FALLBACK_ENGINE
+
+
+def _resolve_engine(engine: str | None):
+    """The engine to use for a request: the named one, or Piper when that one
+    is missing or already failed to load."""
+    eng = _TTS[_norm_engine(engine)]
+    if eng.name != FALLBACK_ENGINE and (not eng.available() or eng.name in _state["tts_errors"]):
+        return _TTS[FALLBACK_ENGINE]
+    return eng
+
+
+def _load_engine(engine: str | None, speakers=()) -> tuple:
+    """Load an engine (falling back to Piper if it can't load). Returns
+    (engine, sample_rate)."""
+    eng = _resolve_engine(engine)
+    try:
+        return eng, eng.load(speakers)
+    except Exception as exc:
+        if eng.name == FALLBACK_ENGINE:
+            raise
+        _state["tts_errors"][eng.name] = str(exc)
+        print(f"[voice] {eng.name} failed to load, falling back to Piper: {exc}", flush=True)
+        fb = _TTS[FALLBACK_ENGINE]
+        return fb, fb.load()
 
 
 def _transcribe(wav_bytes: bytes) -> str:
@@ -1001,10 +1348,11 @@ def _warm_moonshine() -> None:
 
 def prepare(
     engine: str,
-    speaker: str = VIBE_DEFAULT_SPEAKER,
+    speakers: list[str] | tuple = (),
     stt_engine: str = "whisper",
 ) -> dict:
-    """Warm the requested speech recognizer and TTS engine, blocking until ready.
+    """Warm the requested speech recognizer and TTS engine (with every panel
+    voice in `speakers`), blocking until ready.
 
     Called from POST /voice/prepare when the user starts a mock interview, behind
     the "Preparing engine…" modal, so the model-load + cold-start cost (vibe-rt's
@@ -1012,13 +1360,13 @@ def prepare(
     on the first question. Nothing is warmed at boot anymore — that stacked the
     STT load and the VibeVoice cold synth on the same device at launch and froze
     the app. Idempotent: a second call is near-instant once warm. Returns a
-    per-stage readiness report (best-effort per stage)."""
-    engine = _norm_engine(engine)
-    speaker = _norm_speaker(speaker)
+    per-stage readiness report (best-effort per stage); `engine` is the voice
+    that will actually speak, `tts_fallback` the one asked for when it couldn't."""
+    requested = _norm_engine(engine)
     stt_engine = "moonshine" if stt_engine == "moonshine" else "whisper"
     t0 = time.time()
     report: dict = {
-        "engine": engine, "stt_engine": stt_engine, "stt": False, "tts": False
+        "engine": requested, "stt_engine": stt_engine, "stt": False, "tts": False
     }
     # Serialized: callers fire this fire-and-forget from several places (the
     # copilot overlay on open AND on Rec — twice each under React StrictMode —
@@ -1045,90 +1393,103 @@ def prepare(
                     report["stt_fallback"] = True
                 except Exception as fallback_exc:
                     report["stt_fallback_error"] = str(fallback_exc)
-        # warm() is best-effort and never raises, so read the loaded-state
-        # directly to report TTS readiness honestly.
-        warm(engine, speaker)
-    report["tts"] = bool(_state["vibe_warm"]) if engine == "vibe-rt" \
-        else (_state["piper"] is not None)
+        # Starting an interview retries an engine that failed earlier.
+        _state["tts_errors"].pop(requested, None)
+        # warm() is best-effort and never raises; it returns the engine that
+        # will actually speak, so readiness is reported for that one.
+        eng = warm(requested, speakers)
+    report["engine"] = eng.name
+    if eng.name != requested:
+        report["tts_fallback"] = requested
+        report["tts_error"] = _state["tts_errors"].get(requested, "not installed")
+    report["tts"] = eng.warmed()
+    report["tts_device"] = eng.device()
     report["ready"] = report["stt"] and report["tts"]
     report["took_ms"] = int((time.time() - t0) * 1000)
-    print(f"[voice] prepare engine={engine} stt={report['stt_engine']} ready={report['ready']} "
+    print(f"[voice] prepare engine={eng.name} stt={report['stt_engine']} ready={report['ready']} "
           f"({report['took_ms']}ms)", flush=True)
     return report
 
 
-def warm(engine: str, speaker: str = VIBE_DEFAULT_SPEAKER) -> None:
-    """Pay an engine's cold-start cost ahead of the interview.
-
-    For vibe-rt the cold start is brutal on a laptop GPU: the one-time model
-    load is slow AND the *first* synth is ~20x real-time while CUDA kernels JIT-
-    compile (a warm synth is ~0.3s to first audio). So we load the model and run
-    one short throwaway synth here — called when the user enables the humanlike
-    voice, so the warmup lands on the toggle instead of the first question.
-    Idempotent + single-flight; best-effort (never raises)."""
-    engine = _norm_engine(engine)
-    if engine != "vibe-rt":
-        try:
-            _get_piper()
-        except Exception:
-            pass
-        return
-    if _state["vibe_warm"] or _state["vibe_warming"]:
-        return
-    _state["vibe_warming"] = True
+def warm(engine: str | None, speakers: list[str] | tuple = ()):
+    """Pay an engine's cold-start cost (model load + one throwaway line) ahead
+    of the interview. Best-effort, never raises: an engine that fails is
+    recorded in `tts_errors` and Piper is warmed in its place. Returns the
+    engine that will speak."""
+    eng = _TTS[FALLBACK_ENGINE]
     try:
-        for _ in _vibe_synth_stream("Hello.", _norm_speaker(speaker)):
-            pass
-        _state["vibe_warm"] = True
-    except Exception:
-        pass
-    finally:
-        _state["vibe_warming"] = False
+        eng, _sr = _load_engine(engine, speakers)
+        eng.warm(list(speakers))
+    except Exception as exc:
+        print(f"[voice] {eng.name} warm failed: {exc}", flush=True)
+        if eng.name != FALLBACK_ENGINE:
+            _state["tts_errors"][eng.name] = str(exc)
+            eng = _TTS[FALLBACK_ENGINE]
+            try:
+                eng.warm()
+            except Exception:
+                pass
+    return eng
 
 
 # ── endpoints ────────────────────────────────────────────────────────────────
 @router.get("/status")
 async def status():
-    """Report whether voice is usable + which device it runs on. `available` is
-    the default (Piper + STT) path; `vibe_available` reports whether the heavier
-    VibeVoice voice can be toggled on. `voices` lists the panelist presets the UI
-    can assign. The UI shows device so the user knows if they're on GPU (live) or
-    CPU (laggy)."""
+    """Report what's installed and loaded, and where it runs. `available` is
+    the baseline (Piper + Whisper) path; `tts_engines` describes every voice
+    (installed, loaded, device, panel presets, last error) and
+    `default_engine` is the one an engine-less request gets. The legacy
+    `vibe_available` / `voices` / `default_speaker` keys describe VibeVoice."""
     # Prefer what's already known; detecting via torch (`_device`) would block
     # the event loop on a cold torch import every time the overlay polls.
     device = _state["device"] or _state.get("stt_device") \
         or await asyncio.to_thread(_stt_device)
     detail = _state["import_error"]
-    try:
-        import importlib.util
-        def have(mod: str) -> bool:
-            return importlib.util.find_spec(mod) is not None
-        piper_ok = have("piper")
-        stt_ok = have("faster_whisper")
-        moonshine_ok = have("moonshine_voice")
-        vibe_ok = have("torch") and have("vibevoice")
-        available = piper_ok and stt_ok
-        if not available:
-            missing = [m for m, ok in
-                       (("piper-tts", piper_ok), ("faster-whisper", stt_ok)) if not ok]
-            detail = f"missing: {', '.join(missing)} (run backend/setup.ps1 -Voice)"
-    except Exception as exc:
-        available = False
-        vibe_ok = False
-        moonshine_ok = False
-        detail = str(exc)
+    piper_ok = _TTS["piper"].available()
+    stt_ok = _ASR["whisper"].available()
+    available = piper_ok and stt_ok
+    if not available:
+        missing = [m for m, ok in
+                   (("piper-tts", piper_ok), ("faster-whisper", stt_ok)) if not ok]
+        detail = f"missing: {', '.join(missing)} (run backend/setup.ps1 -Voice)"
+    tts_engines = {
+        name: {
+            "label": eng.label,
+            "available": eng.available(),
+            "loaded": eng.loaded(),
+            "device": eng.device(),
+            "voices": list(eng.voices),
+            "default_speaker": eng.default_speaker,
+            "error": _state["tts_errors"].get(name),
+        }
+        for name, eng in _TTS.items()
+    }
+    stt_engines = {
+        name: {"available": eng.available(), "loaded": eng.loaded(), "device": eng.device()}
+        for name, eng in _ASR.items()
+    }
+    gpu = None
+    torch = sys.modules.get("torch")   # only report if something already imported it
+    if torch is not None:
+        try:
+            if torch.cuda.is_initialized():
+                gpu = {"allocated_mb": round(torch.cuda.memory_allocated() / 2**20),
+                       "reserved_mb": round(torch.cuda.memory_reserved() / 2**20)}
+        except Exception:
+            pass
     return {
         "available": available,
         "device": device,
-        "vibe_available": vibe_ok,
-        "moonshine_available": moonshine_ok,
-        "stt_engines": [
-            name for name, ok in
-            (("moonshine", moonshine_ok), ("whisper", stt_ok)) if ok
-        ],
+        "default_engine": await asyncio.to_thread(_default_engine),
+        "tts_engines": tts_engines,
+        "stt_engines": [n for n in ("moonshine", "whisper") if stt_engines[n]["available"]],
+        "recognizers": stt_engines,
+        "torch_gpu": gpu,
+        "vibe_available": tts_engines["vibe-rt"]["available"],
+        "moonshine_available": stt_engines["moonshine"]["available"],
         "voices": list(VIBE_VOICES.keys()),
         "default_speaker": VIBE_DEFAULT_SPEAKER,
-        "tts_loaded": (_state["piper"] is not None) or (_state["vibe_model"] is not None),
+        "tts_loaded": any(e["loaded"] for e in tts_engines.values()),
         "stt_loaded": _state["stt"] is not None,
         "stt_phase": _state["stt_phase"],
         "stt_device": _state.get("stt_device"),
@@ -1137,14 +1498,15 @@ async def status():
     }
 
 
+def _speakers(req: TtsRequest) -> list[str]:
+    return [s for s in (req.speakers or ([req.speaker] if req.speaker else [])) if s]
+
+
 @router.post("/warm")
 async def warm_endpoint(req: TtsRequest):
-    """Kick an engine's warmup in the background and return immediately. The UI
-    calls this when the user turns on the humanlike voice so vibe-rt's slow cold
-    start happens then, not on the first interview question."""
+    """Kick an engine's warmup in the background and return immediately."""
     engine = _norm_engine(req.engine)
-    speaker = _norm_speaker(req.speaker)
-    threading.Thread(target=warm, args=(engine, speaker), daemon=True).start()
+    threading.Thread(target=warm, args=(engine, _speakers(req)), daemon=True).start()
     return {"warming": True, "engine": engine}
 
 
@@ -1155,10 +1517,8 @@ async def prepare_endpoint(req: TtsRequest):
     the cold start happens there instead of at app startup. Runs off the event
     loop so the sidecar keeps serving other requests during the ~30s vibe-rt
     cold synth."""
-    engine = _norm_engine(req.engine)
-    speaker = _norm_speaker(req.speaker)
     return await asyncio.to_thread(
-        prepare, engine, speaker, (req.stt_engine or "whisper").strip().lower()
+        prepare, req.engine, _speakers(req), (req.stt_engine or "whisper").strip().lower()
     )
 
 
@@ -1167,10 +1527,13 @@ async def tts(req: TtsRequest):
     text = (req.text or "").strip()
     if not text:
         return {"error": "empty text"}
-    engine = _norm_engine(req.engine)
-    speaker = _norm_speaker(req.speaker)
+
+    def synth() -> tuple[bytes, int]:
+        eng, sr = _load_engine(req.engine, _speakers(req))
+        return _pcm16_to_wav(b"".join(eng.stream(text, req.speaker or "")), sr), sr
+
     try:
-        wav_bytes, sr = await asyncio.to_thread(_synthesize, text, engine, speaker)
+        wav_bytes, sr = await asyncio.to_thread(synth)
         return {"audio_b64": base64.b64encode(wav_bytes).decode("ascii"), "sample_rate": sr}
     except Exception as exc:
         return {"error": f"TTS failed: {exc}"}
@@ -1179,40 +1542,44 @@ async def tts(req: TtsRequest):
 @router.post("/tts_stream")
 async def tts_stream(req: TtsRequest):
     """Stream synthesized PCM as it's decoded. Body = raw little-endian 16-bit
-    mono PCM frames (no WAV header); the sample rate is in `X-Sample-Rate`."""
+    mono PCM frames (no WAV header); the sample rate is in `X-Sample-Rate` and
+    the engine that spoke (after any Piper fallback) in `X-Engine`."""
     text = (req.text or "").strip()
     if not text:
         return Response(status_code=204)
-    engine = _norm_engine(req.engine)
-    speaker = _norm_speaker(req.speaker)
-    # Load the model (and preset, for vibe-rt) up front so the sample rate is
-    # known before we commit to streaming headers, and import/download errors
-    # surface as a clean 500 instead of a half-written stream.
+    speaker = req.speaker or ""
+    # Load the model (and voice) up front, off the event loop, so the sample
+    # rate is known before we commit to streaming headers, and import/download
+    # errors surface as a clean 500 (or a Piper fallback) instead of a
+    # half-written stream.
     try:
-        sr = _prepare(engine, speaker)
+        eng, sr = await asyncio.to_thread(_load_engine, req.engine, [speaker] if speaker else [])
     except Exception as exc:
         return JSONResponse({"error": f"TTS unavailable: {exc}"}, status_code=500)
 
     def gen():
         try:
-            yield from _synth_stream(text, engine, speaker)
-        except Exception:
+            yield from eng.stream(text, speaker)
+        except Exception as exc:
             # Mid-stream failure: stop cleanly. Headers are already sent, so the
             # client just sees a short stream — better than a 500 it can't read.
+            print(f"[voice] {eng.name} synth failed: {exc}", flush=True)
             return
 
     return StreamingResponse(
         gen(),
         media_type="application/octet-stream",
-        headers={"X-Sample-Rate": str(sr)},
+        headers={"X-Sample-Rate": str(sr), "X-Engine": eng.name},
     )
 
 
+# The mock-interview mic's Moonshine stream: the recognizer contract under its
+# original paths and response shapes.
 @router.post("/stt-stream/start")
 async def stt_stream_start():
     """Create one ordered Moonshine stream for a candidate answer."""
     try:
-        session_id = await asyncio.to_thread(_moonshine_start)
+        session_id = await asyncio.to_thread(_asr_open, "moonshine")
         return {"session_id": session_id, "engine": "moonshine"}
     except Exception as exc:
         print(f"[voice] Moonshine stream start failed: {exc}", flush=True)
@@ -1224,9 +1591,9 @@ async def stt_stream_chunk(req: SttStreamChunkRequest):
     """Append one ordered PCM chunk and return the latest phrase state."""
     try:
         pcm = base64.b64decode(req.audio_b64)
-        session = _moonshine_session(req.session_id)
+        eng, session = _asr_get(req.session_id)
         return await asyncio.to_thread(
-            session.add_pcm16, pcm, req.sample_rate, req.elapsed_ms
+            eng.push, session, pcm, req.sample_rate, req.elapsed_ms
         )
     except Exception as exc:
         print(f"[voice] Moonshine stream chunk failed: {exc}", flush=True)
@@ -1238,7 +1605,7 @@ async def stt_stream_finish(req: SttStreamSessionRequest):
     """Flush the stream and return the final answer text."""
     try:
         t0 = time.time()
-        text = await asyncio.to_thread(_moonshine_finish, req.session_id)
+        text = await asyncio.to_thread(_asr_end, req.session_id)
         print(
             f"[voice] Moonshine final: {time.time() - t0:.2f}s, "
             f"{len(text)} chars",
@@ -1254,7 +1621,7 @@ async def stt_stream_finish(req: SttStreamSessionRequest):
 async def stt_stream_cancel(req: SttStreamSessionRequest):
     """Discard an abandoned candidate stream."""
     try:
-        await asyncio.to_thread(_moonshine_finish, req.session_id, True)
+        await asyncio.to_thread(_asr_end, req.session_id, True)
     except Exception:
         pass
     return {"cancelled": True}
@@ -1277,24 +1644,29 @@ async def asr_warm():
 
 
 @router.post("/asr/start")
-async def asr_start():
-    """Open a streaming-transcription session for one copilot question."""
-    _evict_stale_asr_sessions()
-    session_id = uuid.uuid4().hex
-    with _asr_sessions_lock:
-        _asr_sessions[session_id] = _AsrSession()
-    return {"session_id": session_id, "engine": "whisper"}
+async def asr_start(req: AsrStartRequest | None = None):
+    """Open a streaming-transcription session (default Whisper: one copilot
+    question)."""
+    engine = (req.engine if req and req.engine else "whisper").strip().lower()
+    try:
+        session_id = await asyncio.to_thread(_asr_open, engine)
+        return {"session_id": session_id, "engine": engine}
+    except Exception as exc:
+        print(f"[voice] ASR start ({engine}) failed: {exc}", flush=True)
+        return {"error": str(exc)}
 
 
 @router.post("/asr/chunk")
 async def asr_chunk(req: AsrChunkRequest):
-    """Append audio; maybe start a background decode. Returns the newest
-    partial transcript without waiting for any decode."""
+    """Append audio and return the live state. Whisper only schedules a
+    background decode, so it runs inline; other engines decode in the call."""
     try:
-        session = _asr_session(req.session_id)
-        session.append(base64.b64decode(req.audio_b64) if req.audio_b64 else b"")
-        session.poke(force=req.decode)
-        return session.state()
+        eng, session = _asr_get(req.session_id)
+        pcm = base64.b64decode(req.audio_b64) if req.audio_b64 else b""
+        args = (session, pcm, req.sample_rate, req.elapsed_ms, req.decode)
+        if eng.name == "whisper":
+            return eng.push(*args)
+        return await asyncio.to_thread(eng.push, *args)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -1302,9 +1674,11 @@ async def asr_chunk(req: AsrChunkRequest):
 @router.post("/asr/snapshot")
 async def asr_snapshot(req: AsrSnapshotRequest):
     """Transcript of the question so far (blocks only if no decode covers the
-    last voiced sample yet)."""
+    last voiced sample yet). Whisper sessions only."""
     try:
-        session = _asr_session(req.session_id)
+        _eng, session = _asr_get(req.session_id)
+        if not hasattr(session, "snapshot"):
+            raise ValueError("snapshot is Whisper-only; use /asr/finish")
         t0 = time.perf_counter()
         text, reused = await asyncio.to_thread(session.snapshot, req.upto_samples)
         return {"text": text, "reused": reused,
@@ -1314,10 +1688,21 @@ async def asr_snapshot(req: AsrSnapshotRequest):
         return {"error": str(exc)}
 
 
+@router.post("/asr/finish")
+async def asr_finish(req: SttStreamSessionRequest):
+    """Final transcript of a session; closes it."""
+    try:
+        return {"text": await asyncio.to_thread(_asr_end, req.session_id)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 @router.post("/asr/close")
 async def asr_close(req: SttStreamSessionRequest):
-    with _asr_sessions_lock:
-        _asr_sessions.pop(req.session_id, None)
+    try:
+        await asyncio.to_thread(_asr_end, req.session_id, True)
+    except ValueError:
+        pass
     return {"closed": True}
 
 
@@ -1342,6 +1727,7 @@ def _vad_tail(pcm: bytes) -> dict:
     call. Warm inference is ~4 ms for a 2 s window; the model itself is the
     one already bundled with faster-whisper (loaded during /voice/prepare)."""
     import numpy as np
+    _pin_torch_cudnn()  # faster_whisper imports ctranslate2
     from faster_whisper.vad import VadOptions, get_speech_timestamps
     audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
     window_ms = len(audio) / 16.0

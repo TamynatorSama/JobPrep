@@ -1,10 +1,10 @@
 # InterPrep backend setup
 # Run once from the backend/ directory: .\setup.ps1
-#   -Voice   also install the optional voice stack (Piper + VibeVoice TTS,
-#            Moonshine streaming STT + faster-whisper fallback). Auto-picks the CUDA torch build if an NVIDIA
+#   -Voice   also install the optional voice stack (Kokoro + Piper + VibeVoice
+#            TTS, Moonshine streaming STT + faster-whisper fallback). Auto-picks the CUDA torch build if an NVIDIA
 #            GPU is present, otherwise the CPU build (slower TTS).
-#            Piper is the fast default voice; VibeVoice ("vibe-rt") is opt-in in
-#            Settings for a more humanlike voice + a multi-interviewer panel.
+#            Kokoro is the default voice (Piper the fast fallback); VibeVoice
+#            ("vibe-rt") is opt-in in Settings for the most humanlike voice.
 
 param([switch]$Voice)
 
@@ -114,7 +114,21 @@ if ($Voice) {
         Write-Host "    VibeVoice install failed (default Piper voice still works): $_" -ForegroundColor Yellow
     }
 
-    # Pre-fetch the Piper voice (fast default) so the first interview has no
+    # Pre-fetch Kokoro-82M (the default interview voice): weights, the panel
+    # voices, and spaCy's small English model for misaki's G2P (misaki would
+    # otherwise pip-install it mid-interview). Best-effort: Piper takes over if
+    # Kokoro is missing, and the backend lazy-downloads anything not fetched.
+    Write-Host "==> Fetching Kokoro-82M voice + spaCy en_core_web_sm ..."
+    try {
+        & .\.venv\Scripts\python -m spacy download en_core_web_sm
+        & .\.venv\Scripts\python -c "from huggingface_hub import hf_hub_download as d; r='hexgrad/Kokoro-82M'; [d(r, f) for f in ['config.json', 'kokoro-v1_0.pth'] + [f'voices/{v}.pt' for v in ['af_heart', 'am_michael', 'af_bella', 'am_fenrir', 'af_sarah', 'am_puck']]]"
+        if ($LASTEXITCODE -ne 0) { throw "Kokoro download failed" }
+        Write-Host "    Kokoro ready." -ForegroundColor Green
+    } catch {
+        Write-Host "    Kokoro prefetch failed (Piper still works; Kokoro retries on first use): $_" -ForegroundColor Yellow
+    }
+
+    # Pre-fetch the Piper voice (fast fallback) so the first interview has no
     # download stall. Best-effort: the backend also lazy-downloads on first use.
     $piperDir = Join-Path (Get-Location) "models\piper"
     $piperVoice = "en_US-amy-medium"

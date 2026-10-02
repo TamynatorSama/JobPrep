@@ -67,7 +67,7 @@ struct RecorderState {
 /// Queue item for the serialized TTS playback worker.
 enum TtsMsg {
     /// One chunk (typically a sentence) plus the panelist voice to speak it in
-    /// (`speaker` is used only by the "vibe-rt" engine; Piper ignores it).
+    /// (a preset name of the Kokoro / VibeVoice engine; Piper ignores it).
     Speak { text: String, speaker: String },
     Flush, // end of one utterance → emit `voice:speak_done`
 }
@@ -84,8 +84,9 @@ struct VoiceState {
     /// Barge-in (interrupt the AI by talking) only works with headphones —
     /// on speakers the mic hears the AI's own voice. Off by default.
     barge_enabled: Arc<AtomicBool>,
-    /// TTS engine for the next utterance: "vibe-rt" = VibeVoice (humanlike),
-    /// anything else (incl. empty) = Piper (fast default).
+    /// TTS engine for the next utterance: "kokoro" | "piper" | "vibe-rt",
+    /// passed through to the sidecar; empty = its default (Kokoro with a
+    /// GPU, else Piper).
     engine: Arc<Mutex<String>>,
     listen_stop: Mutex<Option<Arc<AtomicBool>>>,
     /// Manual "transcribe now" trigger for the active capture. Distinct from
@@ -879,17 +880,17 @@ fn voice_set_barge(voice: State<VoiceState>, enabled: bool) {
     voice.barge_enabled.store(enabled, Ordering::SeqCst);
 }
 
-/// Select the TTS engine for the interview voice: "vibe-rt" = VibeVoice
-/// (humanlike), anything else = Piper (fast default). Takes effect on the next
-/// spoken utterance.
+/// Select the TTS engine for the interview voice ("kokoro" | "piper" |
+/// "vibe-rt"; "" = the sidecar's default). Takes effect on the next spoken
+/// utterance.
 #[tauri::command]
 fn voice_set_engine(voice: State<VoiceState>, engine: String) {
     *voice.engine.lock().unwrap() = engine;
 }
 
-/// Warm up an engine's cold start off the critical path. vibe-rt's first load +
-/// first synth take ~2.5 min on a laptop GPU; calling this when the user enables
-/// the humanlike voice moves that cost off the first interview question. Fire-
+/// Warm up an engine's cold start off the critical path. A GPU voice's first
+/// load + first synth take minutes on a laptop; calling this ahead of the
+/// interview moves that cost off the first question. Fire-
 /// and-forget: spawns a thread so the UI isn't blocked, and ignores errors (the
 /// sidecar may not be up yet / the engine may not be installed).
 #[tauri::command]
@@ -911,15 +912,17 @@ async fn voice_prepare(
     sidecar: State<'_, SidecarState>,
     engine: String,
     speaker: Option<String>,
+    speakers: Option<Vec<String>>,
     stt_engine: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let url = require_url(&sidecar)?;
     let speaker = speaker.unwrap_or_default();
+    let speakers = speakers.unwrap_or_default();
     // The main window's only caller is the mock-interview start, so Moonshine
     // is the default. The copilot explicitly requests Whisper for loopback STT.
     let stt_engine = stt_engine.unwrap_or_else(|| "moonshine".to_string());
     tauri::async_runtime::spawn_blocking(move || {
-        backend_client::voice_prepare(&url, &engine, &speaker, &stt_engine)
+        backend_client::voice_prepare(&url, &engine, &speaker, &speakers, &stt_engine)
     })
     .await
     .map_err(|e| e.to_string())?

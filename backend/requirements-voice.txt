@@ -1,14 +1,17 @@
 # Optional voice stack for the live mock interview — the DEFAULT (fast) path.
 # Install via:  .\setup.ps1 -Voice
 #
-# These are light and conflict-free, so the default Piper voice + STT always
-# install cleanly. The heavier, humanlike VibeVoice engine is installed in a
-# SEPARATE step by setup.ps1 (it pins an older transformers, so it must not be
+# These resolve cleanly together (misaki adds spaCy but changes nothing else),
+# so Kokoro, the Piper fallback and STT always install. The humanlike VibeVoice
+# engine is installed in a SEPARATE step by setup.ps1 (it pins an older
+# transformers, so it must not be
 # resolved together with these — see the -Voice block in setup.ps1).
 #
 # torch is intentionally NOT pinned here — setup.ps1 installs it first, picking
 # the CUDA build when an NVIDIA GPU is detected, else the CPU build.
 numpy>=1.26
-piper-tts             # fast neural TTS (default interview voice; offline, CPU, onnxruntime)
+kokoro>=0.9.4         # Kokoro-82M, the default interview voice (torch; GPU when present)
+misaki[en]>=0.9.4     # Kokoro's English G2P (spaCy en_core_web_sm fetched by setup.ps1)
+piper-tts             # fast neural TTS (fallback interview voice; offline, CPU, onnxruntime)
 faster-whisper>=1.0.0  # local STT, auto GPU/CPU
 moonshine-voice==0.0.69 # streaming STT; pinned while its Python API is alpha
