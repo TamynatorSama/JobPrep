@@ -215,10 +215,13 @@ pub fn stream_knockout_screen(
 /// Settings (no app restart needed).
 pub fn seed_config(base_url: &str, token: &str, llm: &Value) -> Result<(), String> {
     let client = reqwest::blocking::Client::new();
+    // `warm`: the copilot's route — the sidecar opens that client's connection
+    // in the background so the first live answer isn't a cold start.
+    let warm = crate::ai_routing::llm_for("copilot");
     let resp = client
         .post(format!("{base_url}/config/seed"))
         .header("X-InterPrep-Token", token)
-        .json(&serde_json::json!({ "llm": llm }))
+        .json(&serde_json::json!({ "llm": llm, "warm": warm }))
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .map_err(|e| e.to_string())?;
@@ -538,6 +541,11 @@ fn cancelled() -> std::sync::MutexGuard<'static, std::collections::HashSet<Strin
 /// for a stream that already finished.
 pub fn cancel_stream(stream_id: &str) {
     cancelled().insert(stream_id.to_string());
+}
+
+/// Stream a request body built elsewhere (screen.rs) on the `chat:*` channel.
+pub fn stream_json(app: AppHandle, url: String, body: Value, stream_id: String) {
+    spawn_stream(app, url, body, stream_id);
 }
 
 fn spawn_stream(app: AppHandle, url: String, body: Value, stream_id: String) {

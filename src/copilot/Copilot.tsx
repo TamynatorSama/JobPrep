@@ -62,6 +62,9 @@ interface Cheatsheet {
   updatedAt?: number;
 }
 interface CopilotCtx { label: string; context: string; cheatsheet: Cheatsheet | null; }
+/** A screen capture waiting to be sent (screen.rs). Rust keeps the full image;
+ *  the overlay only ever gets this small preview. */
+interface ShotInfo { id: number; preview: string; width: number; height: number; chars: number; textHeavy: boolean; ms: number; }
 
 // One live-transcript row. `qid` ties an interviewer line to the Rust listener's
 // question so partial transcripts update it in place.
@@ -336,11 +339,28 @@ function NavBar({ view, setView, recording, onToggleRec, onCapture, time }: {
 }
 
 // ── Shell: quick-ask footer ─────────────────────────────────────────────────
-function QuickAsk({ placeholder, value, onChange, onSend, busy, listening, onMic }: {
+function QuickAsk({ placeholder, value, onChange, onSend, busy, listening, onMic, shots, shotNote, onRemoveShot }: {
   placeholder: string; value: string; onChange: (v: string) => void; onSend: () => void; busy: boolean; listening: boolean; onMic: () => void;
+  shots: ShotInfo[]; shotNote: string; onRemoveShot: (id: number) => void;
 }) {
+  const ready = !busy && (!!value.trim() || shots.length > 0);
   return (
     <div style={{ flexShrink: 0, padding: "9px 10px 10px", borderTop: `1px solid ${T.glassEdge}` }}>
+      {(shots.length > 0 || shotNote) && (
+        // Captures waiting to be sent: Send answers them, with the typed text as
+        // an optional instruction.
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7 }}>
+          {shots.map((s, i) => (
+            <div key={s.id} style={{ position: "relative", width: 56, height: 36, borderRadius: 7, overflow: "hidden", border: `0.5px solid ${T.border}`, flexShrink: 0 }}>
+              <img src={s.preview} alt={`Capture ${i + 1}`} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+              <button onClick={() => onRemoveShot(s.id)} aria-label={`Remove capture ${i + 1}`} style={{ position: "absolute", top: 2, right: 2, width: 15, height: 15, borderRadius: 5, border: "none", background: "rgba(0,0,0,0.65)", color: "#fff", fontSize: 10, lineHeight: "15px", padding: 0, ...press }}>×</button>
+            </div>
+          ))}
+          <span style={{ fontSize: 10.5, color: T.textTertiary, lineHeight: 1.35 }}>
+            {shotNote || (shots.length < 3 ? "Send to answer · Capture again to add a page" : "Send to answer")}
+          </span>
+        </div>
+      )}
       <div style={{ display: "flex", alignItems: "center", gap: 8, background: "rgba(255,255,255,0.04)", border: `0.5px solid ${T.border}`, borderRadius: 12, padding: "7px 8px 7px 12px" }}>
         <Icon name="spark" size={13} color={T.textTertiary} sw={2} />
         <input
@@ -364,8 +384,8 @@ function QuickAsk({ placeholder, value, onChange, onSend, busy, listening, onMic
         <button onClick={onMic} aria-label="Hold mic — capture a spoken question" style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: listening ? T.accentSoft : "rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, ...press }}>
           <Icon name="mic" size={13} color={listening ? T.accent : T.textSecondary} />
         </button>
-        <button onClick={onSend} disabled={busy || !value.trim()} aria-label="Send" style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: value.trim() && !busy ? "#fff" : "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: busy ? 0.6 : 1, ...press }}>
-          <Icon name="send" size={12} color={value.trim() && !busy ? "#0C0C0C" : T.textSecondary} sw={2} />
+        <button onClick={onSend} disabled={!ready} aria-label="Send" style={{ width: 26, height: 26, borderRadius: 8, border: "none", background: ready ? "#fff" : "rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: busy ? 0.6 : 1, ...press }}>
+          <Icon name="send" size={12} color={ready ? "#0C0C0C" : T.textSecondary} sw={2} />
         </button>
       </div>
     </div>
@@ -465,10 +485,7 @@ function ListenBody({ phase, time, lines, levelRef, question, answer, answering,
               <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.violet }}>Suggested answer</span>
             </div>
             <div style={{ background: "rgba(168,85,247,0.06)", border: `0.5px solid ${T.border}`, borderRadius: 12, padding: "11px 12px", minHeight: 44 }}>
-              <p style={{ fontSize: 13, lineHeight: 1.55, color: T.text, letterSpacing: "-0.13px", whiteSpace: "pre-wrap" }}>
-                {answer || "…"}
-                {answering && answer.length > 0 && <span style={{ marginLeft: 1, opacity: 0.5, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
-              </p>
+              <AnswerText text={answer || "…"} answering={answering && answer.length > 0} lineHeight={1.55} />
             </div>
           </div>
         )}
@@ -478,6 +495,27 @@ function ListenBody({ phase, time, lines, levelRef, question, answer, answering,
 }
 
 // ── View: suggested answer (real streamed answer) ───────────────────────────
+// Answer text with ``` fences shown as code blocks (a screen answer can carry a
+// full solution); everything else keeps its line breaks.
+const MONO = "'Cascadia Mono','JetBrains Mono',Consolas,monospace";
+function AnswerText({ text, answering, lineHeight }: { text: string; answering: boolean; lineHeight: number }) {
+  const parts = text.split("```");
+  return (
+    <div>
+      {parts.map((seg, i) => i % 2 === 1
+        ? <pre key={i} style={{ margin: "6px 0", padding: "8px 10px", borderRadius: 8, background: "rgba(0,0,0,0.35)", border: `0.5px solid ${T.border}`, fontFamily: MONO, fontSize: 11.5, lineHeight: 1.5, color: T.text, whiteSpace: "pre", overflowX: "auto" }}>
+            {seg.replace(/^[\w+#.-]*\n/, "")}
+          </pre>
+        : seg.trim() && (
+          <p key={i} style={{ fontSize: 13, lineHeight, color: T.text, letterSpacing: "-0.13px", whiteSpace: "pre-wrap" }}>
+            {seg.replace(/^\n+|\n+$/g, "")}
+          </p>
+        ))}
+      {answering && <span style={{ marginLeft: 1, opacity: 0.5, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
+    </div>
+  );
+}
+
 function AnswerBody({ question, answer, answering, jobLabel, onRephrase, onDeeper, onCopy }: {
   question: string; answer: string; answering: boolean; jobLabel: string; onRephrase: () => void; onDeeper: () => void; onCopy: () => void;
 }) {
@@ -488,7 +526,7 @@ function AnswerBody({ question, answer, answering, jobLabel, onRephrase, onDeepe
           <Icon name="spark" size={22} color={T.violet} sw={1.9} />
         </div>
         <p style={{ fontSize: 13, fontWeight: 600, color: T.text, fontFamily: T.fontDisplay }}>Suggested answers land here</p>
-        <p style={{ fontSize: 11.5, lineHeight: 1.5, color: T.textTertiary, maxWidth: 240 }}>Type a question below, or hit <b style={{ color: T.textSecondary }}>Rec audio</b> to ask one out loud. I'll draft a strong spoken answer.</p>
+        <p style={{ fontSize: 11.5, lineHeight: 1.5, color: T.textTertiary, maxWidth: 240 }}>Type a question below, hit <b style={{ color: T.textSecondary }}>Rec audio</b> to ask one out loud, or <b style={{ color: T.textSecondary }}>Capture</b> your screen (Ctrl+Shift+\) for a coding problem or quiz.</p>
         {jobLabel
           ? <span style={pill(T.violetSoft, "#c084fc")}><Icon name="brief" size={10} color="#c084fc" sw={2} />Grounded on {jobLabel}</span>
           : <span style={pill("rgba(255,255,255,0.05)", T.textTertiary)}>No active job — open one in the app to ground answers</span>}
@@ -515,10 +553,7 @@ function AnswerBody({ question, answer, answering, jobLabel, onRephrase, onDeepe
           {answering && answer.length === 0 && (
             <div style={{ position: "absolute", top: 0, left: 0, width: 60, height: "100%", background: "linear-gradient(90deg, rgba(168,85,247,0.16), transparent)", animation: "co-sheen 2.6s ease-in-out infinite", pointerEvents: "none" }} />
           )}
-          <p style={{ fontSize: 13, lineHeight: 1.6, color: T.text, letterSpacing: "-0.13px", whiteSpace: "pre-wrap" }}>
-            {answer || (answering ? "…" : "")}
-            {answering && answer.length > 0 && <span style={{ marginLeft: 1, opacity: 0.5, animation: "co-blink 1s steps(2) infinite" }}>▌</span>}
-          </p>
+          <AnswerText text={answer || (answering ? "…" : "")} answering={answering && answer.length > 0} lineHeight={1.6} />
         </div>
         <div style={{ display: "flex", gap: 7, marginTop: 12 }}>
           {([{ i: "refresh", l: "Rephrase", on: onRephrase }, { i: "arrowUp", l: "Go deeper", on: onDeeper }, { i: "copy", l: "Copy", on: onCopy }] as const).map((a) => (
@@ -757,7 +792,7 @@ function SettingsBody({ cloak, opacity, onOpacity }: { cloak: CloakStatus; opaci
       <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary, paddingLeft: 2 }}>Capture</span>
       <div style={{ marginTop: 4 }}>
         <SRow icon="mic" label="Your microphone" sub="Powers question capture when Rec is on" on c={T.accent} />
-        <SRow icon="camera" label="Screen capture" sub="Tap Capture to send a screenshot — never automatic" on={false} last />
+        <SRow icon="camera" label="Screen capture" sub="Capture or Ctrl+Shift+\ grabs the window you're in — never automatic, never saved" on last />
       </div>
       <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: T.textTertiary, paddingLeft: 2, display: "block", marginTop: 14 }}>Privacy</span>
       <div style={{ marginTop: 4 }}>
@@ -799,6 +834,10 @@ export default function Copilot() {
   const [routeOpen, setRouteOpen] = useState(false);
   const [cheat, setCheat] = useState<Cheatsheet | null>(null);
   const [cheatBusy, setCheatBusy] = useState(false);
+  // Screen captures waiting to be sent (Rust holds the images), and a short
+  // note for the chip row ("Capturing…", an error).
+  const [shots, setShots] = useState<ShotInfo[]>([]);
+  const [shotNote, setShotNote] = useState("");
   const [opacity, setOpacity] = useState<number>(() => {
     const v = parseFloat(localStorage.getItem("co-opacity") ?? "1");
     return v >= 0.3 && v <= 1 ? v : 1;
@@ -1002,9 +1041,10 @@ export default function Copilot() {
   // chat:* + voice:* listeners (StrictMode-safe).
   useEffect(() => {
     const unsubs: UnlistenFn[] = [];
+    const pending: Promise<void>[] = [];
     let alive = true;
     const reg = <P,>(ev: string, h: (p: P) => void) => {
-      listen<P>(ev, (e) => h(e.payload)).then((u) => { if (alive) unsubs.push(u); else u(); });
+      pending.push(listen<P>(ev, (e) => h(e.payload)).then((u) => { if (alive) unsubs.push(u); else u(); }));
     };
 
     reg<{ streamId: string; content: string }>("chat:token", (p) => {
@@ -1088,6 +1128,8 @@ export default function Copilot() {
       setAnswering(true);
       setPhase("thinking");
     });
+    // Ctrl+Shift+\ — Rust captured the screen and started the answer.
+    reg<{ streamId: string }>("copilot:screen", (p) => adoptScreen(p.streamId));
     reg<{ qid: number; streamId: string }>("copilot:resume", (p) => {
       // They kept talking — the speculative answer was cancelled in Rust.
       upsertLine(p.qid, "", true);
@@ -1115,9 +1157,68 @@ export default function Copilot() {
       setLines((ls) => [...ls.map((l) => ({ ...l, last: false })), { speaker: "System", text: `Listening stopped: ${p.error}`, last: true }]);
     });
 
+    // Listeners are registered (async) above; then pick up captures waiting in
+    // Rust, and — if a hotkey capture is what opened this overlay — its answer.
+    Promise.all(pending).then(() => {
+      if (!alive) return;
+      invoke<ShotInfo[]>("copilot_capture_list").then(setShots).catch(() => {});
+      invoke<{ streamId: string } | null>("copilot_screen_ready")
+        .then((r) => { if (r) adoptScreen(r.streamId); })
+        .catch(() => {});
+    });
+
     return () => { alive = false; unsubs.forEach((u) => u()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Start showing an answer that's streaming under `sid` from a screen capture.
+  const beginScreenAnswer = (sid: string, question: string) => {
+    if (activeStream.current && activeStream.current !== sid) {
+      invoke("cancel_chat_stream", { streamId: activeStream.current }).catch(() => {});
+    }
+    activeStream.current = sid;
+    if (tokRaf.current != null) { cancelAnimationFrame(tokRaf.current); tokRaf.current = null; }
+    tokBuf.current = "";
+    setRoute(null); setRouteOpen(false);
+    setStory(null);
+    setQuestion(question);
+    lastQARef.current = { q: question, a: "" };
+    setAnswer("");
+    setAnswering(true);
+    setPhase("thinking");
+    setView("answer");
+    setShots([]);
+    setShotNote("");
+  };
+  const adoptScreen = (sid: string) => beginScreenAnswer(sid, "What's on my screen");
+
+  const flash = () => {
+    const el = document.getElementById("co-flash");
+    if (el) { el.style.animation = "none"; void el.offsetWidth; el.style.animation = "co-flash .36s ease-out"; }
+  };
+
+  // Capture adds a page to the stack (up to 3); Send answers them all.
+  const capture = () => {
+    flash();
+    setShotNote("Capturing…");
+    invoke<ShotInfo>("copilot_capture")
+      .then((s) => { setShots((prev) => [...prev, s].slice(-3)); setShotNote(""); })
+      .catch((e) => setShotNote(`Capture failed: ${String(e)}`));
+  };
+
+  const removeShot = (id: number) => {
+    invoke("copilot_capture_remove", { id }).catch(() => {});
+    setShots((prev) => prev.filter((s) => s.id !== id));
+  };
+
+  const sendScreen = (instruction: string) => {
+    if (activeStream.current) return;
+    const sid = newStreamId();
+    beginScreenAnswer(sid, instruction.trim() || "What's on my screen");
+    invoke("copilot_screen_answer", { instruction, streamId: sid }).catch((e) => {
+      if (activeStream.current === sid) { activeStream.current = null; setAnswering(false); setAnswer(`Error: ${String(e)}`); }
+    });
+  };
 
   const runStream = async (message: string, history: [string, string][]) => {
     if (activeStream.current) return;
@@ -1159,7 +1260,12 @@ export default function Copilot() {
     runStream(t, []);
   };
 
-  const submit = () => { const t = input; setInput(""); ask(t); };
+  const submit = () => {
+    const t = input;
+    setInput("");
+    if (shots.length > 0) sendScreen(t);
+    else ask(t);
+  };
 
   const followUp = (instruction: string) => {
     const { q, a } = lastQARef.current;
@@ -1198,12 +1304,6 @@ export default function Copilot() {
 
   const micOnce = () => { if (!listening) startListen(); };
 
-  const capture = () => {
-    // Screenshot capture isn't wired to a backend command yet — flash only.
-    const el = document.getElementById("co-flash");
-    if (el) { el.style.animation = "none"; void el.offsetWidth; el.style.animation = "co-flash .36s ease-out"; }
-  };
-
   const win = getCurrentWebviewWindow();
   const placeholder = view === "cheat" ? "Ask Copilot to pull a story…" : view === "live" ? "Ask privately while they talk…" : "Ask anything…";
 
@@ -1225,7 +1325,7 @@ export default function Copilot() {
         {view === "settings" && <SettingsBody cloak={cloak} opacity={opacity} onOpacity={applyOpacity} />}
       </div>
       {view !== "settings" && (
-        <QuickAsk placeholder={placeholder} value={input} onChange={setInput} onSend={submit} busy={answering} listening={listening} onMic={micOnce} />
+        <QuickAsk placeholder={shots.length ? "Add an instruction (optional)…" : placeholder} value={input} onChange={setInput} onSend={submit} busy={answering} listening={listening} onMic={micOnce} shots={shots} shotNote={shotNote} onRemoveShot={removeShot} />
       )}
     </div>
   );

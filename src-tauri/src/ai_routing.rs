@@ -19,6 +19,8 @@
 //!     ChatGPT, chatgpt_auth.rs) — connected when signed in, and limited to
 //!     Responses API features: no company research (Chat Completions engine)
 //!     and no embeddings.
+//!   * embeddings resolve to "local" (the sidecar's on-device model) unless
+//!     the per-feature Embeddings row names a provider.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -157,7 +159,22 @@ pub struct Resolved {
     pub substituted_from: String,
 }
 
+/// Embeddings run on-device (backend/local_embed.py: no key, no API call)
+/// unless the per-feature Embeddings row names a provider.
+fn embeddings_on_device(routing: &AiRouting) -> bool {
+    routing.mode != "per_feature"
+        || routing.features.get("embeddings").map_or(true, |r| r.provider.trim().is_empty())
+}
+
 pub fn resolve(routing: &AiRouting, conn: &Conn, feature: &str) -> Resolved {
+    if feature == "embeddings" && embeddings_on_device(routing) {
+        return Resolved {
+            provider: "local".into(),
+            model: "bge-small-en-v1.5".into(),
+            fallbacks: vec![],
+            substituted_from: String::new(),
+        };
+    }
     let creds = conn.creds;
     let row = if routing.mode == "per_feature" {
         routing.features.get(feature).cloned().unwrap_or_default()
@@ -297,11 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_cannot_embed() {
+    fn embeddings_run_on_device_unless_a_row_picks_a_provider() {
         let mut routing = AiRouting::default();
         routing.same.provider = "anthropic".into();
         let c = creds("g", "", "a");
         assert_eq!(resolve(&routing, &conn(&c), "coach").provider, "anthropic");
+        assert_eq!(resolve(&routing, &conn(&c), "embeddings").provider, "local");
+        // An explicit row is honored — and Anthropic, which can't embed, gets a stand-in.
+        routing.mode = "per_feature".into();
+        routing.features.insert("embeddings".into(), Route { provider: "anthropic".into(), ..Default::default() });
         let e = resolve(&routing, &conn(&c), "embeddings");
         assert_eq!((e.provider.as_str(), e.substituted_from.as_str()), ("gemini", "anthropic"));
     }

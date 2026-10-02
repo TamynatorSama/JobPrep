@@ -45,6 +45,14 @@ class RagDoc(BaseModel):
     LLM alongside the retrieved text."""
     source: str
     text: str
+    # Stable id of the thread the text came from (cheatsheet deltas), optional.
+    id: str = ""
+
+
+class ImageInput(BaseModel):
+    """One base64 image attached to a chat turn (the copilot's screen capture)."""
+    mime: str = "image/jpeg"
+    data: str
 
 
 class ChatRequest(BaseModel):
@@ -56,11 +64,21 @@ class ChatRequest(BaseModel):
     # "coach" (default, friendly assistant), "interviewer" (in-character live
     # interview), or "copilot" (stealth overlay: short, speakable, plain-text
     # answers on the lowest-latency model tier).
-    mode: Literal["coach", "interviewer", "copilot"] = "coach"
+    # "screen" = the copilot answering a screen capture (`images` + the OCR
+    # text in `screen_text`, built by Rust's screen.rs).
+    mode: Literal["coach", "interviewer", "copilot", "screen"] = "coach"
+    images: List[ImageInput] = []
+    screen_text: str = ""
     # The job's corpus (resume, company research, sibling chats) for RAG. The
     # backend embeds + retrieves the most relevant chunks per message. Empty
     # disables retrieval.
     documents: List[RagDoc] = []
+
+
+class BriefRequest(BaseModel):
+    """POST /chat/brief — the job context to condense (job_brief.py)."""
+    job_context: str = ""
+    llm: LLMConfig = LLMConfig()
 
 
 class ResearchRequest(BaseModel):
@@ -119,6 +137,10 @@ class CheatsheetRequest(BaseModel):
     company_research: Optional[str] = ""  # research dossier text
     documents: List[RagDoc] = []          # conversation transcripts (chats / interviews)
     previous_markdown: Optional[str] = "" # existing cheatsheet to refine, if any
+    # The stored cheatsheet (summary/stories/facts/questions/seen). With
+    # `incremental`, only conversation text added since it was built is sent.
+    previous: Optional[dict] = None
+    incremental: bool = False
     llm: LLMConfig = LLMConfig()
 
 
@@ -143,8 +165,10 @@ class SeedConfigRequest(BaseModel):
     """Refresh the in-memory LLM config (provider toggle + all keys).
     Token-guarded; called by the Rust shell on startup and whenever the user
     saves Settings, so the browser-extension endpoints pick up changes without
-    an app restart."""
+    an app restart. `warm` is the copilot's route, warmed in the background so
+    the first live answer doesn't pay the provider's cold path."""
     llm: LLMConfig = LLMConfig()
+    warm: Optional[LLMConfig] = None
 
 
 class FieldSpec(BaseModel):

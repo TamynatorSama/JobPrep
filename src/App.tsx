@@ -272,9 +272,43 @@ interface Cheatsheet {
   markdown?: string;
   /** Epoch-ms of the last build. */
   updatedAt?: number;
+  /** Chars of each conversation (by chat id) this build read, so the automatic
+   *  rebuild after a mock interview sends only what's new. */
+  seen?: Record<string, number>;
 }
 
 type Screen = "chat" | "timeline";
+
+/** The research dossier: the Company Research thread's finished AI output. */
+const researchTextOf = (job: Job): string => {
+  const research = job.chats.find(
+    (c) => c.id === `c-research-${job.id}` || c.title === "Company Research",
+  );
+  return research
+    ? research.messages
+        .filter((m) => m.role === "ai" && !m.streaming && m.content.trim().length > 0)
+        .map((m) => m.content)
+        .join("\n\n")
+    : "";
+};
+
+/** Job context for the copilot overlay and the mock interviewer: JD + research
+ *  dossier + resume. The sidecar condenses it into a cached brief keyed by this
+ *  exact text (backend/job_brief.py), so both must build it here. The resume
+ *  gets 8k chars (education often sits past 4k); the brief pays for that once. */
+const fullJobContext = (job: Job, resumes: Resume[]): string => {
+  const researchText = researchTextOf(job);
+  const masterResume = resumes.length > 0 ? resumes[resumes.length - 1] : null;
+  const resumeText = (job.tailoredResume?.trim() || masterResume?.text?.trim() || "");
+  return [
+    `Company: ${job.company}`,
+    `Role: ${job.role}`,
+    job.location ? `Location: ${job.location}` : "",
+    job.jobDescription ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}` : "",
+    researchText ? `\nCompany Research Dossier:\n${researchText.slice(0, 6000)}` : "",
+    resumeText ? `\nCandidate Resume:\n${resumeText.slice(0, 8000)}` : "",
+  ].filter(Boolean).join("\n");
+};
 
 // ─── Mock-interview config ─────────────────────────────────────────────────
 
@@ -2852,7 +2886,7 @@ const AI_FEATURES: { id: string; label: string }[] = [
   { id: "extension",        label: "Browser extension" },
   { id: "embeddings",       label: "Embeddings (RAG)" },
 ];
-const PROVIDER_NAME: Record<string, string> = { gemini: "Gemini", openai: "OpenAI", chatgpt: "ChatGPT plan", anthropic: "Claude" };
+const PROVIDER_NAME: Record<string, string> = { gemini: "Gemini", openai: "OpenAI", chatgpt: "ChatGPT plan", anthropic: "Claude", local: "On-device" };
 /** Which providers can run a feature (mirrors ai_routing.rs `supports`). */
 const providersFor = (feature?: string) =>
   ["gemini", "openai", "chatgpt", "anthropic"].filter((p) =>
@@ -2952,7 +2986,7 @@ const AiRoutingTab = ({ credentials }: { credentials: Credentials }) => {
     return (
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1.4fr 1fr", gap: 6 }}>
         <select style={sel} value={p} onChange={(e) => onChange({ ...value, provider: e.target.value, model: "" })}>
-          {inherit && <option value="">Same as default</option>}
+          {inherit && <option value="">{embeddings ? "On-device (default)" : "Same as default"}</option>}
           {!inherit && !p && <option value="">Choose…</option>}
           {providers.map((id) => (
             <option key={id} value={id}>{PROVIDER_NAME[id]}{connected(id) ? "" : id === "chatgpt" ? " (not signed in)" : " (no key)"}</option>
@@ -3161,7 +3195,7 @@ const ChatGptCard = () => {
       }))
       .then(() => setApplied(exceptCopilot
         ? "Done — ChatGPT plan for everything, copilot on Gemini (falls back to the plan). Adjust in AI routing."
-        : "Done — ChatGPT plan for everything it can run; Gemini covers research and embeddings."))
+        : "Done — ChatGPT plan for everything it can run; Gemini covers company research, and retrieval runs on-device."))
       .catch((e) => setErr(String(e)));
   };
   const btn: CSSProperties = {
@@ -3665,7 +3699,7 @@ const App = () => {
   const startApplicationPrepRef = useRef<((job: Job) => void) | null>(null);
   /// Latest `generateCheatsheet` closure, so the `chat:done` listener can
   /// auto-refresh the cheatsheet after a mock interview without re-registering.
-  const generateCheatsheetRef = useRef<((jobId: string) => void) | null>(null);
+  const generateCheatsheetRef = useRef<((jobId: string, opts?: { incremental?: boolean }) => void) | null>(null);
   /// Single-flight guard for cheatsheet builds (state updates lag a tick).
   const cheatBusyRef = useRef<Record<string, boolean>>({});
   /// Latest selected job id, so cross-window events (copilot cheatsheet refresh)
@@ -3984,7 +4018,7 @@ const App = () => {
             j.id !== job.id ? j : { ...j, lastInterview: { outcome, date, chatId: thread.id } },
           ));
           // Fold how the candidate actually answered into the living cheatsheet.
-          generateCheatsheetRef.current?.(job.id);
+          generateCheatsheetRef.current?.(job.id, { incremental: true });
           return; // interview over — don't speak/listen further
         }
         // Voice mode: flush the trailing partial sentence, then end the
@@ -4153,28 +4187,9 @@ const App = () => {
       invoke("set_copilot_context", { label: "", context: "" }).catch(() => {});
       return;
     }
-    const research = job.chats.find(
-      (c) => c.id === `c-research-${job.id}` || c.title === "Company Research",
-    );
-    const researchText = research
-      ? research.messages
-          .filter((m) => m.role === "ai" && !m.streaming && m.content.trim().length > 0)
-          .map((m) => m.content)
-          .join("\n\n")
-      : "";
-    const masterResume = resumes.length > 0 ? resumes[resumes.length - 1] : null;
-    const resumeText = (job.tailoredResume?.trim() || masterResume?.text?.trim() || "");
-    const context = [
-      `Company: ${job.company}`,
-      `Role: ${job.role}`,
-      job.location ? `Location: ${job.location}` : "",
-      job.jobDescription ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}` : "",
-      researchText ? `\nCompany Research Dossier:\n${researchText.slice(0, 6000)}` : "",
-      resumeText ? `\nCandidate Resume:\n${resumeText.slice(0, 4000)}` : "",
-    ].filter(Boolean).join("\n");
     invoke("set_copilot_context", {
       label: `${job.role} · ${job.company}`,
-      context,
+      context: fullJobContext(job, resumes),
       cheatsheet: job.cheatsheet ?? null,
     }).catch(() => {});
   }, [selectedJob, resumes]);
@@ -4183,7 +4198,9 @@ const App = () => {
   // and company research. Manual (button) + auto after a mock interview. The
   // result is stored on the Job (→ persisted + pushed to the copilot tab) and
   // written to disk as the job's living cheatsheet.md. Single-flight per job.
-  const generateCheatsheet = (jobId: string) => {
+  // `incremental` (the automatic run after a mock interview) has the sidecar
+  // fold only the conversation text added since the last build into the sheet.
+  const generateCheatsheet = (jobId: string, opts?: { incremental?: boolean }) => {
     const job = jobsRef.current.find((j) => j.id === jobId);
     if (!job) return;
     if (cheatBusyRef.current[jobId]) return; // already building — don't double-fire
@@ -4200,14 +4217,14 @@ const App = () => {
 
     // Conversation transcripts (coach chats + mock interviews) — skip the
     // research thread (passed separately) and empty/streaming bubbles.
-    const documents: { source: string; text: string }[] = [];
+    const documents: { id: string; source: string; text: string }[] = [];
     for (const c of job.chats) {
       if (c.id === research?.id) continue;
       const body = c.messages
         .filter((m) => !m.streaming && m.content.trim().length > 0 && !m.content.includes(INTERVIEW_DONE_MARKER))
         .map((m) => `${m.role === "user" ? "Candidate" : "Assistant"}: ${m.content}`)
         .join("\n\n");
-      if (body) documents.push({ source: `chat: ${c.title}`, text: body });
+      if (body) documents.push({ id: c.id, source: `chat: ${c.title}`, text: body });
     }
 
     invoke<Cheatsheet & { error?: string }>("generate_cheatsheet", {
@@ -4220,6 +4237,8 @@ const App = () => {
         company_research: companyResearch,
         documents,
         previous_markdown: job.cheatsheet?.markdown ?? "",
+        previous: job.cheatsheet ?? null,
+        incremental: !!opts?.incremental,
       },
     })
       .then((cs) => {
@@ -4230,6 +4249,7 @@ const App = () => {
           questions: cs.questions ?? [],
           markdown: cs.markdown ?? "",
           updatedAt: cs.updatedAt ?? Date.now(),
+          seen: cs.seen,
         };
         setJobs((prev) => prev.map((j) => j.id !== jobId ? j : { ...j, cheatsheet }));
         if (cheatsheet.markdown) {
@@ -4368,29 +4388,32 @@ const App = () => {
     const resumeText = (job?.tailoredResume?.trim() || masterResume?.text?.trim() || "");
     const resumeName = job?.tailoredResume?.trim() ? "Tailored Resume" : (masterResume?.name ?? "Resume");
 
-    const jobContext = job
-      ? [
-          `Company: ${job.company}`,
-          `Role: ${job.role}`,
-          job.location ? `Location: ${job.location}` : "",
-          job.jobDescription ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}` : "",
-          resumeText ? `\nCandidate Resume (${resumeName}):\n${resumeText.slice(0, 4000)}` : "",
-          isInterview && targetThread?.interviewConfig
+    // The interviewer gets the copilot's full context (+ its setup block last):
+    // the sidecar swaps in the job's condensed brief, which also brings the
+    // company research. The coach keeps the raw JD + resume, plus retrieval.
+    const jobContext = !job
+      ? ""
+      : isInterview
+        ? fullJobContext(job, resumes) + (targetThread?.interviewConfig
             ? `\n${formatInterviewSetup(targetThread.interviewConfig)}`
-            : "",
-        ].filter(Boolean).join("\n")
-      : "";
+            : "")
+        : [
+            `Company: ${job.company}`,
+            `Role: ${job.role}`,
+            job.location ? `Location: ${job.location}` : "",
+            job.jobDescription ? `\nJob Description:\n${job.jobDescription.slice(0, 1500)}` : "",
+            resumeText ? `\nCandidate Resume (${resumeName}):\n${resumeText.slice(0, 4000)}` : "",
+          ].filter(Boolean).join("\n");
 
-    // RAG corpus. For interviewer mode, restrict to resume + company-research
-    // dossier — sibling chats (esp. prep where the user rehearsed answers)
-    // would leak into a "live" interview and break realism.
+    // RAG corpus — coach only. The interviewer's brief already carries the
+    // resume and research, and sibling chats (esp. prep where the user
+    // rehearsed answers) would leak into a "live" interview and break realism.
     const ragDocs: { source: string; text: string }[] = [];
-    if (job) {
+    if (job && !isInterview) {
       if (resumeText) ragDocs.push({ source: "resume", text: resumeText });
       for (const c of job.chats) {
         if (c.id === targetChatId) continue;
         const isResearch = c.title === "Company Research";
-        if (isInterview && !isResearch) continue;
         const body = c.messages
           .filter((m) => !m.streaming && m.content.trim().length > 0)
           .map((m) => `${m.role === "user" ? "Candidate" : "Assistant"}: ${m.content}`)

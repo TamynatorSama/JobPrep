@@ -75,20 +75,55 @@ impl CopilotContextState {
     }
 }
 
+/// Bumped on every context change; a delayed brief prefetch only fires if it's
+/// still the latest, so a burst of changes (typing in the JD) sends one.
+static BRIEF_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Mirror the active job's research context + cheatsheet from the main window.
 /// Called whenever the selected job (or its research / resume / cheatsheet)
-/// changes.
+/// changes — the main window re-sends on every job-state update, so only a
+/// real context change starts a brief prefetch.
 #[tauri::command]
 pub fn set_copilot_context(
+    app: AppHandle,
     state: State<CopilotContextState>,
     label: String,
     context: String,
     cheatsheet: Option<serde_json::Value>,
 ) {
-    let mut g = state.inner.lock().unwrap();
-    g.label = label;
-    g.context = context;
-    g.cheatsheet = cheatsheet.unwrap_or(serde_json::Value::Null);
+    let changed = {
+        let mut g = state.inner.lock().unwrap();
+        let changed = g.context != context;
+        g.label = label;
+        g.context = context.clone();
+        g.cheatsheet = cheatsheet.unwrap_or(serde_json::Value::Null);
+        changed
+    };
+    if changed && !context.trim().is_empty() {
+        use std::sync::atomic::Ordering;
+        let gen = BRIEF_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if BRIEF_GEN.load(Ordering::SeqCst) == gen {
+                prefetch_brief(&app, &context);
+            }
+        });
+    }
+}
+
+/// Have the sidecar build the condensed job brief (backend/job_brief.py) for
+/// this context, so the first copilot question — and the mock interviewer —
+/// already get the short prompt. Blocking, best-effort; a no-op until the
+/// sidecar is up (lib.rs calls it again once it is).
+pub fn prefetch_brief(app: &AppHandle, context: &str) {
+    let Some(url) = crate::sidecar_url(app) else { return };
+    let body = serde_json::json!({
+        "job_context": context,
+        "llm": crate::ai_routing::llm_for("copilot"),
+    });
+    if let Err(e) = crate::backend_client::post_json(&url, "/chat/brief", &body, 180) {
+        eprintln!("[copilot] brief prefetch failed: {e}");
+    }
 }
 
 /// Read the latest active-job context. Called by the overlay right before each
@@ -478,6 +513,21 @@ pub fn toggle(app: &AppHandle) -> Result<bool, String> {
             recloak_now(&win); // re-apply cloak/no-activate after a hide/show
             Ok(true)
         }
+    } else {
+        build_window(app)?;
+        Ok(true)
+    }
+}
+
+/// Show the overlay without toggling it (screen.rs's capture hotkey). Returns
+/// `true` when it had to be built — its page isn't listening for events yet.
+pub fn show(app: &AppHandle) -> Result<bool, String> {
+    if let Some(win) = app.get_webview_window(COPILOT_LABEL) {
+        if !win.is_visible().unwrap_or(false) {
+            win.show().map_err(|e| e.to_string())?;
+            recloak_now(&win);
+        }
+        Ok(false)
     } else {
         build_window(app)?;
         Ok(true)

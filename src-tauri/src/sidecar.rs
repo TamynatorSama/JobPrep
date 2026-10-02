@@ -175,6 +175,9 @@ impl PythonSidecar {
             // below so the extension can be paired).
             .env("INTERPREP_BRIDGE_TOKEN", token)
             .env("INTERPREP_GEMINI_KEY", gemini_key)
+            // stdout is a file, so Python would default to cp1252 here and a
+            // print with "—" or "→" in it raises mid-request.
+            .env("PYTHONIOENCODING", "utf-8")
             .stdout(Stdio::from(stdio_handle))
             .stderr(Stdio::from(stderr_handle))
             .spawn()

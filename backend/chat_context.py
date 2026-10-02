@@ -39,6 +39,14 @@ RECENT_CHAR_BUDGET = 6000
 MIN_RECENT = 2
 # Don't bother summarizing a trivially small older block; RAG alone covers it.
 MIN_OLDER_CHARS = 800
+# The older/recent boundary moves in steps of this many messages (3 exchanges)
+# when the extra verbatim text that costs is small (short turns, like a mock
+# interview's). If it moved every turn, the recap — and so the system prompt —
+# would change on every message: a summary call each turn, and a prompt that
+# never matches the provider's prompt cache. Long turns (coach replies) skip the
+# step: keeping them verbatim would cost more than the recap call saves.
+SUMMARY_STEP = 6
+STEP_EXTRA_CHARS = RECENT_CHAR_BUDGET // 2
 
 
 def split_history(
@@ -49,20 +57,24 @@ def split_history(
     """Split `history` into (older, recent).
 
     `recent` is the newest run of turns that fits in `budget` chars (but always
-    at least `min_recent` turns); `older` is everything before it. Order is
-    preserved (oldest-first) in both lists.
+    at least `min_recent` turns); `older` is everything before it, rounded down
+    to a whole number of SUMMARY_STEP messages when that keeps at most
+    STEP_EXTRA_CHARS more verbatim. Order is preserved (oldest-first) in both
+    lists.
     """
-    recent: List[ChatMessage] = []
+    kept = 0
     total = 0
     for turn in reversed(list(history)):
         c = len(turn.content or "")
-        if recent and total + c > budget and len(recent) >= min_recent:
+        if kept and total + c > budget and kept >= min_recent:
             break
-        recent.append(turn)
+        kept += 1
         total += c
-    recent.reverse()
-    older = list(history[: len(history) - len(recent)])
-    return older, recent
+    n_older = len(history) - kept
+    stepped = n_older - n_older % SUMMARY_STEP
+    if sum(len(t.content or "") for t in history[stepped:n_older]) <= STEP_EXTRA_CHARS:
+        n_older = stepped
+    return list(history[:n_older]), list(history[n_older:])
 
 
 def _speaker(role: str, mode: str) -> str:
@@ -104,13 +116,52 @@ prose — no preamble, no markdown headers. Do NOT invent turns that aren't belo
 """
 
 
-# Recap cache. The chat route calls summarize_older on EVERY message of a long
-# thread, and the older block is identical between turns until enough new turns
-# roll past the recent-budget — so without a cache each message pays an extra
-# serial LLM call (latency before the stream even starts) for the same recap.
-# Keyed by content hash; tiny LRU since threads in one app session are few.
+_ROLL_PROMPT_COACH = """Below is the running summary of an interview-prep coaching conversation, then
+the turns that came after it. Rewrite the summary so it also covers the new
+turns: the user's goal/role, key facts about them, advice already given, and any
+decisions or open threads. Be factual and concise (under ~150 words). Output
+plain prose — no preamble, no markdown headers.
+
+=== SUMMARY SO FAR ===
+{summary}
+
+=== LATER TURNS ===
+{transcript}
+"""
+
+_ROLL_PROMPT_INTERVIEWER = """Below is the running recap of a LIVE mock interview, then the turns that came
+after it. Rewrite the recap so it also covers the new turns. For each question
+asked so far, note the question's topic and how strong the candidate's answer
+was (with one concrete detail); also note any red flags or standout strengths.
+Be factual and concise (under ~180 words). Output plain prose — no preamble, no
+markdown headers. Do NOT invent turns that aren't in the recap or below.
+
+=== RECAP SO FAR ===
+{summary}
+
+=== LATER TURNS ===
+{transcript}
+"""
+
+
+# Recap cache, keyed by a hash of the older turns (chained turn by turn, so
+# every prefix has its own key). The chat route calls summarize_older on EVERY
+# message of a long thread: an unchanged older block is a cache hit, and a block
+# that grew rolls the cached recap of its longest summarized prefix forward over
+# just the new turns — so a recap call reads ~one exchange plus the old recap,
+# not the whole thread again. Tiny LRU: threads in one app session are few.
 _summary_cache: OrderedDict[str, str] = OrderedDict()
 _SUMMARY_CACHE_MAX = 64
+
+
+def _prefix_keys(turns: Sequence[ChatMessage], mode: str) -> List[str]:
+    """keys[m] identifies turns[:m] (keys[0] = the empty prefix)."""
+    h = hashlib.sha1(mode.encode("utf-8"))
+    keys = [h.hexdigest()]
+    for t in turns:
+        h.update(f"\x00{t.role}\x00{t.content or ''}".encode("utf-8"))
+        keys.append(h.copy().hexdigest())
+    return keys
 
 
 async def summarize_older(
@@ -123,14 +174,19 @@ async def summarize_older(
     transcript = render_transcript(older, mode)
     if len(transcript) < MIN_OLDER_CHARS:
         return ""
-    key = hashlib.sha1(f"{mode}\x00{transcript}".encode("utf-8")).hexdigest()
-    if key in _summary_cache:
-        _summary_cache.move_to_end(key)
-        return _summary_cache[key]
-    template = (
-        _SUMMARY_PROMPT_INTERVIEWER if mode == "interviewer" else _SUMMARY_PROMPT_COACH
-    )
-    prompt = template.format(transcript=transcript)
+    keys = _prefix_keys(older, mode)
+    if keys[-1] in _summary_cache:
+        _summary_cache.move_to_end(keys[-1])
+        return _summary_cache[keys[-1]]
+    interviewer = mode == "interviewer"
+    prompt = (_SUMMARY_PROMPT_INTERVIEWER if interviewer else _SUMMARY_PROMPT_COACH).format(
+        transcript=transcript)
+    for m in range(len(older) - 1, 0, -1):
+        prev = _summary_cache.get(keys[m])
+        if prev:
+            prompt = (_ROLL_PROMPT_INTERVIEWER if interviewer else _ROLL_PROMPT_COACH).format(
+                summary=prev, transcript=render_transcript(older[m:], mode))
+            break
     try:
         text, _model = await llm_factory.generate_raw(
             cfg, prompt, tier="fast", temperature=0.2,
@@ -139,7 +195,7 @@ async def summarize_older(
         return ""
     summary = (text or "").strip()
     if summary:
-        _summary_cache[key] = summary
+        _summary_cache[keys[-1]] = summary
         while len(_summary_cache) > _SUMMARY_CACHE_MAX:
             _summary_cache.popitem(last=False)
     return summary

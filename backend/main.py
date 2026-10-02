@@ -59,9 +59,9 @@ def _preimport_llm_packages() -> None:
     """Import the LangChain partner packages in the background so the first chat
     doesn't pay their cold import (langchain_google_genai alone is ~30s on a
     cold disk cache — the sidecar imports them lazily per provider, and that
-    stall used to land on the user's first message). Imports only: no model
-    load, no GPU, no network — unlike the old model warmup this cannot freeze
-    the app at launch."""
+    stall used to land on the user's first message). No GPU, no network, and
+    the only model load is the small CPU embedder — unlike the old model warmup
+    this cannot freeze the app at launch."""
     for pkg in ("langchain_google_genai", "langchain_openai", "langchain_anthropic"):
         try:
             __import__(pkg)
@@ -75,6 +75,13 @@ def _preimport_llm_packages() -> None:
             __import__(mod)
         except Exception:
             pass  # surfaces as a clear error on the request that needs it
+    # The on-device RAG embedder (34 MB, CPU), if it's already downloaded — the
+    # first download happens on first use instead, never at boot.
+    try:
+        import local_embed
+        local_embed.warm_if_cached()
+    except Exception:
+        pass
 
 
 @asynccontextmanager

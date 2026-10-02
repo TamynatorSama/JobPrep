@@ -9,6 +9,7 @@ mod credentials;
 mod jobs_store;
 mod recorder;
 mod resume_store;
+pub mod screen;
 mod sidecar;
 mod types;
 pub mod vad;
@@ -215,6 +216,11 @@ fn poll_timeline_inbox(state: State<SidecarState>) -> Result<serde_json::Value, 
 fn ack_timeline_inbox(state: State<SidecarState>, ids: Vec<String>) -> Result<(), String> {
     let (url, token) = bridge_url_token(&state)?;
     backend_client::timeline_ack(&url, &token, ids)
+}
+
+/// The sidecar's base URL once it's up, for background work outside commands.
+pub(crate) fn sidecar_url(app: &AppHandle) -> Option<String> {
+    app.state::<SidecarState>().inner.lock().unwrap().base_url.clone()
 }
 
 fn bridge_url_token(state: &State<SidecarState>) -> Result<(String, String), String> {
@@ -1208,9 +1214,9 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        // Global hotkey to toggle the stealth copilot overlay without touching
-        // the mouse. Only one shortcut is registered (below, in `setup`), so the
-        // handler doesn't need to disambiguate which fired.
+        // Global hotkeys (registered below, in `setup`): Ctrl+\ toggles the
+        // stealth copilot overlay, Ctrl+` ends a listening capture, and
+        // Ctrl+Shift+\ screenshots the working window and answers it.
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -1231,6 +1237,12 @@ pub fn run() {
                         }
                         return;
                     }
+                    // Ctrl+Shift+\ → capture the working window and answer it.
+                    let screen_sc = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Backslash);
+                    if *shortcut == screen_sc {
+                        screen::hotkey(app);
+                        return;
+                    }
                     if let Err(e) = copilot::toggle(app) {
                         eprintln!("[copilot] hotkey toggle failed: {e}");
                     }
@@ -1242,6 +1254,7 @@ pub fn run() {
         .manage(VoiceState::default())
         .manage(CopilotListenState::default())
         .manage(copilot::CopilotContextState::default())
+        .manage(screen::ScreenState::default())
         .setup(|app| {
             // Keep the ChatGPT plan token fresh in the background (no-op while
             // signed out) and re-seed the extension's copy after each refresh.
@@ -1264,7 +1277,13 @@ pub fn run() {
                 if let Err(e) = app.global_shortcut().register(finish_sc) {
                     eprintln!("[copilot] finish shortcut register failed: {e}");
                 }
+                // Ctrl+Shift+\ → screenshot the working window and answer it.
+                let screen_sc = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Backslash);
+                if let Err(e) = app.global_shortcut().register(screen_sc) {
+                    eprintln!("[copilot] screen shortcut register failed: {e}");
+                }
             }
+            screen::start_foreground_tracker(app.handle().clone());
 
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -1300,6 +1319,13 @@ pub fn run() {
                         // sidecar) so the copilot never meets a cold recognizer:
                         // a cold first load is ~1 min of DLL loading on this box.
                         let _ = backend_client::speech_warm(&url);
+                        // The selected job's context arrived before the sidecar
+                        // did; build its brief now (copilot.rs debounces later
+                        // changes itself).
+                        let ctx = handle.state::<copilot::CopilotContextState>().context();
+                        if !ctx.trim().is_empty() {
+                            copilot::prefetch_brief(&handle, &ctx);
+                        }
                     }
                     Err(e) => {
                         {
@@ -1368,6 +1394,11 @@ pub fn run() {
             copilot::copilot_typing,
             copilot::copilot_set_opacity,
             copilot::set_copilot_context,
+            screen::copilot_capture,
+            screen::copilot_capture_remove,
+            screen::copilot_capture_list,
+            screen::copilot_screen_answer,
+            screen::copilot_screen_ready,
             copilot::get_copilot_context,
         ])
         .build(tauri::generate_context!())

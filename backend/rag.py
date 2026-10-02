@@ -4,9 +4,9 @@ the company-research dossier, and prior chat threads for the same job.
 Design constraints (see CLAUDE.md):
   * The corpus per job is tiny (one resume, ~one research doc, a handful of
     chats), so a full vector DB (FAISS/Chroma) is overkill. We embed chunks
-    with whichever configured provider has an embeddings API (Gemini or OpenAI
-    — see llm_provider.make_embeddings) and rank with plain-Python cosine
-    similarity. No numpy / faiss dependency.
+    on-device by default (local_embed.py; Gemini or OpenAI when chosen in AI
+    routing — see llm_provider.make_embeddings) and rank with plain-Python
+    cosine similarity. No faiss dependency.
   * Retrieval is stateless from the frontend's point of view: the client
     sends the job's documents with every chat request. To avoid re-embedding
     unchanged text on each message, chunk embeddings are cached on disk,
@@ -42,6 +42,7 @@ DEFAULT_K = 6
 DEFAULT_MAX_CHARS = 6000
 
 _cache_lock = threading.Lock()
+_mem_cache: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -117,8 +118,11 @@ def _embed_cached(emb, namespace: str, texts: Sequence[str]) -> List[List[float]
     def key(t: str) -> str:
         return _hash(f"{namespace}::{t}")
 
+    global _mem_cache
     with _cache_lock:
-        cache = _load_cache()
+        if _mem_cache is None:  # parse the file once per process, not per message
+            _mem_cache = _load_cache()
+        cache = _mem_cache
         missing = sorted({t for t in texts if key(t) not in cache})
         if missing:
             vectors = emb.embed_documents(list(missing))

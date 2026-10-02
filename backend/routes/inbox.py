@@ -108,11 +108,41 @@ async def ack_timeline(req: InboxAckRequest):
     return {"ok": True}
 
 
+# Page text sent to the extractor, after _clean_page. A posting is rarely over
+# 8k chars; the rest of a page is chrome.
+_EXTRACT_CAP = 12000
+
+
+def _clean_page(text: str, title: str) -> str:
+    """Strip the bulk of a page's chrome before the LLM sees it: every repeat of
+    a short line (nav links, buttons, "Easy apply", related-job cards) goes, and
+    a page still over the cap is windowed to start just above the job title."""
+    seen: set[str] = set()
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if len(line) <= 40:
+            k = line.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+        lines.append(line)
+    page = "\n".join(lines)
+    if len(page) > _EXTRACT_CAP:
+        at = page.find(title.strip()) if title.strip() else -1
+        start = max(0, min(at - 500, len(page) - _EXTRACT_CAP)) if at > 0 else 0
+        page = page[start:start + _EXTRACT_CAP]
+    return page
+
+
 @router.post("/extract")
 async def extract(req: PageExtractRequest):
     """Parse company/role/location/JD out of raw page text with the configured
     LLM, for pages where the client-side heuristics (JSON-LD / DOM) come up
-    short."""
+    short. Fast tier on cleaned, capped page text: copying fields out of a page
+    doesn't need the smart tier, and most of a page is chrome."""
     import llm_provider as llm_factory
 
     cfg = runtime_config.get_llm_config()
@@ -124,10 +154,11 @@ async def extract(req: PageExtractRequest):
 
     contents = (
         EXTRACT_PROMPT
-        + f"\n\n=== URL ===\n{req.url}\n\n=== TITLE ===\n{req.title}\n\n=== PAGE TEXT ===\n{req.page_text[:30000]}"
+        + f"\n\n=== URL ===\n{req.url}\n\n=== TITLE ===\n{req.title}\n\n=== PAGE TEXT ===\n"
+        + _clean_page(req.page_text, req.title)
     )
     try:
-        data, _model = await llm_factory.generate_json(cfg, contents, tier="smart", temperature=0.1)
+        data, _model = await llm_factory.generate_json(cfg, contents, tier="fast", temperature=0.1)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"extraction failed: {exc}")
 

@@ -14,31 +14,36 @@ import asyncio
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 import runtime_config
-from models import SeedConfigRequest
+from models import LLMConfig, SeedConfigRequest
 
 router = APIRouter()
 
-# One-shot guard for the LLM channel warmup below.
-_warmed = False
+# The route last warmed (provider, model). A seed warms again only when the
+# copilot's route changed (Settings save), not on every token refresh.
+_warmed: tuple | None = None
 
 
-async def _warm_llm_channel() -> None:
-    """Fire one tiny fast-tier generation so the FIRST real question doesn't pay
-    the provider cold path (client construction + TLS/HTTP2 channel + session
-    setup — measured ~70s worst-case on a cold boot when it also contends with
-    the package pre-import, ~2-3s otherwise). Runs in the background right after
-    the Rust shell seeds credentials at startup; costs a handful of tokens."""
+async def _warm_llm_channel(target: LLMConfig | None) -> None:
+    """Fire tiny generations so the FIRST real answer doesn't pay the provider
+    cold path (client construction + TLS/HTTP2 channel + session setup —
+    measured ~70s worst-case on a cold boot when it also contends with the
+    package pre-import, ~2-3s otherwise; a first screen answer on the ChatGPT
+    plan took 21 s when the wrong route had been warmed). `target` is the
+    copilot's route (Rust sends it with the seed); older callers fall back to
+    the seeded extension config. Runs in the background; costs a handful of
+    tokens."""
     global _warmed
-    if _warmed:
-        return
-    cfg = runtime_config.get_llm_config()
+    cfg = target or runtime_config.get_llm_config()
     import llm_provider as llm_factory
     if llm_factory.missing_key_error(cfg):
         return  # no key yet — the next seed (Settings save) retries
-    _warmed = True
+    key = (cfg.provider, cfg.model)
+    if _warmed == key:
+        return
+    _warmed = key
     try:
         import time
-        from routes.chat import COPILOT_MAX_TOKENS
+        from routes.chat import COPILOT_MAX_TOKENS, SCREEN_MAX_TOKENS
         llm_factory.set_feature("warmup")
         t0 = time.time()
         # Same tier/temperature/max_tokens as a copilot answer, so this builds
@@ -47,9 +52,14 @@ async def _warm_llm_channel() -> None:
         await llm_factory.generate_raw(cfg, "Reply with the single word: ok",
                                        tier="instant", temperature=None,
                                        max_tokens=COPILOT_MAX_TOKENS)
-        print(f"[bridge] LLM channel warmed in {time.time() - t0:.1f}s", flush=True)
+        print(f"[bridge] LLM channel warmed in {time.time() - t0:.1f}s "
+              f"({cfg.provider} {cfg.model or 'auto'})", flush=True)
+        # ...and the client a screen-capture answer uses (fast tier).
+        await llm_factory.generate_raw(cfg, "Reply with the single word: ok",
+                                       tier="fast", temperature=None,
+                                       max_tokens=SCREEN_MAX_TOKENS)
     except Exception as exc:  # warmup is best-effort, never a failure surface
-        _warmed = False
+        _warmed = None
         print(f"[bridge] LLM warmup failed (will retry on next seed): {exc}", flush=True)
 
 
@@ -69,7 +79,7 @@ async def seed(req: SeedConfigRequest, _: None = Depends(require_token)):
     # Warm the provider channel in the background so the first real question
     # (copilot / coach / interview) streams immediately instead of paying the
     # cold path. Fire-and-forget; /config/seed must stay fast for the caller.
-    asyncio.get_running_loop().create_task(_warm_llm_channel())
+    asyncio.get_running_loop().create_task(_warm_llm_channel(req.warm))
     return {"ok": True}
 
 

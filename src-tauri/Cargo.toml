@@ -49,11 +49,24 @@ jsonwebtoken = "9"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "copy-dylibs"] }
 
 # Win32 — SetWindowDisplayAffinity for the stealth copilot overlay (cloaks the
-# window from screen capture). Windows-only; the app is Windows-only anyway.
+# window from screen capture), and the copilot's screenshot → answer
+# (screen.rs): GDI capture, WinRT OCR + JPEG encoding. Windows-only; the app is
+# Windows-only anyway.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Foundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
 ] }
 # WebView2 settings on the copilot overlay (no context menu / autofill / status
 # bar / browser accelerator popups — each is its own window outside the capture

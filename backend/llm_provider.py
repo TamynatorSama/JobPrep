@@ -403,7 +403,7 @@ def current_feature() -> str:
     return _feature.get()
 
 
-def record_usage(model: str, usage: dict | None) -> None:
+def record_usage(model: str, usage: dict | None, feature: str | None = None) -> None:
     """Record one call's usage (a LangChain `usage_metadata` dict). Never raises."""
     try:
         usage = usage or {}
@@ -411,7 +411,7 @@ def record_usage(model: str, usage: dict | None) -> None:
         tout = int(usage.get("output_tokens") or 0)
         details = usage.get("input_token_details") or {}
         cached = int(details.get("cache_read") or 0)
-        feature = current_feature()
+        feature = feature or current_feature()
         with _usage_lock:
             row = _usage.setdefault((feature, model), {
                 "feature": feature, "model": model, "calls": 0,
@@ -423,6 +423,19 @@ def record_usage(model: str, usage: dict | None) -> None:
             row["output_tokens"] += tout
         print(f"[usage] feature={feature} model={model} in={tin} cached={cached} "
               f"out={tout}", flush=True)
+    except Exception:  # noqa: BLE001 — metering must never break a call
+        pass
+
+
+def record_estimate(model: str, messages, output_chars: int) -> None:
+    """Meter a stream the client cancelled (the copilot drops a speculative
+    answer when the interviewer keeps talking). The provider bills its prompt,
+    but streams report usage only at the end, so estimate ~4 chars per token —
+    under "<feature>:cancelled", so estimates never mix with exact counts."""
+    try:
+        chars = sum(len(content_text(m)) for m in messages)
+        record_usage(model, {"input_tokens": chars // 4, "output_tokens": output_chars // 4},
+                     feature=f"{current_feature()}:cancelled")
     except Exception:  # noqa: BLE001 — metering must never break a call
         pass
 
@@ -598,22 +611,28 @@ async def generate_json(
 def make_embeddings(cfg: LLMConfig):
     """Return (embeddings, cache_namespace) for RAG retrieval, or (None, "").
 
-    Prefers the selected provider when it has an embeddings API; anthropic
-    doesn't, so it falls back to any other configured provider. RAG is strictly
-    best-effort — callers treat (None, "") as "skip retrieval". The namespace
-    keys the on-disk vector cache so vectors from different embedding models
-    never mix.
+    "local" (what Rust sends unless AI routing's per-feature Embeddings row
+    names a provider) or "" runs the on-device model (local_embed.py): no API
+    call, no key, works with every provider including the ChatGPT plan. An
+    explicit gemini | openai uses that provider instead; either way the other
+    options are fallbacks. RAG is strictly best-effort —
+    callers treat (None, "") as "skip retrieval". The namespace keys the
+    on-disk vector cache so vectors from different embedding models never mix.
     """
-    # The Embeddings row in AI routing wins; otherwise follow the chat provider.
-    p = (cfg.embeddings_provider or "").strip().lower() or provider_of(cfg)
+    p = (cfg.embeddings_provider or "").strip().lower()
+
+    def _local():
+        import local_embed
+        return local_embed.make()
 
     def _gemini():
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        # text-embedding-004 was retired (404) — that silently turned RAG off.
         return (
             GoogleGenerativeAIEmbeddings(
-                model="models/text-embedding-004", google_api_key=cfg.gemini_api_key,
+                model="models/gemini-embedding-001", google_api_key=cfg.gemini_api_key,
             ),
-            "gemini:text-embedding-004",
+            "gemini:gemini-embedding-001",
         )
 
     def _openai():
@@ -628,8 +647,8 @@ def make_embeddings(cfg: LLMConfig):
         builders = [_openai]
     elif p == "gemini":
         builders = [_gemini]
-    # Fallbacks for providers without embeddings (anthropic) or when the
-    # preferred builder can't run.
+    # Fallbacks when the preferred builder can't run (no download yet, no key).
+    builders.append(_local)
     if cfg.gemini_api_key and _gemini not in builders:
         builders.append(_gemini)
     if cfg.openai_api_key and _openai not in builders:

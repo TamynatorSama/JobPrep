@@ -8,10 +8,16 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from sse_starlette.sse import EventSourceResponse
 
 import chat_context
+import job_brief
 import llm_provider as llm_factory
-from models import ChatRequest, RagDoc
+from models import BriefRequest, ChatRequest, RagDoc
 
 router = APIRouter()
+
+# Coach retrieval budget: top chunks per message, capped in chars (~4 chars per
+# token). Was 6 chunks / 6,000 chars — more than the job context itself.
+RAG_K = 4
+RAG_MAX_CHARS = 3000
 
 COACH_SYSTEM = (
     "You are InterPrep, an expert AI interview coach. "
@@ -39,6 +45,17 @@ contractions and plain words and vary sentence length. Start most answers
 straight on the substance; a casual opener ("Sure,", "Honestly,") is fine now
 and then, but never on its own line and never the same one every time ("Yeah,
 so" gets old fast). Sound like a specific person, never like a cover letter.
+
+Use technical terms freely; they show you know the field. What has to stay
+simple is the sentence around them, so it flows when spoken: one idea per
+sentence, short enough to say in one breath, everyday verbs, plain
+connectors ("so", "because", "then"), no stacked modifiers or formal
+phrasing. Not "leveraging a centralized in-memory
+store to ensure atomicity across concurrent requests", but "I'd keep the
+counts in Redis and make each check atomic, so two requests can't both slip
+through" (that shows the pattern; find your own words). Pick the plain word
+over the fancy one: use, not utilize; help, not facilitate; make sure, not
+ensure.
 
 Pick the shape that fits the question:
 - About me ("tell me about yourself", "walk me through your background"): a
@@ -84,6 +101,44 @@ If asked to rephrase, shorten or go deeper, apply it to your previous answer
 # reasoning models the cap also counts thinking tokens, and the prompt — not
 # this cap — is what keeps answers at ~90 words.
 COPILOT_MAX_TOKENS = 800
+
+# Copilot screen capture (Phase 4): the candidate hit Capture during a live
+# interview or an online assessment. The overlay renders plain text, with
+# ``` fences shown as code blocks.
+SCREEN_SYSTEM = """\
+You are a silent interview copilot. The candidate just captured their screen
+during a live interview or an online assessment and needs help right now. You
+get a picture of the screen and the text read from it by OCR. OCR can garble
+symbols, indentation and math; when it disagrees with the picture, trust the
+picture. If several captures are attached, they are one problem that scrolls,
+in order.
+
+Work out what's on the screen, then answer in the shape that fits. Don't name
+the category:
+- Coding problem: one line on what's being asked; the approach in two or three
+  short lines (the key idea and why it works); time and space complexity; then
+  the complete solution in ONE fenced code block, in the language the screen
+  uses (Python if none), handling the edge cases the problem states.
+- Multiple choice or quiz: the answer first (letter and text), then one short
+  line on why. Several questions: answer each, in order.
+- System design or architecture diagram: the main components and how data
+  flows through them, then the two or three trade-offs or bottlenecks worth
+  raising.
+- Error message, failing test or logs: the likely cause, then the fix.
+- An interview question in text (chat, slide, document): what the candidate
+  would say out loud, in first person.
+- Anything else: the most useful short answer to what's on the screen.
+
+If the candidate typed an instruction, follow it over the rest.
+
+Style: the candidate reads this with the clock running. Lead with the answer.
+Plain text outside code blocks: no headings, bold or bullet symbols, one idea
+per line. Use technical terms freely, in short sentences that are easy to say
+out loud. Use the job context only when the screen is about the candidate or
+the company."""
+
+# Room for a full solution in a code block (the copilot's 800 would cut it off).
+SCREEN_MAX_TOKENS = 4000
 
 INTERVIEWER_SYSTEM = """\
 You are conducting a LIVE, multi-turn job interview. You are an interviewer
@@ -208,6 +263,42 @@ first question.
 """
 
 
+def _not_in_context(text: str, context: str) -> str:
+    """The part of a RAG document the job context doesn't already carry: when
+    the context quotes the document's opening (the app puts the first 4,000
+    chars of the resume there), only what follows the quoted run is left."""
+    head = text[:300]
+    at = context.find(head) if head.strip() else -1
+    if at < 0:
+        return text
+    return text[len(os.path.commonprefix([text, context[at:]])):]
+
+
+def _screen_content(req: ChatRequest) -> list:
+    """The user turn for a screen capture: the instruction and the OCR text,
+    then the images as data-URL blocks (every provider's LangChain client
+    accepts that shape)."""
+    text = req.message.strip() or "Help me with what's on my screen."
+    if req.screen_text.strip():
+        text += ("\n\nText read from the screen by OCR (may have errors; the picture "
+                 f"is the truth):\n{req.screen_text.strip()}")
+    return [{"type": "text", "text": text}] + [
+        {"type": "image_url", "image_url": {"url": f"data:{img.mime};base64,{img.data}"}}
+        for img in req.images
+    ]
+
+
+@router.post("/brief")
+async def brief(req: BriefRequest):
+    """Build (or return the cached) condensed job brief for this job context.
+    Rust calls it when the selected job's context changes, so the copilot's
+    first question already gets the short prompt."""
+    llm_factory.set_feature("job_brief")
+    base, _setup = job_brief.split_setup(req.job_context or "")
+    text = await job_brief.ensure(req.llm, base)
+    return {"ok": bool(text), "chars": len(text), "source_chars": len(base), "brief": text}
+
+
 @router.post("/stream")
 async def chat_stream(req: ChatRequest):
     async def generate():
@@ -221,32 +312,49 @@ async def chat_stream(req: ChatRequest):
             base_system = {
                 "interviewer": INTERVIEWER_SYSTEM,
                 "copilot": COPILOT_SYSTEM,
+                "screen": SCREEN_SYSTEM,
             }.get(req.mode, COACH_SYSTEM)
             system_content = base_system
-            if req.job_context:
-                system_content += f"\n\n**Current Job Context:**\n{req.job_context}"
+            job_context = req.job_context or ""
+            if job_context and req.mode in ("copilot", "interviewer", "screen"):
+                # The condensed job brief (job_brief.py) when it's cached.
+                job_context = job_brief.context_for(req.llm, job_context, req.mode)
+            if job_context:
+                system_content += f"\n\n**Current Job Context:**\n{job_context}"
 
             # ── Context management ───────────────────────────────────────────
             # The frontend resends the whole thread every turn. Keep only the
             # most recent turns verbatim; roll older turns into (a) a short
-            # running summary in the system prompt and (b) the RAG corpus, so a
+            # running summary in the system prompt and (b) the coach's RAG corpus, so a
             # long thread stays bounded without losing earlier context. Both are
             # best-effort and never block the stream.
             older, recent = chat_context.split_history(req.history)
-            docs = list(req.documents)
+            # Coach only: the interviewer's brief already carries the resume and
+            # company research, and the copilot never sends documents. Text the
+            # job context already holds (the resume) isn't retrieved twice.
+            docs = []
+            if req.mode == "coach":
+                for d in req.documents:
+                    rest = _not_in_context(d.text or "", job_context)
+                    if rest.strip():
+                        docs.append(RagDoc(source=d.source, text=rest))
             if older:
-                docs.append(RagDoc(
-                    source="earlier in this conversation",
-                    text=chat_context.render_transcript(older, req.mode),
-                ))
+                if docs:
+                    docs.append(RagDoc(
+                        source="earlier in this conversation",
+                        text=chat_context.render_transcript(older, req.mode),
+                    ))
                 summary = await chat_context.summarize_older(req.llm, older, req.mode)
                 if summary:
                     system_content += f"\n\n**Summary of earlier conversation:**\n{summary}"
 
             # RAG: pull the most relevant chunks from this job's corpus (resume,
-            # company research, prior chats, + older turns of THIS chat) and
-            # prepend them. Best-effort — any failure degrades to no retrieved
-            # context, never breaks chat.
+            # company research, prior chats, + older turns of THIS chat). They
+            # ride in the LAST user turn, not the system prompt: the system
+            # prompt and history then stay byte-identical from turn to turn, so
+            # providers serve that prefix from their prompt cache. Best-effort —
+            # any failure degrades to no retrieved context, never breaks chat.
+            user_content = req.message
             if docs:
                 yield {"data": json.dumps({
                     "type": "stage",
@@ -256,11 +364,13 @@ async def chat_stream(req: ChatRequest):
                     from rag import build_context
                     retrieved = await asyncio.to_thread(
                         build_context, req.message, docs, req.llm,
+                        RAG_K, RAG_MAX_CHARS,
                     )
+                    print(f"[rag] {req.mode}: {len(retrieved)} chars retrieved", flush=True)
                     if retrieved:
-                        system_content += f"\n\n{retrieved}"
-                except Exception:
-                    pass
+                        user_content = f"{retrieved}\n\n---\n\n{req.message}"
+                except Exception as exc:
+                    print(f"[rag] {req.mode}: retrieval failed: {exc}", flush=True)
 
             messages = [SystemMessage(content=system_content)]
             for turn in recent:
@@ -268,7 +378,10 @@ async def chat_stream(req: ChatRequest):
                     messages.append(HumanMessage(content=turn.content))
                 else:
                     messages.append(AIMessage(content=turn.content))
-            messages.append(HumanMessage(content=req.message))
+            if req.mode == "screen":
+                messages.append(HumanMessage(content=_screen_content(req)))
+            else:
+                messages.append(HumanMessage(content=user_content))
 
             # Coach + interviewer run the fast tier. Coach: cost + latency.
             # Interviewer: it's a live SPOKEN conversation — measured TTFT on the
@@ -278,15 +391,17 @@ async def chat_stream(req: ChatRequest):
             # INTERPREP_INTERVIEWER_TIER=smart to trade latency for maximum
             # persona depth. The copilot runs the "instant" tier (lite models,
             # minimal thinking) — it answers a live interviewer, so time-to-
-            # first-word is the whole game. Falling back only happens BEFORE the
-            # first token — once we've streamed output we can't switch models.
+            # first-word is the whole game. A screen capture is often a coding
+            # problem, so it gets the fast tier's stronger models. Falling back
+            # only happens BEFORE the first token — once we've streamed output
+            # we can't switch models.
             if req.mode == "interviewer":
                 tier = os.environ.get("INTERPREP_INTERVIEWER_TIER", "fast").strip() or "fast"
             elif req.mode == "copilot":
                 tier = "instant"
             else:
                 tier = "fast"
-            max_tokens = COPILOT_MAX_TOKENS if req.mode == "copilot" else None
+            max_tokens = {"copilot": COPILOT_MAX_TOKENS, "screen": SCREEN_MAX_TOKENS}.get(req.mode)
             # Cap time-to-first-token. A slow/unavailable candidate must NOT hang
             # the whole stream — the Rust SSE client waits up to 300s, so a dead
             # first candidate would stall the answer for minutes. If no token
@@ -302,6 +417,8 @@ async def chat_stream(req: ChatRequest):
                     continue
                 started = False
                 usage = None
+                streamed = 0
+                metered = False
                 t0 = time.monotonic()
                 try:
                     model = llm_factory.make_chat_model(
@@ -345,11 +462,18 @@ async def chat_stream(req: ChatRequest):
                                 if route:
                                     yield {"data": json.dumps(route)}
                             started = True
+                            streamed += len(text)
                             yield {"data": json.dumps({"type": "token", "content": text})}
                             await asyncio.sleep(0)
                     llm_factory.record_usage(model_name, usage)
+                    metered = True
                     yield {"data": json.dumps({"type": "done"})}
                     return
+                except (asyncio.CancelledError, GeneratorExit):
+                    # The client hung up mid-stream; the call is still billed.
+                    if not metered:
+                        llm_factory.record_estimate(model_name, messages, streamed)
+                    raise
                 except asyncio.TimeoutError:
                     print(f"[chat] {model_name} no token in {ttft_timeout}s — "
                           f"failing over to next candidate", flush=True)

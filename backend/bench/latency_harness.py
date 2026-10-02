@@ -129,7 +129,7 @@ def llm_config(args) -> dict:
 
 def job_context(selector: str) -> tuple[str, str]:
     """(label, context) built the same way App.tsx mirrors it to the overlay:
-    JD 1.5k + research dossier 6k + resume 4k chars."""
+    JD 1.5k + research dossier 6k + resume 8k chars (App.tsx fullJobContext)."""
     base = Path(os.environ.get("LOCALAPPDATA", ".")) / "InterPrep"
     try:
         jobs = json.loads((base / "jobs.json").read_text(encoding="utf-8"))
@@ -162,14 +162,15 @@ def job_context(selector: str) -> tuple[str, str]:
         f"Location: {pick['location']}" if pick.get("location") else "",
         f"\nJob Description:\n{pick['jobDescription'][:1500]}" if pick.get("jobDescription") else "",
         f"\nCompany Research Dossier:\n{research_text[:6000]}" if research_text else "",
-        f"\nCandidate Resume:\n{resume[:4000]}" if resume else "",
+        f"\nCandidate Resume:\n{resume[:8000]}" if resume else "",
     ]
     return f"{pick.get('role', '')} · {pick.get('company', '')}", "\n".join(p for p in parts if p)
 
 
 def start_sidecar(token: str, log_path: Path) -> tuple[subprocess.Popen, str, float]:
     port = free_port()
-    env = {**os.environ, "INTERPREP_BRIDGE_TOKEN": token}
+    # PYTHONIOENCODING: like the app (sidecar.rs) — stdout is a file, not cp1252-safe.
+    env = {**os.environ, "INTERPREP_BRIDGE_TOKEN": token, "PYTHONIOENCODING": "utf-8"}
     log = open(log_path, "w", encoding="utf-8")
     t0 = time.perf_counter()
     proc = subprocess.Popen(
